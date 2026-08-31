@@ -43,8 +43,12 @@ export interface Person {
 
 export interface Channel {
   readonly createdAt: string;
+  readonly deletedAt?: string;
+  readonly deletedBy?: string;
   readonly id: string;
   readonly ownerId: string;
+  readonly purgedAt?: string;
+  readonly purgedBy?: string;
   readonly title: string;
   readonly typeId: string;
   readonly typeVersion: string;
@@ -208,6 +212,24 @@ export type DomainChange =
     }
   | { readonly channel: Channel; readonly kind: 'channel.created' }
   | {
+      readonly actorId: string;
+      readonly channelId: string;
+      readonly deletedAt: string;
+      readonly kind: 'channel.deleted';
+    }
+  | {
+      readonly actorId: string;
+      readonly channelId: string;
+      readonly kind: 'channel.restored';
+      readonly restoredAt: string;
+    }
+  | {
+      readonly actorId: string;
+      readonly channelId: string;
+      readonly kind: 'channel.purged';
+      readonly purgedAt: string;
+    }
+  | {
       readonly kind: 'membership.granted';
       readonly membership: ChannelMembership;
       readonly previousRole?: ChannelRole;
@@ -219,6 +241,11 @@ export type DomainChange =
       readonly personId: string;
       readonly revertedOperationId: string;
       readonly restoredRole?: ChannelRole;
+    }
+  | {
+      readonly channelId: string;
+      readonly kind: 'membership.left';
+      readonly personId: string;
     }
   | {
       readonly channelId: string;

@@ -45,8 +45,12 @@ interface InvitationRow {
 
 interface ChannelRow {
   created_at: string;
+  deleted_at: string | null;
+  deleted_by: string | null;
   id: string;
   owner_id: string;
+  purged_at: string | null;
+  purged_by: string | null;
   title: string;
   type_id: string;
   type_version: string;
@@ -199,8 +203,12 @@ const invitationFromRow = (row: InvitationRow): ChannelInvitation => ({
 
 const channelFromRow = (row: ChannelRow): Channel => ({
   createdAt: row.created_at,
+  ...(row.deleted_at === null ? {} : { deletedAt: row.deleted_at }),
+  ...(row.deleted_by === null ? {} : { deletedBy: row.deleted_by }),
   id: row.id,
   ownerId: row.owner_id,
+  ...(row.purged_at === null ? {} : { purgedAt: row.purged_at }),
+  ...(row.purged_by === null ? {} : { purgedBy: row.purged_by }),
   title: row.title,
   typeId: row.type_id,
   typeVersion: row.type_version,
@@ -365,7 +373,11 @@ export class SqliteStore implements DatagramStore {
         title TEXT NOT NULL,
         owner_id TEXT NOT NULL REFERENCES persons(id),
         created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
+        updated_at TEXT NOT NULL,
+        deleted_at TEXT,
+        deleted_by TEXT REFERENCES persons(id),
+        purged_at TEXT,
+        purged_by TEXT REFERENCES persons(id)
       );
 
       CREATE TABLE IF NOT EXISTS channel_memberships (
@@ -624,6 +636,28 @@ export class SqliteStore implements DatagramStore {
       );
     `);
 
+    const channelColumns = new Set(
+      (this.#database.query('PRAGMA table_info(channels)').all() as TableInfoRow[]).map(
+        (column) => column.name,
+      ),
+    );
+    if (!channelColumns.has('deleted_at')) {
+      this.#database.exec('ALTER TABLE channels ADD COLUMN deleted_at TEXT;');
+    }
+    if (!channelColumns.has('deleted_by')) {
+      this.#database.exec(
+        'ALTER TABLE channels ADD COLUMN deleted_by TEXT REFERENCES persons(id);',
+      );
+    }
+    if (!channelColumns.has('purged_at')) {
+      this.#database.exec('ALTER TABLE channels ADD COLUMN purged_at TEXT;');
+    }
+    if (!channelColumns.has('purged_by')) {
+      this.#database.exec(
+        'ALTER TABLE channels ADD COLUMN purged_by TEXT REFERENCES persons(id);',
+      );
+    }
+
     const operationColumns = new Set(
       (
         this.#database.query('PRAGMA table_info(operations)').all() as TableInfoRow[]
@@ -785,6 +819,8 @@ export class SqliteStore implements DatagramStore {
            ON channel_navigation.channel_id = channels.id
           AND channel_navigation.person_id = channel_memberships.person_id
          WHERE channel_memberships.person_id = ?
+           AND channels.deleted_at IS NULL
+           AND channels.purged_at IS NULL
            AND channel_navigation.archived_at IS NULL
          ORDER BY COALESCE(channel_navigation.pinned, 0) DESC,
                   CASE WHEN channel_navigation.pinned = 1 THEN channel_navigation.position END,
@@ -798,7 +834,9 @@ export class SqliteStore implements DatagramStore {
 
   async listOwnedChannels(personId: string): Promise<readonly Channel[]> {
     const rows = this.#database
-      .query('SELECT * FROM channels WHERE owner_id = ? ORDER BY created_at, id')
+      .query(
+        'SELECT * FROM channels WHERE owner_id = ? AND purged_at IS NULL ORDER BY created_at, id',
+      )
       .all(personId) as ChannelRow[];
     return rows.map(channelFromRow);
   }
@@ -825,8 +863,15 @@ export class SqliteStore implements DatagramStore {
   async listChannelGroupEntries(groupId: string): Promise<readonly ChannelGroupEntry[]> {
     const rows = this.#database
       .query(
-        `SELECT * FROM channel_group_entries
-         WHERE group_id = ? ORDER BY pinned DESC, position, channel_id`,
+        `SELECT channel_group_entries.*
+         FROM channel_group_entries
+         INNER JOIN channels ON channels.id = channel_group_entries.channel_id
+         WHERE channel_group_entries.group_id = ?
+           AND channels.deleted_at IS NULL
+           AND channels.purged_at IS NULL
+         ORDER BY channel_group_entries.pinned DESC,
+                  channel_group_entries.position,
+                  channel_group_entries.channel_id`,
       )
       .all(groupId) as ChannelGroupEntryRow[];
     return rows.map(groupEntryFromRow);
@@ -855,6 +900,8 @@ export class SqliteStore implements DatagramStore {
          LEFT JOIN channel_activities AS unread
            ON unread.channel_id = channels.id
           AND unread.sequence > COALESCE(read_activity.sequence, 0)
+         WHERE channels.deleted_at IS NULL
+           AND channels.purged_at IS NULL
          GROUP BY channels.id
          ORDER BY COALESCE(navigation.pinned, 0) DESC,
                   CASE WHEN navigation.pinned = 1 THEN navigation.position END,
@@ -947,6 +994,7 @@ export class SqliteStore implements DatagramStore {
            LEFT JOIN channel_memberships
              ON channel_memberships.channel_id = channels.id
             AND channel_memberships.role = 'owner'
+           WHERE channels.purged_at IS NULL
            GROUP BY channels.id
            HAVING COUNT(channel_memberships.person_id) <> 1
               OR MAX(channel_memberships.person_id = channels.owner_id) <> 1
@@ -997,7 +1045,7 @@ export class SqliteStore implements DatagramStore {
         return;
       case 'person.deactivated': {
         const ownedChannel = this.#database
-          .query('SELECT id FROM channels WHERE owner_id = ? LIMIT 1')
+          .query('SELECT id FROM channels WHERE owner_id = ? AND purged_at IS NULL LIMIT 1')
           .get(change.personId);
         if (ownedChannel) {
           throw new Error('Channel ownership must be transferred before deactivation');
@@ -1026,6 +1074,80 @@ export class SqliteStore implements DatagramStore {
           ],
         );
         return;
+      case 'channel.deleted': {
+        const result = this.#database.run(
+          `UPDATE channels SET deleted_at = ?, deleted_by = ?, updated_at = ?
+           WHERE id = ? AND owner_id = ? AND deleted_at IS NULL AND purged_at IS NULL`,
+          [
+            change.deletedAt,
+            change.actorId,
+            change.deletedAt,
+            change.channelId,
+            change.actorId,
+          ],
+        );
+        if (result.changes !== 1) throw new Error('Channel cannot be deleted');
+        return;
+      }
+      case 'channel.restored': {
+        const result = this.#database.run(
+          `UPDATE channels
+           SET deleted_at = NULL, deleted_by = NULL, updated_at = ?
+           WHERE id = ? AND owner_id = ? AND deleted_at IS NOT NULL AND purged_at IS NULL`,
+          [change.restoredAt, change.channelId, change.actorId],
+        );
+        if (result.changes !== 1) throw new Error('Channel cannot be restored');
+        return;
+      }
+      case 'channel.purged': {
+        const channel = this.#database
+          .query(
+            `SELECT owner_id FROM channels
+             WHERE id = ? AND deleted_at IS NOT NULL AND purged_at IS NULL`,
+          )
+          .get(change.channelId) as { owner_id: string } | null;
+        if (channel?.owner_id !== change.actorId) throw new Error('Channel cannot be purged');
+        this.#database.run('DELETE FROM channel_group_entries WHERE channel_id = ?', [
+          change.channelId,
+        ]);
+        this.#database.run('DELETE FROM channel_navigation WHERE channel_id = ?', [
+          change.channelId,
+        ]);
+        this.#database.run('DELETE FROM table_settings WHERE channel_id = ?', [
+          change.channelId,
+        ]);
+        this.#database.run('DELETE FROM table_views WHERE channel_id = ?', [change.channelId]);
+        this.#database.run('DELETE FROM dictionary_entries WHERE channel_id = ?', [
+          change.channelId,
+        ]);
+        this.#database.run('DELETE FROM table_records WHERE channel_id = ?', [
+          change.channelId,
+        ]);
+        this.#database.run('DELETE FROM table_fields WHERE channel_id = ?', [change.channelId]);
+        this.#database.run(
+          `DELETE FROM message_revisions
+           WHERE message_id IN (SELECT id FROM messages WHERE channel_id = ?)`,
+          [change.channelId],
+        );
+        this.#database.run('DELETE FROM messages WHERE channel_id = ?', [change.channelId]);
+        this.#database.run('DELETE FROM channel_invitations WHERE channel_id = ?', [
+          change.channelId,
+        ]);
+        this.#database.run('DELETE FROM channel_activities WHERE channel_id = ?', [
+          change.channelId,
+        ]);
+        this.#database.run('DELETE FROM operations WHERE channel_id = ?', [change.channelId]);
+        this.#database.run('DELETE FROM channel_memberships WHERE channel_id = ?', [
+          change.channelId,
+        ]);
+        this.#database.run(
+          `UPDATE channels
+           SET title = '[purged]', purged_at = ?, purged_by = ?, updated_at = ?
+           WHERE id = ?`,
+          [change.purgedAt, change.actorId, change.purgedAt, change.channelId],
+        );
+        return;
+      }
       case 'membership.granted':
         if (change.membership.role === 'owner') {
           const channel = this.#database
@@ -1066,6 +1188,15 @@ export class SqliteStore implements DatagramStore {
               [change.channelId, change.personId, change.expectedRole],
             );
         if (result.changes !== 1) throw new Error('Membership changed after original Operation');
+        return;
+      }
+      case 'membership.left': {
+        const result = this.#database.run(
+          `DELETE FROM channel_memberships
+           WHERE channel_id = ? AND person_id = ? AND role <> 'owner'`,
+          [change.channelId, change.personId],
+        );
+        if (result.changes !== 1) throw new Error('Channel Owner cannot leave');
         return;
       }
       case 'channel.ownership-transferred': {

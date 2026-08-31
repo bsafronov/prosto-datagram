@@ -136,6 +136,8 @@ export class DatagramApplication {
   async #requireChannel(channelId: string, typeId?: string): Promise<Channel> {
     const channel = await this.store.getChannel(channelId);
     invariant(channel, 'channel.not-found', 'Channel does not exist', 404);
+    invariant(channel.purgedAt === undefined, 'channel.purged', 'Channel was purged', 410);
+    invariant(channel.deletedAt === undefined, 'channel.deleted', 'Channel is deleted', 410);
     if (typeId) {
       invariant(
         channel.typeId === typeId,
@@ -143,6 +145,13 @@ export class DatagramApplication {
         `Channel must use type ${typeId}`,
       );
     }
+    return channel;
+  }
+
+  async #requireStoredChannel(channelId: string): Promise<Channel> {
+    const channel = await this.store.getChannel(channelId);
+    invariant(channel, 'channel.not-found', 'Channel does not exist', 404);
+    invariant(channel.purgedAt === undefined, 'channel.purged', 'Channel was purged', 410);
     return channel;
   }
 
@@ -672,6 +681,142 @@ export class DatagramApplication {
                 kind: 'activity.appended',
               },
             ],
+          );
+        },
+      }),
+      defineAction({
+        description: 'Leave one Channel without changing its Owner.',
+        inputSchema: z.object({ channelId: z.string().min(1) }),
+        name: 'channel.member.leave',
+        run: async (context, input) => {
+          const channel = await this.#requireChannel(input.channelId);
+          const membership = await this.store.getMembership(input.channelId, context.actorId);
+          invariant(membership, 'permission.denied', 'Channel membership is required', 403);
+          invariant(
+            channel.ownerId !== context.actorId,
+            'channel.owner-cannot-leave',
+            'Transfer Channel ownership before leaving',
+            409,
+          );
+          return this.#commit(
+            context,
+            'channel.member.leave',
+            input.channelId,
+            () => [
+              { channelId: input.channelId, kind: 'membership.left', personId: context.actorId },
+            ],
+          );
+        },
+      }),
+      defineAction({
+        description: 'Shared recoverable Channel deletion. Owner only.',
+        inputSchema: z.object({ channelId: z.string().min(1) }),
+        name: 'channel.delete',
+        run: async (context, input) => {
+          const channel = await this.#requireChannel(input.channelId);
+          invariant(
+            channel.ownerId === context.actorId,
+            'permission.denied',
+            'Channel Owner is required',
+            403,
+          );
+          const deletedAt = nowIso();
+          return this.#commit(
+            context,
+            'channel.delete',
+            input.channelId,
+            (operationId) => [
+              {
+                actorId: context.actorId,
+                channelId: input.channelId,
+                deletedAt,
+                kind: 'channel.deleted',
+              },
+              {
+                activity: this.#activity(
+                  context.actorId,
+                  input.channelId,
+                  'channel.deleted',
+                  operationId,
+                  deletedAt,
+                ),
+                kind: 'activity.appended',
+              },
+            ],
+            { id: input.channelId, kind: 'channel' },
+          );
+        },
+      }),
+      defineAction({
+        description: 'Restore one recoverably deleted Channel. Owner only.',
+        inputSchema: z.object({ channelId: z.string().min(1) }),
+        name: 'channel.restore',
+        run: async (context, input) => {
+          const channel = await this.#requireStoredChannel(input.channelId);
+          invariant(channel.deletedAt, 'channel.not-deleted', 'Channel is not deleted', 409);
+          invariant(
+            channel.ownerId === context.actorId,
+            'permission.denied',
+            'Channel Owner is required',
+            403,
+          );
+          const restoredAt = nowIso();
+          return this.#commit(
+            context,
+            'channel.restore',
+            input.channelId,
+            (operationId) => [
+              {
+                actorId: context.actorId,
+                channelId: input.channelId,
+                kind: 'channel.restored',
+                restoredAt,
+              },
+              {
+                activity: this.#activity(
+                  context.actorId,
+                  input.channelId,
+                  'channel.restored',
+                  operationId,
+                  restoredAt,
+                ),
+                kind: 'activity.appended',
+              },
+            ],
+            { id: input.channelId, kind: 'channel' },
+          );
+        },
+      }),
+      defineAction({
+        description: 'Permanently purge one deleted Channel. Owner explicit approval required.',
+        inputSchema: z.object({
+          approved: z.literal(true),
+          channelId: z.string().min(1),
+        }),
+        name: 'channel.purge',
+        run: async (context, input) => {
+          const channel = await this.#requireStoredChannel(input.channelId);
+          invariant(channel.deletedAt, 'channel.not-deleted', 'Delete Channel before purge', 409);
+          invariant(
+            channel.ownerId === context.actorId,
+            'permission.denied',
+            'Channel Owner is required',
+            403,
+          );
+          const purgedAt = nowIso();
+          return this.#commit(
+            context,
+            'channel.purge',
+            input.channelId,
+            () => [
+              {
+                actorId: context.actorId,
+                channelId: input.channelId,
+                kind: 'channel.purged',
+                purgedAt,
+              },
+            ],
+            { id: input.channelId, kind: 'channel' },
           );
         },
       }),
@@ -1696,6 +1841,31 @@ export class DatagramApplication {
         },
       }),
       defineQuery({
+        description: 'Resolve a stable Channel or Table Record reference when permitted.',
+        inputSchema: z.object({
+          channelId: z.string().min(1),
+          recordId: z.string().min(1).optional(),
+        }),
+        name: 'channel.reference.resolve',
+        run: async (context, input): Promise<QueryResult> => {
+          const resolution = await this.#resolveReference(
+            context.actorId,
+            input.channelId,
+            input.recordId,
+          );
+          return {
+            data: resolution,
+            view: {
+              bindings: { reference: '$result' },
+              commands: [],
+              kind: 'value',
+              schemaVersion: 'datagram/view@1',
+              title: 'Reference Resolution',
+            },
+          };
+        },
+      }),
+      defineQuery({
         description: 'List Channels accessible to the requesting person.',
         inputSchema: z.object({ archived: z.boolean().default(false) }),
         name: 'channel.list',
@@ -1931,20 +2101,31 @@ export class DatagramApplication {
           invariant(membership, 'permission.denied', 'Channel membership is required', 403);
           const messages = await this.store.listMessages(input.channelId);
           return {
-            data: messages.map((message) => ({
-              authorId: message.authorId,
-              createdAt: message.createdAt,
-              id: message.id,
-              recordReferences:
-                message.tombstonedAt === undefined ? [...message.recordReferences] : [],
-              ...(message.replyToMessageId === undefined
-                ? {}
-                : { replyToMessageId: message.replyToMessageId }),
-              text: message.tombstonedAt === undefined ? message.text : null,
-              ...(message.tombstonedAt === undefined
-                ? {}
-                : { tombstonedAt: message.tombstonedAt }),
-            })),
+            data: await Promise.all(
+              messages.map(async (message) => ({
+                authorId: message.authorId,
+                createdAt: message.createdAt,
+                id: message.id,
+                recordReferences:
+                  message.tombstonedAt === undefined
+                    ? await Promise.all(
+                        message.recordReferences.map(async (recordId) => {
+                          const record = await this.store.getTableRecord(recordId);
+                          return record
+                            ? this.#resolveReference(context.actorId, record.channelId, recordId)
+                            : { recordId, status: 'unresolved' as const };
+                        }),
+                      )
+                    : [],
+                ...(message.replyToMessageId === undefined
+                  ? {}
+                  : { replyToMessageId: message.replyToMessageId }),
+                text: message.tombstonedAt === undefined ? message.text : null,
+                ...(message.tombstonedAt === undefined
+                  ? {}
+                  : { tombstonedAt: message.tombstonedAt }),
+              })),
+            ),
             view: {
               bindings: { messages: '$result' },
               commands:
@@ -2026,6 +2207,34 @@ export class DatagramApplication {
       404,
     );
     return entry;
+  }
+
+  async #resolveReference(
+    actorId: string,
+    channelId: string,
+    recordId?: string,
+  ): Promise<JsonValue> {
+    const channel = await this.store.getChannel(channelId);
+    const membership = await this.store.getMembership(channelId, actorId);
+    if (
+      !channel ||
+      channel.deletedAt !== undefined ||
+      channel.purgedAt !== undefined ||
+      !membership
+    ) {
+      return { channelId, ...(recordId ? { recordId } : {}), status: 'unresolved' };
+    }
+    if (recordId !== undefined) {
+      const record = await this.store.getTableRecord(recordId);
+      if (
+        !record ||
+        record.channelId !== channelId ||
+        record.tombstonedAt !== undefined
+      ) {
+        return { channelId, recordId, status: 'unresolved' };
+      }
+    }
+    return { channelId, ...(recordId ? { recordId } : {}), status: 'resolved' };
   }
 
   #validatedRecordValues(

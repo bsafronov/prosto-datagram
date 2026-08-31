@@ -146,7 +146,10 @@ describe('universal Discussion lifecycle', () => {
       expect.arrayContaining([
         expect.objectContaining({
           id: parent.subject!.id,
-          recordReferences: ['record-stable', 'record-unresolved'],
+          recordReferences: [
+            { recordId: 'record-stable', status: 'unresolved' },
+            { recordId: 'record-unresolved', status: 'unresolved' },
+          ],
         }),
         expect.objectContaining({
           id: reply.subject!.id,
@@ -215,7 +218,10 @@ describe('universal Discussion lifecycle', () => {
       await value.app.executeQuery(viewerId, 'http', 'discussion.messages.list', { channelId })
     ).data as Array<Record<string, unknown>>;
     expect(tombstone.find((message) => message.id === parent.subject!.id)).toMatchObject({
-      recordReferences: ['record-stable', 'record-unresolved'],
+      recordReferences: [
+        { recordId: 'record-stable', status: 'unresolved' },
+        { recordId: 'record-unresolved', status: 'unresolved' },
+      ],
       text: 'Parent',
     });
 
