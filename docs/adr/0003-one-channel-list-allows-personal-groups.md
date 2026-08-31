@@ -1,0 +1,3 @@
+# One Channel List allows personal groups
+
+Each person starts with one Flat Channel List containing every accessible Channel, without selecting a workspace first. People may organize Channels into overlapping personal Channel Groups; one Channel can appear in many groups, with group-specific order and pinning. Groups begin with manual membership and may later gain rules such as Channel Type, owner, unread state, or activity, but they never change ownership, permissions, or domain structure. Future profiles or workspace-like configurations may filter the same accessible Channels without becoming primary navigation boundaries.

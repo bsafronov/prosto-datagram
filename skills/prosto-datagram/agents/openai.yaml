@@ -1,0 +1,4 @@
+interface:
+  display_name: "Prosto Datagram"
+  short_description: "Operate channels and structured data through Datagram"
+  default_prompt: "Use $prosto-datagram to perform this request through Datagram actions and result handles."
