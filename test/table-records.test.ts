@@ -188,4 +188,44 @@ describe('typed Table Record lifecycle', () => {
     });
     expect(await value.store.listTableViews(channelId, person.subject!.id)).toHaveLength(2);
   });
+
+  test('backfills tombstoned Records before restoring after a required Field addition', async () => {
+    const { channelId, value } = await setup();
+    const created = await value.app.executeAction(
+      value.owner.id,
+      'cli',
+      'table.record.create',
+      { channelId, values: {} },
+    );
+    await value.app.executeAction(value.owner.id, 'cli', 'table.record.tombstone', {
+      channelId,
+      recordId: created.subject!.id,
+    });
+    await addField(value, channelId, {
+      defaultValue: 'Backfilled',
+      key: 'name',
+      label: 'Name',
+      required: true,
+      type: 'text',
+    });
+
+    expect(await value.store.getTableRecord(created.subject!.id)).toMatchObject({
+      tombstonedAt: expect.any(String),
+      values: { name: 'Backfilled' },
+    });
+    const before = (await value.store.listOperations(channelId)).length;
+    await value.app.executeAction(value.owner.id, 'cli', 'table.record.restore', {
+      channelId,
+      recordId: created.subject!.id,
+    });
+
+    expect(await value.store.getTableRecord(created.subject!.id)).toMatchObject({
+      id: created.subject!.id,
+      values: { name: 'Backfilled' },
+    });
+    expect((await value.store.listOperations(channelId)).length).toBe(before + 1);
+    expect((await value.store.listActivities(channelId)).at(-1)?.kind).toBe(
+      'table.record-restored',
+    );
+  });
 });

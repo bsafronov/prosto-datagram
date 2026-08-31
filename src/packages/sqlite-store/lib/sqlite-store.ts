@@ -1083,8 +1083,7 @@ export class SqliteStore implements DatagramStore {
         return;
       case 'table.record-updated': {
         const result = this.#database.run(
-          `UPDATE table_records SET values_json = ?, updated_at = ?
-           WHERE id = ? AND tombstoned_at IS NULL`,
+          'UPDATE table_records SET values_json = ?, updated_at = ? WHERE id = ?',
           [JSON.stringify(change.values), change.updatedAt, change.recordId],
         );
         if (result.changes !== 1) throw new Error('Table Record is unavailable');

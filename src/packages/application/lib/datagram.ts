@@ -867,7 +867,8 @@ export class DatagramApplication {
             `Field key already exists: ${input.key}`,
             409,
           );
-          const records = (await this.store.listTableRecords(input.channelId)).filter(
+          const allRecords = await this.store.listTableRecords(input.channelId);
+          const records = allRecords.filter(
             (record) => record.tombstonedAt === undefined,
           );
           if (input.defaultValue !== undefined) {
@@ -912,7 +913,7 @@ export class DatagramApplication {
               { field, kind: 'table.field-added' },
               ...(input.defaultValue === undefined
                 ? []
-                : records.map((record) => ({
+                : allRecords.map((record) => ({
                     kind: 'table.record-updated' as const,
                     recordId: record.id,
                     updatedAt: occurredAt,
@@ -1127,13 +1128,19 @@ export class DatagramApplication {
           );
           const fields = await this.store.listTableFields(input.channelId);
           const records = await this.store.listTableRecords(input.channelId);
-          this.#validatedRecordValues(fields, records, record.values, record.id);
+          const values = this.#validatedRecordValues(fields, records, record.values, record.id);
           const restoredAt = nowIso();
           return this.#commit(
             context,
             'table.record.restore',
             input.channelId,
             (operationId) => [
+              {
+                kind: 'table.record-updated',
+                recordId: record.id,
+                updatedAt: restoredAt,
+                values,
+              },
               { kind: 'table.record-restored', recordId: record.id, restoredAt },
               {
                 activity: this.#activity(
