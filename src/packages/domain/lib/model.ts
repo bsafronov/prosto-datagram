@@ -102,7 +102,7 @@ export interface Operation {
   readonly intent: string;
   readonly occurredAt: string;
   readonly origin: OperationOrigin;
-  readonly result: 'succeeded';
+  readonly result: JsonValue;
   readonly status: 'succeeded';
 }
 

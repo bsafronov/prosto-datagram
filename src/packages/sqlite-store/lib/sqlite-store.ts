@@ -73,9 +73,15 @@ interface OperationRow {
   changes_json: string;
   channel_id: string | null;
   id: string;
+  intent_json: string;
   occurred_at: string;
   origin: Operation['origin'];
+  result_json: string;
   status: Operation['status'];
+}
+
+interface TableInfoRow {
+  name: string;
 }
 
 interface ActivityRow {
@@ -146,10 +152,10 @@ const operationFromRow = (row: OperationRow): Operation => ({
   changes: JSON.parse(row.changes_json) as DomainChange[],
   ...(row.channel_id === null ? {} : { channelId: row.channel_id }),
   id: row.id,
-  intent: row.action,
+  intent: JSON.parse(row.intent_json) as string,
   occurredAt: row.occurred_at,
   origin: row.origin,
-  result: row.status,
+  result: JSON.parse(row.result_json) as JsonValue,
   status: row.status,
 });
 
@@ -205,6 +211,8 @@ export class SqliteStore implements DatagramStore {
         channel_id TEXT REFERENCES channels(id),
         status TEXT NOT NULL,
         changes_json TEXT NOT NULL,
+        intent_json TEXT NOT NULL,
+        result_json TEXT NOT NULL,
         occurred_at TEXT NOT NULL
       );
 
@@ -256,6 +264,32 @@ export class SqliteStore implements DatagramStore {
       CREATE INDEX IF NOT EXISTS messages_channel
         ON messages(channel_id, created_at);
     `);
+
+    const operationColumns = new Set(
+      (
+        this.#database.query('PRAGMA table_info(operations)').all() as TableInfoRow[]
+      ).map((column) => column.name),
+    );
+    if (!operationColumns.has('intent_json')) {
+      this.#database.exec('ALTER TABLE operations ADD COLUMN intent_json TEXT;');
+    }
+    const missingIntents = this.#database
+      .query('SELECT id, action FROM operations WHERE intent_json IS NULL')
+      .all() as Array<{ action: string; id: string }>;
+    const updateIntent = this.#database.prepare(
+      'UPDATE operations SET intent_json = ? WHERE id = ?',
+    );
+    for (const row of missingIntents) updateIntent.run(JSON.stringify(row.action), row.id);
+    if (!operationColumns.has('result_json')) {
+      this.#database.exec('ALTER TABLE operations ADD COLUMN result_json TEXT;');
+    }
+    const missingResults = this.#database
+      .query('SELECT id, status FROM operations WHERE result_json IS NULL')
+      .all() as Array<{ id: string; status: string }>;
+    const updateResult = this.#database.prepare(
+      'UPDATE operations SET result_json = ? WHERE id = ?',
+    );
+    for (const row of missingResults) updateResult.run(JSON.stringify(row.status), row.id);
   }
 
   async ensureLocalOwner(displayName = 'Local Owner'): Promise<Person> {
@@ -360,8 +394,9 @@ export class SqliteStore implements DatagramStore {
 
       this.#database.run(
         `INSERT INTO operations
-          (id, actor_id, origin, action, channel_id, status, changes_json, occurred_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          (id, actor_id, origin, action, channel_id, status, changes_json, intent_json,
+           result_json, occurred_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           candidate.id,
           candidate.actorId,
@@ -370,6 +405,8 @@ export class SqliteStore implements DatagramStore {
           candidate.channelId ?? null,
           candidate.status,
           JSON.stringify(candidate.changes),
+          JSON.stringify(candidate.intent),
+          JSON.stringify(candidate.result),
           candidate.occurredAt,
         ],
       );

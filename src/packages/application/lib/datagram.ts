@@ -139,7 +139,10 @@ export class DatagramApplication {
       intent: action,
       occurredAt,
       origin: context.origin,
-      result: 'succeeded',
+      result: {
+        status: 'succeeded',
+        ...(subject === undefined ? {} : { subject: { ...subject } }),
+      },
       status: 'succeeded',
     };
     await this.store.commit(operation);

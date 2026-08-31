@@ -27,6 +27,8 @@ const operation = (input: {
   readonly changes: readonly DomainChange[];
   readonly channelId?: string;
   readonly id: string;
+  readonly intent?: string;
+  readonly result?: Operation['result'];
   readonly second: number;
 }): Operation => ({
   action: input.action,
@@ -34,10 +36,10 @@ const operation = (input: {
   changes: input.changes,
   ...(input.channelId ? { channelId: input.channelId } : {}),
   id: input.id,
-  intent: input.action,
+  intent: input.intent ?? input.action,
   occurredAt: timestamp(input.second),
   origin: 'system',
-  result: 'succeeded',
+  result: input.result ?? { status: 'succeeded' },
   status: 'succeeded',
 });
 
@@ -170,6 +172,8 @@ export function storeConformance(name: string, createFixture: StoreFixtureFactor
             ],
             channelId: 'channel-reference',
             id: operationId,
+            intent: 'post-message-with-stable-references',
+            result: { messageId: 'message-reference' },
             second: 2,
           }),
         );
@@ -184,10 +188,11 @@ export function storeConformance(name: string, createFixture: StoreFixtureFactor
         expect(persisted).toMatchObject({
           actorId: owner.id,
           changes: expect.any(Array),
-          intent: 'discussion.message.post',
+          intent: 'post-message-with-stable-references',
           occurredAt: timestamp(2),
           origin: 'system',
-          result: 'succeeded',
+          result: { messageId: 'message-reference' },
+          status: 'succeeded',
         });
         expect(await store.listActivities('channel-reference')).toHaveLength(2);
       } finally {
