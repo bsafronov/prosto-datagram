@@ -84,7 +84,34 @@ export interface TableRecord {
   readonly createdAt: string;
   readonly createdBy: string;
   readonly id: string;
+  readonly tombstonedAt?: string;
+  readonly tombstonedBy?: string;
+  readonly updatedAt?: string;
   readonly values: Readonly<Record<string, JsonValue>>;
+}
+
+export interface TableViewFilter {
+  readonly fieldId: string;
+  readonly operator: 'contains' | 'equals' | 'greater-than' | 'is-empty' | 'less-than';
+  readonly value?: JsonValue;
+}
+
+export interface TableViewSort {
+  readonly direction: 'ascending' | 'descending';
+  readonly fieldId: string;
+}
+
+export interface TableView {
+  readonly channelId: string;
+  readonly createdAt: string;
+  readonly filters: readonly TableViewFilter[];
+  readonly grouping: readonly string[];
+  readonly id: string;
+  readonly name: string;
+  readonly ownerId: string;
+  readonly sorting: readonly TableViewSort[];
+  readonly visibility: 'personal' | 'shared';
+  readonly visibleFieldIds: readonly string[];
 }
 
 export interface Message {
@@ -193,7 +220,30 @@ export type DomainChange =
     }
   | { readonly kind: 'channel-navigation.updated'; readonly navigation: ChannelNavigation }
   | { readonly field: TableField; readonly kind: 'table.field-added' }
+  | {
+      readonly channelId: string;
+      readonly displayFieldId?: string;
+      readonly kind: 'table.display-field-set';
+    }
   | { readonly kind: 'table.record-created'; readonly record: TableRecord }
+  | {
+      readonly kind: 'table.record-updated';
+      readonly recordId: string;
+      readonly updatedAt: string;
+      readonly values: Readonly<Record<string, JsonValue>>;
+    }
+  | {
+      readonly actorId: string;
+      readonly kind: 'table.record-tombstoned';
+      readonly recordId: string;
+      readonly tombstonedAt: string;
+    }
+  | {
+      readonly kind: 'table.record-restored';
+      readonly recordId: string;
+      readonly restoredAt: string;
+    }
+  | { readonly kind: 'table.view-saved'; readonly view: TableView }
   | { readonly kind: 'discussion.message-posted'; readonly message: Message }
   | { readonly activity: ChannelActivity; readonly kind: 'activity.appended' };
 

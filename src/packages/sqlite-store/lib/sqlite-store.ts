@@ -19,6 +19,7 @@ import {
   type Person,
   type TableField,
   type TableRecord,
+  type TableView,
 } from '../../application/store';
 
 interface PersonRow {
@@ -72,7 +73,20 @@ interface TableRecordRow {
   created_at: string;
   created_by: string;
   id: string;
+  tombstoned_at: string | null;
+  tombstoned_by: string | null;
+  updated_at: string | null;
   values_json: string;
+}
+
+interface TableViewRow {
+  channel_id: string;
+  created_at: string;
+  definition_json: string;
+  id: string;
+  name: string;
+  owner_id: string;
+  visibility: TableView['visibility'];
 }
 
 interface MessageRow {
@@ -192,8 +206,27 @@ const tableRecordFromRow = (row: TableRecordRow): TableRecord => ({
   createdAt: row.created_at,
   createdBy: row.created_by,
   id: row.id,
+  ...(row.tombstoned_at === null ? {} : { tombstonedAt: row.tombstoned_at }),
+  ...(row.tombstoned_by === null ? {} : { tombstonedBy: row.tombstoned_by }),
+  ...(row.updated_at === null ? {} : { updatedAt: row.updated_at }),
   values: JSON.parse(row.values_json) as Record<string, JsonValue>,
 });
+
+const tableViewFromRow = (row: TableViewRow): TableView => {
+  const definition = JSON.parse(row.definition_json) as Pick<
+    TableView,
+    'filters' | 'grouping' | 'sorting' | 'visibleFieldIds'
+  >;
+  return {
+    channelId: row.channel_id,
+    createdAt: row.created_at,
+    ...definition,
+    id: row.id,
+    name: row.name,
+    ownerId: row.owner_id,
+    visibility: row.visibility,
+  };
+};
 
 const messageFromRow = (row: MessageRow): Message => ({
   authorId: row.author_id,
@@ -373,6 +406,24 @@ export class SqliteStore implements DatagramStore {
         channel_id TEXT NOT NULL REFERENCES channels(id),
         values_json TEXT NOT NULL,
         created_by TEXT NOT NULL REFERENCES persons(id),
+        created_at TEXT NOT NULL,
+        updated_at TEXT,
+        tombstoned_at TEXT,
+        tombstoned_by TEXT REFERENCES persons(id)
+      );
+
+      CREATE TABLE IF NOT EXISTS table_settings (
+        channel_id TEXT PRIMARY KEY REFERENCES channels(id),
+        display_field_id TEXT REFERENCES table_fields(id)
+      );
+
+      CREATE TABLE IF NOT EXISTS table_views (
+        id TEXT PRIMARY KEY,
+        channel_id TEXT NOT NULL REFERENCES channels(id),
+        name TEXT NOT NULL,
+        visibility TEXT NOT NULL CHECK (visibility IN ('personal', 'shared')),
+        owner_id TEXT NOT NULL REFERENCES persons(id),
+        definition_json TEXT NOT NULL,
         created_at TEXT NOT NULL
       );
 
@@ -493,6 +544,21 @@ export class SqliteStore implements DatagramStore {
       'UPDATE operations SET result_json = ? WHERE id = ?',
     );
     for (const row of missingResults) updateResult.run(JSON.stringify(row.status), row.id);
+
+    const recordColumns = new Set(
+      (
+        this.#database.query('PRAGMA table_info(table_records)').all() as TableInfoRow[]
+      ).map((column) => column.name),
+    );
+    if (!recordColumns.has('updated_at')) {
+      this.#database.exec('ALTER TABLE table_records ADD COLUMN updated_at TEXT;');
+    }
+    if (!recordColumns.has('tombstoned_at')) {
+      this.#database.exec('ALTER TABLE table_records ADD COLUMN tombstoned_at TEXT;');
+    }
+    if (!recordColumns.has('tombstoned_by')) {
+      this.#database.exec('ALTER TABLE table_records ADD COLUMN tombstoned_by TEXT;');
+    }
   }
 
   async ensureLocalOwner(displayName = 'Local Owner'): Promise<Person> {
@@ -573,6 +639,20 @@ export class SqliteStore implements DatagramStore {
       .query('SELECT * FROM channel_memberships WHERE channel_id = ? AND person_id = ?')
       .get(channelId, personId) as MembershipRow | null;
     return row ? membershipFromRow(row) : null;
+  }
+
+  async getTableDisplayFieldId(channelId: string): Promise<string | null> {
+    const row = this.#database
+      .query('SELECT display_field_id FROM table_settings WHERE channel_id = ?')
+      .get(channelId) as { display_field_id: string | null } | null;
+    return row?.display_field_id ?? null;
+  }
+
+  async getTableRecord(recordId: string): Promise<TableRecord | null> {
+    const row = this.#database.query('SELECT * FROM table_records WHERE id = ?').get(recordId) as
+      | TableRecordRow
+      | null;
+    return row ? tableRecordFromRow(row) : null;
   }
 
   async listChannels(personId: string): Promise<readonly Channel[]> {
@@ -683,6 +763,17 @@ export class SqliteStore implements DatagramStore {
       .query('SELECT * FROM table_records WHERE channel_id = ? ORDER BY created_at, id')
       .all(channelId) as TableRecordRow[];
     return rows.map(tableRecordFromRow);
+  }
+
+  async listTableViews(channelId: string, personId: string): Promise<readonly TableView[]> {
+    const rows = this.#database
+      .query(
+        `SELECT * FROM table_views
+         WHERE channel_id = ? AND (visibility = 'shared' OR owner_id = ?)
+         ORDER BY created_at, id`,
+      )
+      .all(channelId, personId) as TableViewRow[];
+    return rows.map(tableViewFromRow);
   }
 
   async listMessages(channelId: string): Promise<readonly Message[]> {
@@ -970,6 +1061,13 @@ export class SqliteStore implements DatagramStore {
           ],
         );
         return;
+      case 'table.display-field-set':
+        this.#database.run(
+          `INSERT INTO table_settings (channel_id, display_field_id) VALUES (?, ?)
+           ON CONFLICT(channel_id) DO UPDATE SET display_field_id = excluded.display_field_id`,
+          [change.channelId, change.displayFieldId ?? null],
+        );
+        return;
       case 'table.record-created':
         this.#database.run(
           `INSERT INTO table_records (id, channel_id, values_json, created_by, created_at)
@@ -980,6 +1078,59 @@ export class SqliteStore implements DatagramStore {
             JSON.stringify(change.record.values),
             change.record.createdBy,
             change.record.createdAt,
+          ],
+        );
+        return;
+      case 'table.record-updated': {
+        const result = this.#database.run(
+          `UPDATE table_records SET values_json = ?, updated_at = ?
+           WHERE id = ? AND tombstoned_at IS NULL`,
+          [JSON.stringify(change.values), change.updatedAt, change.recordId],
+        );
+        if (result.changes !== 1) throw new Error('Table Record is unavailable');
+        return;
+      }
+      case 'table.record-tombstoned': {
+        const result = this.#database.run(
+          `UPDATE table_records SET tombstoned_at = ?, tombstoned_by = ?, updated_at = ?
+           WHERE id = ? AND tombstoned_at IS NULL`,
+          [change.tombstonedAt, change.actorId, change.tombstonedAt, change.recordId],
+        );
+        if (result.changes !== 1) throw new Error('Table Record is already tombstoned');
+        return;
+      }
+      case 'table.record-restored': {
+        const result = this.#database.run(
+          `UPDATE table_records
+           SET tombstoned_at = NULL, tombstoned_by = NULL, updated_at = ?
+           WHERE id = ? AND tombstoned_at IS NOT NULL`,
+          [change.restoredAt, change.recordId],
+        );
+        if (result.changes !== 1) throw new Error('Table Record is not tombstoned');
+        return;
+      }
+      case 'table.view-saved':
+        this.#database.run(
+          `INSERT INTO table_views
+            (id, channel_id, name, visibility, owner_id, definition_json, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(id) DO UPDATE SET
+             name = excluded.name,
+             visibility = excluded.visibility,
+             definition_json = excluded.definition_json`,
+          [
+            change.view.id,
+            change.view.channelId,
+            change.view.name,
+            change.view.visibility,
+            change.view.ownerId,
+            JSON.stringify({
+              filters: change.view.filters,
+              grouping: change.view.grouping,
+              sorting: change.view.sorting,
+              visibleFieldIds: change.view.visibleFieldIds,
+            }),
+            change.view.createdAt,
           ],
         );
         return;

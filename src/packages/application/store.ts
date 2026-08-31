@@ -14,6 +14,7 @@ export type {
   Person,
   TableField,
   TableRecord,
+  TableView,
 } from '../domain/model';
 export { newId, nowIso } from '../domain/model';
 export type { DatagramStore } from './lib/store';

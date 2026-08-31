@@ -24,6 +24,8 @@ import type {
   Person,
   QueryResult,
   TableField,
+  TableRecord,
+  TableView,
 } from '../../domain/model';
 import type { DatagramStore } from './store';
 import {
@@ -44,6 +46,17 @@ const roleRank: Readonly<Record<ChannelRole, number>> = {
 };
 
 const optionalJsonValueSchema = jsonValueSchema.optional();
+
+const tableViewFilterSchema = z.object({
+  fieldId: z.string().min(1),
+  operator: z.enum(['contains', 'equals', 'greater-than', 'is-empty', 'less-than']),
+  value: optionalJsonValueSchema,
+});
+
+const tableViewSortSchema = z.object({
+  direction: z.enum(['ascending', 'descending']),
+  fieldId: z.string().min(1),
+});
 
 const toJson = (value: unknown): JsonValue => jsonValueSchema.parse(value);
 
@@ -854,7 +867,31 @@ export class DatagramApplication {
             `Field key already exists: ${input.key}`,
             409,
           );
-          if (input.defaultValue !== undefined) this.#validateFieldValue(input.type, input.defaultValue);
+          const records = (await this.store.listTableRecords(input.channelId)).filter(
+            (record) => record.tombstonedAt === undefined,
+          );
+          if (input.defaultValue !== undefined) {
+            invariant(
+              !(input.required && input.defaultValue === null),
+              'table.record-required-field',
+              `Required Field cannot default to null: ${input.key}`,
+            );
+            if (input.defaultValue !== null) {
+              this.#validateFieldValue(input.type, input.defaultValue);
+            }
+          }
+          invariant(
+            !(input.required && input.defaultValue === undefined && records.length > 0),
+            'table.field-required-existing-records',
+            'Required Field needs a default while Records exist',
+            409,
+          );
+          invariant(
+            !(input.unique && input.defaultValue != null && records.length > 1),
+            'table.field-unique-default-conflict',
+            'Unique Field default cannot be applied to multiple Records',
+            409,
+          );
           const field: TableField = {
             channelId: input.channelId,
             ...(input.defaultValue === undefined
@@ -873,6 +910,14 @@ export class DatagramApplication {
             input.channelId,
             (operationId, occurredAt) => [
               { field, kind: 'table.field-added' },
+              ...(input.defaultValue === undefined
+                ? []
+                : records.map((record) => ({
+                    kind: 'table.record-updated' as const,
+                    recordId: record.id,
+                    updatedAt: occurredAt,
+                    values: { ...record.values, [input.key]: input.defaultValue! },
+                  }))),
               {
                 activity: this.#activity(
                   context.actorId,
@@ -900,39 +945,7 @@ export class DatagramApplication {
           await this.#requireRole(context.actorId, input.channelId, 'contributor');
           const fields = await this.store.listTableFields(input.channelId);
           const records = await this.store.listTableRecords(input.channelId);
-          const fieldByKey = new Map(fields.map((field) => [field.key, field]));
-          for (const key of Object.keys(input.values)) {
-            invariant(
-              fieldByKey.has(key),
-              'table.record-unknown-field',
-              `Unknown Field: ${key}`,
-            );
-          }
-          const values: Record<string, JsonValue> = {};
-          for (const field of fields) {
-            const supplied = input.values[field.key];
-            const value = supplied === undefined ? field.defaultValue : supplied;
-            if (value === undefined) {
-              invariant(
-                !field.required,
-                'table.record-required-field',
-                `Required Field is missing: ${field.key}`,
-              );
-              continue;
-            }
-            this.#validateFieldValue(field.type, value);
-            if (field.unique) {
-              invariant(
-                !records.some(
-                  (record) => JSON.stringify(record.values[field.key]) === JSON.stringify(value),
-                ),
-                'table.record-unique-field',
-                `Unique Field value already exists: ${field.key}`,
-                409,
-              );
-            }
-            values[field.key] = value;
-          }
+          const values = this.#validatedRecordValues(fields, records, input.values);
           const occurredAt = nowIso();
           const recordId = newId('record');
           return this.#commit(
@@ -962,6 +975,253 @@ export class DatagramApplication {
               },
             ],
             { id: recordId, kind: 'record' },
+          );
+        },
+      }),
+      defineAction({
+        description: 'Select a Text Field as the Table Display Field. Admin role required.',
+        inputSchema: z.object({
+          channelId: z.string().min(1),
+          fieldId: z.string().min(1).nullable(),
+        }),
+        name: 'table.display-field.set',
+        run: async (context, input) => {
+          await this.#requireChannel(input.channelId, 'table');
+          await this.#requireRole(context.actorId, input.channelId, 'admin');
+          if (input.fieldId !== null) {
+            const fields = await this.store.listTableFields(input.channelId);
+            const field = fields.find((candidate) => candidate.id === input.fieldId);
+            invariant(field, 'table.field-not-found', 'Display Field does not exist', 404);
+            invariant(
+              field.type === 'text',
+              'table.display-field-type',
+              'Display Field must be Text',
+            );
+          }
+          return this.#commit(
+            context,
+            'table.display-field.set',
+            input.channelId,
+            (operationId, occurredAt) => [
+              {
+                channelId: input.channelId,
+                ...(input.fieldId === null ? {} : { displayFieldId: input.fieldId }),
+                kind: 'table.display-field-set',
+              },
+              {
+                activity: this.#activity(
+                  context.actorId,
+                  input.channelId,
+                  'table.display-field-changed',
+                  operationId,
+                  occurredAt,
+                ),
+                kind: 'activity.appended',
+              },
+            ],
+          );
+        },
+      }),
+      defineAction({
+        description: 'Edit any active Table Record. Contributor role required.',
+        inputSchema: z.object({
+          channelId: z.string().min(1),
+          recordId: z.string().min(1),
+          values: z.record(z.string(), jsonValueSchema),
+        }),
+        name: 'table.record.edit',
+        run: async (context, input) => {
+          await this.#requireChannel(input.channelId, 'table');
+          await this.#requireRole(context.actorId, input.channelId, 'contributor');
+          const record = await this.#requireTableRecord(input.channelId, input.recordId);
+          invariant(
+            record.tombstonedAt === undefined,
+            'table.record-tombstoned',
+            'Table Record is tombstoned',
+            409,
+          );
+          const fields = await this.store.listTableFields(input.channelId);
+          const records = await this.store.listTableRecords(input.channelId);
+          const values = this.#validatedRecordValues(
+            fields,
+            records,
+            { ...record.values, ...input.values },
+            record.id,
+          );
+          const updatedAt = nowIso();
+          return this.#commit(
+            context,
+            'table.record.edit',
+            input.channelId,
+            (operationId) => [
+              { kind: 'table.record-updated', recordId: record.id, updatedAt, values },
+              {
+                activity: this.#activity(
+                  context.actorId,
+                  input.channelId,
+                  'table.record-edited',
+                  operationId,
+                  updatedAt,
+                ),
+                kind: 'activity.appended',
+              },
+            ],
+            { id: record.id, kind: 'record' },
+          );
+        },
+      }),
+      defineAction({
+        description: 'Tombstone any active Table Record. Contributor role required.',
+        inputSchema: z.object({ channelId: z.string().min(1), recordId: z.string().min(1) }),
+        name: 'table.record.tombstone',
+        run: async (context, input) => {
+          await this.#requireChannel(input.channelId, 'table');
+          await this.#requireRole(context.actorId, input.channelId, 'contributor');
+          const record = await this.#requireTableRecord(input.channelId, input.recordId);
+          invariant(
+            record.tombstonedAt === undefined,
+            'table.record-already-tombstoned',
+            'Table Record is already tombstoned',
+            409,
+          );
+          const tombstonedAt = nowIso();
+          return this.#commit(
+            context,
+            'table.record.tombstone',
+            input.channelId,
+            (operationId) => [
+              {
+                actorId: context.actorId,
+                kind: 'table.record-tombstoned',
+                recordId: record.id,
+                tombstonedAt,
+              },
+              {
+                activity: this.#activity(
+                  context.actorId,
+                  input.channelId,
+                  'table.record-tombstoned',
+                  operationId,
+                  tombstonedAt,
+                ),
+                kind: 'activity.appended',
+              },
+            ],
+            { id: record.id, kind: 'record' },
+          );
+        },
+      }),
+      defineAction({
+        description: 'Restore a tombstoned Table Record. Contributor role required.',
+        inputSchema: z.object({ channelId: z.string().min(1), recordId: z.string().min(1) }),
+        name: 'table.record.restore',
+        run: async (context, input) => {
+          await this.#requireChannel(input.channelId, 'table');
+          await this.#requireRole(context.actorId, input.channelId, 'contributor');
+          const record = await this.#requireTableRecord(input.channelId, input.recordId);
+          invariant(
+            record.tombstonedAt !== undefined,
+            'table.record-not-tombstoned',
+            'Table Record is not tombstoned',
+            409,
+          );
+          const fields = await this.store.listTableFields(input.channelId);
+          const records = await this.store.listTableRecords(input.channelId);
+          this.#validatedRecordValues(fields, records, record.values, record.id);
+          const restoredAt = nowIso();
+          return this.#commit(
+            context,
+            'table.record.restore',
+            input.channelId,
+            (operationId) => [
+              { kind: 'table.record-restored', recordId: record.id, restoredAt },
+              {
+                activity: this.#activity(
+                  context.actorId,
+                  input.channelId,
+                  'table.record-restored',
+                  operationId,
+                  restoredAt,
+                ),
+                kind: 'activity.appended',
+              },
+            ],
+            { id: record.id, kind: 'record' },
+          );
+        },
+      }),
+      defineAction({
+        description: 'Create a personal or shared semantic Table View.',
+        inputSchema: z.object({
+          channelId: z.string().min(1),
+          filters: z.array(tableViewFilterSchema).default([]),
+          grouping: z.array(z.string().min(1)).default([]),
+          name: z.string().trim().min(1).max(120),
+          sorting: z.array(tableViewSortSchema).default([]),
+          visibility: z.enum(['personal', 'shared']),
+          visibleFieldIds: z.array(z.string().min(1)),
+        }),
+        name: 'table.view.create',
+        run: async (context, input) => {
+          await this.#requireChannel(input.channelId, 'table');
+          await this.#requireRole(
+            context.actorId,
+            input.channelId,
+            input.visibility === 'shared' ? 'admin' : 'viewer',
+          );
+          const fields = await this.store.listTableFields(input.channelId);
+          const knownIds = new Set(fields.map((field) => field.id));
+          const referencedIds = [
+            ...input.visibleFieldIds,
+            ...input.filters.map((filter) => filter.fieldId),
+            ...input.sorting.map((sort) => sort.fieldId),
+            ...input.grouping,
+          ];
+          invariant(
+            referencedIds.every((fieldId) => knownIds.has(fieldId)),
+            'table.view-unknown-field',
+            'Table View references an unknown Field',
+          );
+          invariant(
+            new Set(input.visibleFieldIds).size === input.visibleFieldIds.length,
+            'table.view-duplicate-field',
+            'Visible Fields must be unique',
+          );
+          const view: TableView = {
+            channelId: input.channelId,
+            createdAt: nowIso(),
+            filters: input.filters.map((filter) => ({
+              fieldId: filter.fieldId,
+              operator: filter.operator,
+              ...(filter.value === undefined ? {} : { value: filter.value }),
+            })),
+            grouping: input.grouping,
+            id: newId('view'),
+            name: input.name,
+            ownerId: context.actorId,
+            sorting: input.sorting,
+            visibility: input.visibility,
+            visibleFieldIds: input.visibleFieldIds,
+          };
+          return this.#commit(
+            context,
+            'table.view.create',
+            input.channelId,
+            (operationId, occurredAt) => [
+              { kind: 'table.view-saved', view },
+              {
+                activity: this.#activity(
+                  context.actorId,
+                  input.channelId,
+                  input.visibility === 'shared'
+                    ? 'table.shared-view-created'
+                    : 'table.personal-view-created',
+                  operationId,
+                  occurredAt,
+                ),
+                kind: 'activity.appended',
+              },
+            ],
           );
         },
       }),
@@ -1167,21 +1427,80 @@ export class DatagramApplication {
         },
       }),
       defineQuery({
-        description: 'List current Records in a Table Channel.',
+        description: 'Describe Table display configuration without Record values.',
         inputSchema: z.object({ channelId: z.string().min(1) }),
+        name: 'table.configuration',
+        run: async (context, input): Promise<QueryResult> => {
+          await this.#requireChannel(input.channelId, 'table');
+          await this.#requireRole(context.actorId, input.channelId, 'viewer');
+          return {
+            data: { displayFieldId: await this.store.getTableDisplayFieldId(input.channelId) },
+            view: {
+              bindings: { configuration: '$result' },
+              commands: ['table.display-field.set'],
+              kind: 'value',
+              schemaVersion: 'datagram/view@1',
+              title: 'Table Configuration',
+            },
+          };
+        },
+      }),
+      defineQuery({
+        description: 'List current Records in a Table Channel.',
+        inputSchema: z.object({
+          channelId: z.string().min(1),
+          includeTombstoned: z.boolean().default(false),
+        }),
         name: 'table.records.list',
         run: async (context, input): Promise<QueryResult> => {
           const channel = await this.#requireChannel(input.channelId, 'table');
           await this.#requireRole(context.actorId, input.channelId, 'viewer');
-          const records = await this.store.listTableRecords(input.channelId);
+          const records = (await this.store.listTableRecords(input.channelId)).filter(
+            (record) => input.includeTombstoned || record.tombstonedAt === undefined,
+          );
           return {
-            data: records.map((record) => ({ id: record.id, values: record.values })),
+            data: records.map((record) => ({
+              id: record.id,
+              ...(record.tombstonedAt === undefined
+                ? {}
+                : { tombstonedAt: record.tombstonedAt }),
+              values: record.values,
+            })),
             view: {
               bindings: { rows: '$result' },
               commands: ['table.record.create'],
               kind: 'table',
               schemaVersion: 'datagram/view@1',
               title: channel.title,
+            },
+          };
+        },
+      }),
+      defineQuery({
+        description: 'List shared Table Views and the actor personal Views.',
+        inputSchema: z.object({ channelId: z.string().min(1) }),
+        name: 'table.views.list',
+        run: async (context, input): Promise<QueryResult> => {
+          await this.#requireChannel(input.channelId, 'table');
+          await this.#requireRole(context.actorId, input.channelId, 'viewer');
+          const views = await this.store.listTableViews(input.channelId, context.actorId);
+          return {
+            data: toJson(views.map((view) => ({
+              filters: [...view.filters],
+              grouping: [...view.grouping],
+              id: view.id,
+              name: view.name,
+              ownerId: view.ownerId,
+              sorting: [...view.sorting],
+              visibility: view.visibility,
+              visibleFieldIds: [...view.visibleFieldIds],
+            }))),
+            view: {
+              bindings: { views: '$result' },
+              commands: ['table.view.create'],
+              kind: 'table',
+              schemaVersion: 'datagram/view@1',
+              title: 'Table Views',
             },
           };
         },
@@ -1215,6 +1534,63 @@ export class DatagramApplication {
     ];
   }
 
+  async #requireTableRecord(channelId: string, recordId: string): Promise<TableRecord> {
+    const record = await this.store.getTableRecord(recordId);
+    invariant(
+      record?.channelId === channelId,
+      'table.record-not-found',
+      'Table Record does not exist',
+      404,
+    );
+    return record;
+  }
+
+  #validatedRecordValues(
+    fields: readonly TableField[],
+    records: readonly TableRecord[],
+    input: Readonly<Record<string, JsonValue>>,
+    currentRecordId?: string,
+  ): Record<string, JsonValue> {
+    const fieldByKey = new Map(fields.map((field) => [field.key, field]));
+    for (const key of Object.keys(input)) {
+      invariant(
+        fieldByKey.has(key),
+        'table.record-unknown-field',
+        `Unknown Field: ${key}`,
+      );
+    }
+    const values: Record<string, JsonValue> = {};
+    for (const field of fields) {
+      const supplied = input[field.key];
+      const value = supplied === undefined ? field.defaultValue : supplied;
+      if (value === undefined || value === null) {
+        invariant(
+          !field.required,
+          'table.record-required-field',
+          `Required Field is missing: ${field.key}`,
+        );
+        if (value === null) values[field.key] = null;
+        continue;
+      }
+      this.#validateFieldValue(field.type, value);
+      if (field.unique) {
+        invariant(
+          !records.some(
+            (record) =>
+              record.id !== currentRecordId &&
+              record.tombstonedAt === undefined &&
+              JSON.stringify(record.values[field.key]) === JSON.stringify(value),
+          ),
+          'table.record-unique-field',
+          `Unique Field value already exists: ${field.key}`,
+          409,
+        );
+      }
+      values[field.key] = value;
+    }
+    return values;
+  }
+
   #validateFieldValue(type: TableField['type'], rawValue: unknown): JsonValue {
     const value = toJson(rawValue);
     switch (type) {
@@ -1233,7 +1609,7 @@ export class DatagramApplication {
         return value;
       case 'date-time':
         invariant(
-          typeof value === 'string' && !Number.isNaN(Date.parse(value)),
+          typeof value === 'string' && z.iso.datetime({ offset: true }).safeParse(value).success,
           'table.field-type',
           'Expected ISO date-time value',
         );

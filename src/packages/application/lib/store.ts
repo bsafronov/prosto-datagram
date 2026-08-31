@@ -12,6 +12,7 @@ import type {
   Person,
   TableField,
   TableRecord,
+  TableView,
 } from '../../domain/model';
 
 export interface DatagramStore {
@@ -25,6 +26,8 @@ export interface DatagramStore {
   getInvitation(invitationId: string): Promise<ChannelInvitation | null>;
   getMembership(channelId: string, personId: string): Promise<ChannelMembership | null>;
   getPerson(personId: string): Promise<Person | null>;
+  getTableDisplayFieldId(channelId: string): Promise<string | null>;
+  getTableRecord(recordId: string): Promise<TableRecord | null>;
   initialize(): Promise<void>;
   listChannels(personId: string): Promise<readonly Channel[]>;
   listOwnedChannels(personId: string): Promise<readonly Channel[]>;
@@ -37,4 +40,5 @@ export interface DatagramStore {
   listServiceOperations(): Promise<readonly Operation[]>;
   listTableFields(channelId: string): Promise<readonly TableField[]>;
   listTableRecords(channelId: string): Promise<readonly TableRecord[]>;
+  listTableViews(channelId: string, personId: string): Promise<readonly TableView[]>;
 }
