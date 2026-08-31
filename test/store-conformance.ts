@@ -5,9 +5,9 @@ import { DatagramError } from '../src/packages/application/errors';
 import type { DatagramStore } from '../src/packages/application/store';
 import type {
   Channel,
-  ChannelActivity,
   DomainChange,
   Operation,
+  PendingChannelActivity,
   Person,
 } from '../src/packages/domain/model';
 
@@ -59,7 +59,7 @@ const activity = (
   actorId: string,
   operationId: string,
   second: number,
-): ChannelActivity => ({
+): PendingChannelActivity => ({
   actorId,
   channelId,
   id,
@@ -117,9 +117,17 @@ export function storeConformance(name: string, createFixture: StoreFixtureFactor
           'channel-newer',
           'channel-older',
         ]);
-        expect((await fixture.store.listActivities('channel-older')).map((value) => value.id)).toEqual([
-          'activity-channel-older',
+        expect(await fixture.store.listActivities('channel-older')).toEqual([
+          expect.objectContaining({ id: 'activity-channel-older', position: 1 }),
         ]);
+        const events = await fixture.store.listSubscriptionEvents(0, 100);
+        expect(events.map((event) => event.type)).toEqual([
+          'activity',
+          'operation-result',
+          'activity',
+          'operation-result',
+        ]);
+        expect(events.map((event) => event.position)).toEqual([1, 2, 3, 4]);
       } finally {
         await fixture.dispose();
       }
@@ -263,6 +271,11 @@ export function storeConformance(name: string, createFixture: StoreFixtureFactor
           result: { messageId: 'message-reference' },
           status: 'succeeded',
         });
+        const persistedEvents = await store.listSubscriptionEvents(0, 100);
+        expect(persistedEvents.at(-1)).toMatchObject({
+          operationId: 'operation-message-tombstoned',
+          type: 'operation-result',
+        });
         expect(await store.listActivities('channel-reference')).toHaveLength(4);
         await store.commit(
           operation({
@@ -306,6 +319,7 @@ export function storeConformance(name: string, createFixture: StoreFixtureFactor
         const store = fixture.store;
         const owner = await store.ensureLocalOwner('Owner');
         await commitChannel(store, owner, 'channel-atomic', 1);
+        const eventsBeforeFailures = await store.listSubscriptionEvents(0, 100);
 
         const invalidState = operation({
           action: 'channel.create',
@@ -385,6 +399,7 @@ export function storeConformance(name: string, createFixture: StoreFixtureFactor
           ),
         ).toBeFalse();
         expect(await store.listActivities('channel-atomic')).toHaveLength(1);
+        expect(await store.listSubscriptionEvents(0, 100)).toEqual(eventsBeforeFailures);
       } finally {
         await fixture.dispose();
       }

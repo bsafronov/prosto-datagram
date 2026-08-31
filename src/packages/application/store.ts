@@ -13,6 +13,7 @@ export type {
   Message,
   MessageRevision,
   Operation,
+  SubscriptionEvent,
   Person,
   TableField,
   TableRecord,

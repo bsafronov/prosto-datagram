@@ -12,7 +12,6 @@ import {
 import type {
   ActionReceipt,
   Channel,
-  ChannelActivity,
   ChannelGroup,
   ChannelNavigation,
   ChannelInvitation,
@@ -23,8 +22,10 @@ import type {
   Message,
   Operation,
   OperationOrigin,
+  PendingChannelActivity,
   Person,
   QueryResult,
+  SubscriptionEvent,
   TableField,
   TableRecord,
   TableView,
@@ -121,6 +122,33 @@ export class DatagramApplication {
     return this.handles.issue(actorId, name, result);
   }
 
+  async *subscribe(
+    actorId: string,
+    options: { readonly after?: number; readonly signal?: AbortSignal } = {},
+  ): AsyncIterable<SubscriptionEvent> {
+    await this.#requirePerson(actorId);
+    invariant(
+      options.after === undefined ||
+        (Number.isSafeInteger(options.after) && options.after >= 0),
+      'subscription.position-invalid',
+      'Subscription position must be a non-negative integer',
+    );
+    let position = options.after ?? 0;
+
+    while (!options.signal?.aborted) {
+      await this.#requirePerson(actorId);
+      const events = await this.store.listSubscriptionEvents(position, 100);
+      if (events.length === 0) {
+        await this.#waitForSubscriptionEvent(options.signal);
+        continue;
+      }
+      for (const event of events) {
+        position = event.position;
+        if (await this.#canReceiveSubscriptionEvent(actorId, event)) yield event;
+      }
+    }
+  }
+
   async #requirePerson(personId: string): Promise<Person> {
     const person = await this.store.getPerson(personId);
     invariant(person, 'person.not-found', 'Person does not exist', 404);
@@ -131,6 +159,29 @@ export class DatagramApplication {
       403,
     );
     return person;
+  }
+
+  async #canReceiveSubscriptionEvent(
+    actorId: string,
+    event: SubscriptionEvent,
+  ): Promise<boolean> {
+    const channelId = event.type === 'activity' ? event.activity.channelId : event.channelId;
+    if (event.type === 'operation-result' && event.actorId !== actorId) return false;
+    if (channelId === undefined) return true;
+    return (await this.store.getMembership(channelId, actorId)) !== null;
+  }
+
+  async #waitForSubscriptionEvent(signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) return;
+    await new Promise<void>((resolve) => {
+      const done = () => {
+        clearTimeout(timer);
+        signal?.removeEventListener('abort', done);
+        resolve();
+      };
+      const timer = setTimeout(done, 25);
+      signal?.addEventListener('abort', done, { once: true });
+    });
   }
 
   async #requireChannel(channelId: string, typeId?: string): Promise<Channel> {
@@ -244,7 +295,7 @@ export class DatagramApplication {
     kind: string,
     operationId: string,
     occurredAt: string,
-  ): ChannelActivity {
+  ): PendingChannelActivity {
     return {
       actorId,
       channelId,
@@ -1802,6 +1853,33 @@ export class DatagramApplication {
   #queryDefinitions() {
     return [
       defineQuery({
+        description: 'List ordered meaningful Activity for one authorized Channel.',
+        inputSchema: z.object({ channelId: z.string().min(1) }),
+        name: 'channel.activity.list',
+        run: async (context, input): Promise<QueryResult> => {
+          await this.#requireChannel(input.channelId);
+          await this.#requireRole(context.actorId, input.channelId, 'viewer');
+          const activities = await this.store.listActivities(input.channelId);
+          return {
+            data: activities.map((activity) => ({
+              actorId: activity.actorId,
+              id: activity.id,
+              kind: activity.kind,
+              occurredAt: activity.occurredAt,
+              operationId: activity.operationId,
+              position: activity.position,
+            })),
+            view: {
+              bindings: { activities: '$result' },
+              commands: ['channel.activity.mark-read'],
+              kind: 'table',
+              schemaVersion: 'datagram/view@1',
+              title: 'Channel Activity',
+            },
+          };
+        },
+      }),
+      defineQuery({
         description: 'Inspect permitted Operation History for one Channel.',
         inputSchema: z.object({ channelId: z.string().min(1) }),
         name: 'operation.history',
@@ -1889,6 +1967,7 @@ export class DatagramApplication {
                     position: entry.position,
                   })),
                 id: item.channel.id,
+                lastReadActivityId: item.navigation.lastReadActivityId ?? null,
                 muted: item.navigation.muted,
                 pinned: item.navigation.pinned,
                 position: item.navigation.position,

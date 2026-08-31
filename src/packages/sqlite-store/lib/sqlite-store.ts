@@ -19,6 +19,7 @@ import {
   type MessageRevision,
   type Operation,
   type Person,
+  type SubscriptionEvent,
   type TableField,
   type TableRecord,
   type TableView,
@@ -151,6 +152,26 @@ interface ActivityRow {
   kind: string;
   occurred_at: string;
   operation_id: string;
+  position: number;
+}
+
+interface SubscriptionEventRow {
+  action: string;
+  activity_actor_id: string | null;
+  activity_channel_id: string | null;
+  activity_id: string | null;
+  activity_kind: string | null;
+  activity_occurred_at: string | null;
+  activity_operation_id: string | null;
+  activity_position: number | null;
+  actor_id: string;
+  channel_id: string | null;
+  event_type: SubscriptionEvent['type'];
+  id: string;
+  occurred_at: string;
+  operation_id: string;
+  position: number;
+  status: Operation['status'];
 }
 
 interface NavigationRow {
@@ -318,6 +339,7 @@ const activityFromRow = (row: ActivityRow): ChannelActivity => ({
   kind: row.kind,
   occurredAt: row.occurred_at,
   operationId: row.operation_id,
+  position: row.position,
 });
 
 const navigationFromRow = (row: NavigationRow): ChannelNavigation => ({
@@ -420,6 +442,17 @@ export class SqliteStore implements DatagramStore {
         channel_id TEXT NOT NULL REFERENCES channels(id),
         operation_id TEXT NOT NULL REFERENCES operations(id),
         kind TEXT NOT NULL,
+        actor_id TEXT NOT NULL REFERENCES persons(id),
+        occurred_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS subscription_events (
+        position INTEGER PRIMARY KEY AUTOINCREMENT,
+        id TEXT NOT NULL UNIQUE,
+        event_type TEXT NOT NULL CHECK (event_type IN ('activity', 'operation-result')),
+        operation_id TEXT NOT NULL REFERENCES operations(id),
+        activity_id TEXT REFERENCES channel_activities(id),
+        channel_id TEXT REFERENCES channels(id),
         actor_id TEXT NOT NULL REFERENCES persons(id),
         occurred_at TEXT NOT NULL
       );
@@ -740,7 +773,8 @@ export class SqliteStore implements DatagramStore {
   async getActivity(activityId: string): Promise<ChannelActivity | null> {
     const row = this.#database
       .query(
-        `SELECT actor_id, channel_id, id, kind, occurred_at, operation_id
+        `SELECT actor_id, channel_id, id, kind, occurred_at, operation_id,
+                sequence AS position
          FROM channel_activities WHERE id = ?`,
       )
       .get(activityId) as ActivityRow | null;
@@ -844,7 +878,8 @@ export class SqliteStore implements DatagramStore {
   async listActivities(channelId: string): Promise<readonly ChannelActivity[]> {
     const rows = this.#database
       .query(
-        `SELECT actor_id, channel_id, id, kind, occurred_at, operation_id
+        `SELECT actor_id, channel_id, id, kind, occurred_at, operation_id,
+                sequence AS position
          FROM channel_activities
          WHERE channel_id = ?
          ORDER BY sequence`,
@@ -981,6 +1016,78 @@ export class SqliteStore implements DatagramStore {
     return rows.map(operationFromRow);
   }
 
+  async listSubscriptionEvents(
+    afterPosition: number,
+    limit: number,
+  ): Promise<readonly SubscriptionEvent[]> {
+    const rows = this.#database
+      .query(
+        `SELECT events.position,
+                events.id,
+                events.event_type,
+                events.operation_id,
+                events.channel_id,
+                events.actor_id,
+                events.occurred_at,
+                operations.action,
+                operations.status,
+                activities.id AS activity_id,
+                activities.channel_id AS activity_channel_id,
+                activities.operation_id AS activity_operation_id,
+                activities.kind AS activity_kind,
+                activities.actor_id AS activity_actor_id,
+                activities.occurred_at AS activity_occurred_at,
+                activities.sequence AS activity_position
+         FROM subscription_events AS events
+         INNER JOIN operations ON operations.id = events.operation_id
+         LEFT JOIN channel_activities AS activities ON activities.id = events.activity_id
+         WHERE events.position > ?
+         ORDER BY events.position
+         LIMIT ?`,
+      )
+      .all(afterPosition, limit) as SubscriptionEventRow[];
+    return rows.map((row): SubscriptionEvent => {
+      if (row.event_type === 'activity') {
+        if (
+          row.activity_actor_id === null ||
+          row.activity_channel_id === null ||
+          row.activity_id === null ||
+          row.activity_kind === null ||
+          row.activity_occurred_at === null ||
+          row.activity_operation_id === null ||
+          row.activity_position === null
+        ) {
+          throw new Error('Activity subscription event is incomplete');
+        }
+        return {
+          activity: {
+            actorId: row.activity_actor_id,
+            channelId: row.activity_channel_id,
+            id: row.activity_id,
+            kind: row.activity_kind,
+            occurredAt: row.activity_occurred_at,
+            operationId: row.activity_operation_id,
+            position: row.activity_position,
+          },
+          id: row.id,
+          position: row.position,
+          type: 'activity',
+        };
+      }
+      return {
+        action: row.action,
+        actorId: row.actor_id,
+        ...(row.channel_id === null ? {} : { channelId: row.channel_id }),
+        id: row.id,
+        occurredAt: row.occurred_at,
+        operationId: row.operation_id,
+        position: row.position,
+        status: row.status,
+        type: 'operation-result',
+      };
+    });
+  }
+
   async commit(operation: Operation): Promise<void> {
     const apply = this.#database.transaction((candidate: Operation) => {
       for (const change of candidate.changes) {
@@ -1025,6 +1132,35 @@ export class SqliteStore implements DatagramStore {
       for (const change of candidate.changes) {
         if (change.kind === 'activity.appended') this.#applyChange(change);
       }
+
+      for (const change of candidate.changes) {
+        if (change.kind !== 'activity.appended') continue;
+        this.#database.run(
+          `INSERT INTO subscription_events
+            (id, event_type, operation_id, activity_id, channel_id, actor_id, occurred_at)
+           VALUES (?, 'activity', ?, ?, ?, ?, ?)`,
+          [
+            change.activity.id,
+            candidate.id,
+            change.activity.id,
+            change.activity.channelId,
+            change.activity.actorId,
+            change.activity.occurredAt,
+          ],
+        );
+      }
+      this.#database.run(
+        `INSERT INTO subscription_events
+          (id, event_type, operation_id, activity_id, channel_id, actor_id, occurred_at)
+         VALUES (?, 'operation-result', ?, NULL, ?, ?, ?)`,
+        [
+          `operation-result:${candidate.id}`,
+          candidate.id,
+          candidate.channelId ?? null,
+          candidate.actorId,
+          candidate.occurredAt,
+        ],
+      );
     });
     apply(operation);
   }
@@ -1131,6 +1267,9 @@ export class SqliteStore implements DatagramStore {
         );
         this.#database.run('DELETE FROM messages WHERE channel_id = ?', [change.channelId]);
         this.#database.run('DELETE FROM channel_invitations WHERE channel_id = ?', [
+          change.channelId,
+        ]);
+        this.#database.run('DELETE FROM subscription_events WHERE channel_id = ?', [
           change.channelId,
         ]);
         this.#database.run('DELETE FROM channel_activities WHERE channel_id = ?', [

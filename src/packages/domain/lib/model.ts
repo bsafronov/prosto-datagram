@@ -157,7 +157,29 @@ export interface ChannelActivity {
   readonly kind: string;
   readonly occurredAt: string;
   readonly operationId: string;
+  readonly position: number;
 }
+
+export type PendingChannelActivity = Omit<ChannelActivity, 'position'>;
+
+export type SubscriptionEvent =
+  | {
+      readonly activity: ChannelActivity;
+      readonly id: string;
+      readonly position: number;
+      readonly type: 'activity';
+    }
+  | {
+      readonly action: string;
+      readonly actorId: string;
+      readonly channelId?: string;
+      readonly id: string;
+      readonly occurredAt: string;
+      readonly operationId: string;
+      readonly position: number;
+      readonly status: 'succeeded';
+      readonly type: 'operation-result';
+    };
 
 export interface ChannelNavigation {
   readonly archivedAt?: string;
@@ -330,7 +352,7 @@ export type DomainChange =
       readonly messageId: string;
       readonly restoredBy: string;
     }
-  | { readonly activity: ChannelActivity; readonly kind: 'activity.appended' };
+  | { readonly activity: PendingChannelActivity; readonly kind: 'activity.appended' };
 
 export interface ActionReceipt {
   readonly action: string;

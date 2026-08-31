@@ -10,6 +10,7 @@ import type {
   DictionaryEntry,
   Message,
   Operation,
+  SubscriptionEvent,
   Person,
   TableField,
   TableRecord,
@@ -42,6 +43,7 @@ export interface DatagramStore {
   listMessages(channelId: string): Promise<readonly Message[]>;
   listOperations(channelId: string): Promise<readonly Operation[]>;
   listServiceOperations(): Promise<readonly Operation[]>;
+  listSubscriptionEvents(afterPosition: number, limit: number): Promise<readonly SubscriptionEvent[]>;
   listTableFields(channelId: string): Promise<readonly TableField[]>;
   listTableRecords(channelId: string): Promise<readonly TableRecord[]>;
   listTableViews(channelId: string, personId: string): Promise<readonly TableView[]>;

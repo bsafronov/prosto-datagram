@@ -1,4 +1,9 @@
-import type { ActionReceipt, OperationOrigin, QueryResult } from '../domain/model';
+import type {
+  ActionReceipt,
+  OperationOrigin,
+  QueryResult,
+  SubscriptionEvent,
+} from '../domain/model';
 import type { ActionRegistry, QueryRegistry } from './contracts';
 import type { IssuedResultHandle, ResultHandleBroker } from './result-handles';
 
@@ -24,4 +29,8 @@ export interface DatagramApplicationPort {
     name: string,
     input: unknown,
   ): Promise<IssuedResultHandle>;
+  subscribe(
+    actorId: string,
+    options?: { readonly after?: number; readonly signal?: AbortSignal },
+  ): AsyncIterable<SubscriptionEvent>;
 }

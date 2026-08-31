@@ -36,6 +36,49 @@ function failure(error: unknown): Response {
   return json({ error: { code: 'internal', message: 'Internal server error' } }, 500);
 }
 
+function eventStream(
+  app: DatagramApplicationPort,
+  actorId: string,
+  after: number,
+  requestSignal: AbortSignal,
+): Response {
+  const abort = new AbortController();
+  const iterator = app.subscribe(actorId, { after, signal: abort.signal })[Symbol.asyncIterator]();
+  const encoder = new TextEncoder();
+  requestSignal.addEventListener('abort', () => abort.abort(), { once: true });
+  return new Response(
+    new ReadableStream<Uint8Array>({
+      async cancel() {
+        abort.abort();
+        await iterator.return?.();
+      },
+      async pull(controller) {
+        try {
+          const next = await iterator.next();
+          if (next.done) {
+            controller.close();
+            return;
+          }
+          controller.enqueue(
+            encoder.encode(
+              `id: ${next.value.position}\nevent: ${next.value.type}\ndata: ${JSON.stringify(next.value)}\n\n`,
+            ),
+          );
+        } catch (error) {
+          controller.error(error);
+        }
+      },
+    }),
+    {
+      headers: {
+        'cache-control': 'no-cache',
+        connection: 'keep-alive',
+        'content-type': 'text/event-stream; charset=utf-8',
+      },
+    },
+  );
+}
+
 export function createHttpHandler({ app, defaultActorId }: HttpHandlerOptions) {
   const catalog = (definitions: readonly { description: string; name: string }[]) =>
     definitions.map(({ description, name }) => ({ description, name }));
@@ -53,6 +96,23 @@ export function createHttpHandler({ app, defaultActorId }: HttpHandlerOptions) {
       }
       if (request.method === 'GET' && url.pathname === '/v1/queries') {
         return json({ queries: catalog(app.queries.list()) });
+      }
+      if (request.method === 'GET' && url.pathname === '/v1/events') {
+        const rawPosition =
+          request.headers.get('last-event-id') ?? url.searchParams.get('after') ?? '0';
+        const after = Number(rawPosition);
+        if (!Number.isSafeInteger(after) || after < 0) {
+          return json(
+            {
+              error: {
+                code: 'subscription.position-invalid',
+                message: 'Subscription position must be a non-negative integer',
+              },
+            },
+            400,
+          );
+        }
+        return eventStream(app, actorId, after, request.signal);
       }
 
       const action = url.pathname.match(/^\/v1\/actions\/([^/]+)$/);

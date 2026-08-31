@@ -277,6 +277,17 @@ describe('shared Channel lifecycle', () => {
     expect(await value.store.getMessage(message.subject!.id)).toBeNull();
     expect(await value.store.getMembership(channelId, value.owner.id)).toBeNull();
     expect(await value.store.listActivities(channelId)).toEqual([]);
+    expect(
+      (await value.store.listSubscriptionEvents(0, 100)).filter(
+        (event) =>
+          (event.type === 'activity' ? event.activity.channelId : event.channelId) === channelId,
+      ),
+    ).toEqual([
+      expect.objectContaining({
+        action: 'channel.purge',
+        type: 'operation-result',
+      }),
+    ]);
     expect((await value.store.listOperations(channelId)).map((item) => item.action)).toEqual([
       'channel.purge',
     ]);
