@@ -10,6 +10,7 @@ export type {
   DomainChange,
   JsonValue,
   Message,
+  MessageRevision,
   Operation,
   Person,
   TableField,

@@ -120,6 +120,17 @@ export interface Message {
   readonly createdAt: string;
   readonly id: string;
   readonly recordReferences: readonly string[];
+  readonly replyToMessageId?: string;
+  readonly revisions: readonly MessageRevision[];
+  readonly text: string;
+  readonly tombstonedAt?: string;
+  readonly tombstonedBy?: string;
+}
+
+export interface MessageRevision {
+  readonly createdAt: string;
+  readonly editorId: string;
+  readonly id: string;
   readonly text: string;
 }
 
@@ -245,6 +256,22 @@ export type DomainChange =
     }
   | { readonly kind: 'table.view-saved'; readonly view: TableView }
   | { readonly kind: 'discussion.message-posted'; readonly message: Message }
+  | {
+      readonly kind: 'discussion.message-edited';
+      readonly messageId: string;
+      readonly revision: MessageRevision;
+    }
+  | {
+      readonly actorId: string;
+      readonly kind: 'discussion.message-tombstoned';
+      readonly messageId: string;
+      readonly tombstonedAt: string;
+    }
+  | {
+      readonly kind: 'discussion.message-restored';
+      readonly messageId: string;
+      readonly restoredBy: string;
+    }
   | { readonly activity: ChannelActivity; readonly kind: 'activity.appended' };
 
 export interface ActionReceipt {

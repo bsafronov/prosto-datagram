@@ -156,6 +156,14 @@ export function storeConformance(name: string, createFixture: StoreFixtureFactor
                   createdAt: timestamp(2),
                   id: 'message-reference',
                   recordReferences: [recordId, 'record-unresolved'],
+                  revisions: [
+                    {
+                      createdAt: timestamp(2),
+                      editorId: owner.id,
+                      id: 'revision-reference',
+                      text: 'References',
+                    },
+                  ],
                   text: 'References',
                 },
               },
@@ -177,13 +185,74 @@ export function storeConformance(name: string, createFixture: StoreFixtureFactor
             second: 2,
           }),
         );
+        await store.commit(
+          operation({
+            action: 'discussion.message.edit',
+            actorId: owner.id,
+            changes: [
+              {
+                kind: 'discussion.message-edited',
+                messageId: 'message-reference',
+                revision: {
+                  createdAt: timestamp(3),
+                  editorId: owner.id,
+                  id: 'revision-edited',
+                  text: 'Edited references',
+                },
+              },
+              {
+                activity: activity(
+                  'activity-message-edited',
+                  'channel-reference',
+                  owner.id,
+                  'operation-message-edited',
+                  3,
+                ),
+                kind: 'activity.appended',
+              },
+            ],
+            channelId: 'channel-reference',
+            id: 'operation-message-edited',
+            second: 3,
+          }),
+        );
+        await store.commit(
+          operation({
+            action: 'discussion.message.tombstone',
+            actorId: owner.id,
+            changes: [
+              {
+                actorId: owner.id,
+                kind: 'discussion.message-tombstoned',
+                messageId: 'message-reference',
+                tombstonedAt: timestamp(4),
+              },
+              {
+                activity: activity(
+                  'activity-message-tombstoned',
+                  'channel-reference',
+                  owner.id,
+                  'operation-message-tombstoned',
+                  4,
+                ),
+                kind: 'activity.appended',
+              },
+            ],
+            channelId: 'channel-reference',
+            id: 'operation-message-tombstoned',
+            second: 4,
+          }),
+        );
         await store.close();
         store = await fixture.reopen();
 
-        expect((await store.listMessages('channel-reference'))[0]?.recordReferences).toEqual([
-          recordId,
-          'record-unresolved',
-        ]);
+        expect((await store.listMessages('channel-reference'))[0]).toMatchObject({
+          recordReferences: [recordId, 'record-unresolved'],
+          revisions: [{ text: 'References' }, { text: 'Edited references' }],
+          text: 'Edited references',
+          tombstonedAt: timestamp(4),
+          tombstonedBy: owner.id,
+        });
         const persisted = (await store.listOperations('channel-reference'))[1];
         expect(persisted).toMatchObject({
           actorId: owner.id,
@@ -194,7 +263,37 @@ export function storeConformance(name: string, createFixture: StoreFixtureFactor
           result: { messageId: 'message-reference' },
           status: 'succeeded',
         });
-        expect(await store.listActivities('channel-reference')).toHaveLength(2);
+        expect(await store.listActivities('channel-reference')).toHaveLength(4);
+        await store.commit(
+          operation({
+            action: 'discussion.message.restore',
+            actorId: owner.id,
+            changes: [
+              {
+                kind: 'discussion.message-restored',
+                messageId: 'message-reference',
+                restoredBy: owner.id,
+              },
+              {
+                activity: activity(
+                  'activity-message-restored',
+                  'channel-reference',
+                  owner.id,
+                  'operation-message-restored',
+                  5,
+                ),
+                kind: 'activity.appended',
+              },
+            ],
+            channelId: 'channel-reference',
+            id: 'operation-message-restored',
+            second: 5,
+          }),
+        );
+        expect(await store.getMessage('message-reference')).toMatchObject({
+          text: 'Edited references',
+        });
+        expect((await store.getMessage('message-reference'))?.tombstonedAt).toBeUndefined();
       } finally {
         await store.close();
         await fixture.dispose();

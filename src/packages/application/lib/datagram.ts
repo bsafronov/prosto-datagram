@@ -19,6 +19,7 @@ import type {
   ChannelRole,
   DomainChange,
   JsonValue,
+  Message,
   Operation,
   OperationOrigin,
   Person,
@@ -164,6 +165,25 @@ export class DatagramApplication {
   ): Promise<ChannelNavigation> {
     const current = await this.store.getChannelNavigation(channelId, actorId);
     return { ...current, ...update };
+  }
+
+  async #requireMessage(channelId: string, messageId: string): Promise<Message> {
+    const message = await this.store.getMessage(messageId);
+    invariant(message, 'discussion.message-not-found', 'Message does not exist', 404);
+    invariant(
+      message.channelId === channelId,
+      'discussion.message-not-found',
+      'Message does not exist',
+      404,
+    );
+    return message;
+  }
+
+  async #requireMessageAuthorOrAdmin(actorId: string, message: Message): Promise<void> {
+    await this.#requireRole(actorId, message.channelId, 'contributor');
+    if (message.authorId !== actorId) {
+      await this.#requireRole(actorId, message.channelId, 'admin');
+    }
   }
 
   async #commit(
@@ -1237,13 +1257,18 @@ export class DatagramApplication {
         inputSchema: z.object({
           channelId: z.string().min(1),
           recordReferences: z.array(z.string().min(1)).default([]),
+          replyToMessageId: z.string().min(1).optional(),
           text: z.string().trim().min(1).max(20_000),
         }),
         name: 'discussion.message.post',
         run: async (context, input) => {
           await this.#requireChannel(input.channelId);
           await this.#requireRole(context.actorId, input.channelId, 'contributor');
+          if (input.replyToMessageId !== undefined) {
+            await this.#requireMessage(input.channelId, input.replyToMessageId);
+          }
           const messageId = newId('message');
+          const revisionId = newId('revision');
           const occurredAt = nowIso();
           return this.#commit(
             context,
@@ -1258,6 +1283,17 @@ export class DatagramApplication {
                   createdAt: occurredAt,
                   id: messageId,
                   recordReferences: input.recordReferences,
+                  ...(input.replyToMessageId === undefined
+                    ? {}
+                    : { replyToMessageId: input.replyToMessageId }),
+                  revisions: [
+                    {
+                      createdAt: occurredAt,
+                      editorId: context.actorId,
+                      id: revisionId,
+                      text: input.text,
+                    },
+                  ],
                   text: input.text,
                 },
               },
@@ -1273,6 +1309,148 @@ export class DatagramApplication {
               },
             ],
             { id: messageId, kind: 'message' },
+          );
+        },
+      }),
+      defineAction({
+        description: 'Edit an active Message while preserving its revision history. Author only.',
+        inputSchema: z.object({
+          channelId: z.string().min(1),
+          messageId: z.string().min(1),
+          text: z.string().trim().min(1).max(20_000),
+        }),
+        name: 'discussion.message.edit',
+        run: async (context, input) => {
+          await this.#requireChannel(input.channelId);
+          const message = await this.#requireMessage(input.channelId, input.messageId);
+          await this.#requireRole(context.actorId, input.channelId, 'contributor');
+          invariant(
+            message.authorId === context.actorId,
+            'permission.denied',
+            'Only the Message author can edit it',
+            403,
+          );
+          invariant(
+            message.tombstonedAt === undefined,
+            'discussion.message-tombstoned',
+            'Tombstoned Message cannot be edited',
+            409,
+          );
+          const occurredAt = nowIso();
+          return this.#commit(
+            context,
+            'discussion.message.edit',
+            input.channelId,
+            (operationId) => [
+              {
+                kind: 'discussion.message-edited',
+                messageId: input.messageId,
+                revision: {
+                  createdAt: occurredAt,
+                  editorId: context.actorId,
+                  id: newId('revision'),
+                  text: input.text,
+                },
+              },
+              {
+                activity: this.#activity(
+                  context.actorId,
+                  input.channelId,
+                  'discussion.message-edited',
+                  operationId,
+                  occurredAt,
+                ),
+                kind: 'activity.appended',
+              },
+            ],
+            { id: input.messageId, kind: 'message' },
+          );
+        },
+      }),
+      defineAction({
+        description: 'Tombstone a Message. Authors may act on their own; Admins may moderate any.',
+        inputSchema: z.object({
+          channelId: z.string().min(1),
+          messageId: z.string().min(1),
+        }),
+        name: 'discussion.message.tombstone',
+        run: async (context, input) => {
+          await this.#requireChannel(input.channelId);
+          const message = await this.#requireMessage(input.channelId, input.messageId);
+          await this.#requireMessageAuthorOrAdmin(context.actorId, message);
+          invariant(
+            message.tombstonedAt === undefined,
+            'discussion.message-already-tombstoned',
+            'Message is already tombstoned',
+            409,
+          );
+          const occurredAt = nowIso();
+          return this.#commit(
+            context,
+            'discussion.message.tombstone',
+            input.channelId,
+            (operationId) => [
+              {
+                actorId: context.actorId,
+                kind: 'discussion.message-tombstoned',
+                messageId: input.messageId,
+                tombstonedAt: occurredAt,
+              },
+              {
+                activity: this.#activity(
+                  context.actorId,
+                  input.channelId,
+                  'discussion.message-tombstoned',
+                  operationId,
+                  occurredAt,
+                ),
+                kind: 'activity.appended',
+              },
+            ],
+            { id: input.messageId, kind: 'message' },
+          );
+        },
+      }),
+      defineAction({
+        description: 'Restore a Message. Authors may act on their own; Admins may moderate any.',
+        inputSchema: z.object({
+          channelId: z.string().min(1),
+          messageId: z.string().min(1),
+        }),
+        name: 'discussion.message.restore',
+        run: async (context, input) => {
+          await this.#requireChannel(input.channelId);
+          const message = await this.#requireMessage(input.channelId, input.messageId);
+          await this.#requireMessageAuthorOrAdmin(context.actorId, message);
+          invariant(
+            message.tombstonedAt !== undefined,
+            'discussion.message-not-tombstoned',
+            'Message is not tombstoned',
+            409,
+          );
+          const occurredAt = nowIso();
+          return this.#commit(
+            context,
+            'discussion.message.restore',
+            input.channelId,
+            (operationId) => [
+              {
+                kind: 'discussion.message-restored',
+                messageId: input.messageId,
+                restoredBy: context.actorId,
+              },
+              {
+                activity: this.#activity(
+                  context.actorId,
+                  input.channelId,
+                  'discussion.message-restored',
+                  operationId,
+                  occurredAt,
+                ),
+                kind: 'activity.appended',
+              },
+            ],
+            { id: input.messageId, kind: 'message' },
           );
         },
       }),
@@ -1518,22 +1696,75 @@ export class DatagramApplication {
         name: 'discussion.messages.list',
         run: async (context, input): Promise<QueryResult> => {
           const channel = await this.#requireChannel(input.channelId);
-          await this.#requireRole(context.actorId, input.channelId, 'viewer');
+          const membership = await this.store.getMembership(input.channelId, context.actorId);
+          invariant(membership, 'permission.denied', 'Channel membership is required', 403);
           const messages = await this.store.listMessages(input.channelId);
           return {
             data: messages.map((message) => ({
               authorId: message.authorId,
               createdAt: message.createdAt,
               id: message.id,
-              recordReferences: [...message.recordReferences],
-              text: message.text,
+              recordReferences:
+                message.tombstonedAt === undefined ? [...message.recordReferences] : [],
+              ...(message.replyToMessageId === undefined
+                ? {}
+                : { replyToMessageId: message.replyToMessageId }),
+              text: message.tombstonedAt === undefined ? message.text : null,
+              ...(message.tombstonedAt === undefined
+                ? {}
+                : { tombstonedAt: message.tombstonedAt }),
             })),
             view: {
               bindings: { messages: '$result' },
-              commands: ['discussion.message.post'],
+              commands:
+                membership.role === 'viewer'
+                  ? []
+                  : [
+                      'discussion.message.post',
+                      'discussion.message.edit',
+                      'discussion.message.tombstone',
+                      'discussion.message.restore',
+                    ],
               kind: 'discussion',
               schemaVersion: 'datagram/view@1',
               title: `${channel.title} Discussion`,
+            },
+          };
+        },
+      }),
+      defineQuery({
+        description: 'Inspect one Message revision history under Operation History policy.',
+        inputSchema: z.object({
+          channelId: z.string().min(1),
+          messageId: z.string().min(1),
+        }),
+        name: 'discussion.message.revisions',
+        run: async (context, input): Promise<QueryResult> => {
+          const channel = await this.#requireChannel(input.channelId);
+          const message = await this.#requireMessage(input.channelId, input.messageId);
+          const membership = await this.store.getMembership(input.channelId, context.actorId);
+          invariant(membership, 'permission.denied', 'Channel membership is required', 403);
+          invariant(
+            membership.role === 'owner' ||
+              membership.role === 'admin' ||
+              (membership.role === 'contributor' && message.authorId === context.actorId),
+            'permission.denied',
+            'Message revision history is not available',
+            403,
+          );
+          return {
+            data: message.revisions.map((revision) => ({
+              createdAt: revision.createdAt,
+              editorId: revision.editorId,
+              id: revision.id,
+              text: revision.text,
+            })),
+            view: {
+              bindings: { revisions: '$result' },
+              commands: [],
+              kind: 'table',
+              schemaVersion: 'datagram/view@1',
+              title: `${channel.title} Message Revisions`,
             },
           };
         },

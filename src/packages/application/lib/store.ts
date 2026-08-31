@@ -24,6 +24,7 @@ export interface DatagramStore {
   getChannelGroup(groupId: string): Promise<ChannelGroup | null>;
   getChannelNavigation(channelId: string, personId: string): Promise<ChannelNavigation>;
   getInvitation(invitationId: string): Promise<ChannelInvitation | null>;
+  getMessage(messageId: string): Promise<Message | null>;
   getMembership(channelId: string, personId: string): Promise<ChannelMembership | null>;
   getPerson(personId: string): Promise<Person | null>;
   getTableDisplayFieldId(channelId: string): Promise<string | null>;

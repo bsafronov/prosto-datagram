@@ -15,6 +15,7 @@ import {
   type DomainChange,
   type JsonValue,
   type Message,
+  type MessageRevision,
   type Operation,
   type Person,
   type TableField,
@@ -95,6 +96,17 @@ interface MessageRow {
   created_at: string;
   id: string;
   record_references_json: string;
+  reply_to_message_id: string | null;
+  text: string;
+  tombstoned_at: string | null;
+  tombstoned_by: string | null;
+}
+
+interface MessageRevisionRow {
+  created_at: string;
+  editor_id: string;
+  id: string;
+  message_id: string;
   text: string;
 }
 
@@ -228,13 +240,29 @@ const tableViewFromRow = (row: TableViewRow): TableView => {
   };
 };
 
-const messageFromRow = (row: MessageRow): Message => ({
+const messageRevisionFromRow = (row: MessageRevisionRow): MessageRevision => ({
+  createdAt: row.created_at,
+  editorId: row.editor_id,
+  id: row.id,
+  text: row.text,
+});
+
+const messageFromRow = (
+  row: MessageRow,
+  revisions: readonly MessageRevision[],
+): Message => ({
   authorId: row.author_id,
   channelId: row.channel_id,
   createdAt: row.created_at,
   id: row.id,
   recordReferences: JSON.parse(row.record_references_json) as string[],
+  ...(row.reply_to_message_id === null
+    ? {}
+    : { replyToMessageId: row.reply_to_message_id }),
+  revisions,
   text: row.text,
+  ...(row.tombstoned_at === null ? {} : { tombstonedAt: row.tombstoned_at }),
+  ...(row.tombstoned_by === null ? {} : { tombstonedBy: row.tombstoned_by }),
 });
 
 const operationFromRow = (row: OperationRow): Operation => ({
@@ -433,6 +461,17 @@ export class SqliteStore implements DatagramStore {
         author_id TEXT NOT NULL REFERENCES persons(id),
         text TEXT NOT NULL,
         record_references_json TEXT NOT NULL,
+        reply_to_message_id TEXT REFERENCES messages(id),
+        created_at TEXT NOT NULL,
+        tombstoned_at TEXT,
+        tombstoned_by TEXT REFERENCES persons(id)
+      );
+
+      CREATE TABLE IF NOT EXISTS message_revisions (
+        id TEXT PRIMARY KEY,
+        message_id TEXT NOT NULL REFERENCES messages(id),
+        editor_id TEXT NOT NULL REFERENCES persons(id),
+        text TEXT NOT NULL,
         created_at TEXT NOT NULL
       );
 
@@ -508,6 +547,8 @@ export class SqliteStore implements DatagramStore {
         ON table_records(channel_id, created_at);
       CREATE INDEX IF NOT EXISTS messages_channel
         ON messages(channel_id, created_at);
+      CREATE INDEX IF NOT EXISTS message_revisions_message
+        ON message_revisions(message_id, created_at, id);
     `);
 
     const personColumns = new Set(
@@ -518,6 +559,30 @@ export class SqliteStore implements DatagramStore {
     if (!personColumns.has('deactivated_at')) {
       this.#database.exec('ALTER TABLE persons ADD COLUMN deactivated_at TEXT;');
     }
+
+    const messageColumns = new Set(
+      (this.#database.query('PRAGMA table_info(messages)').all() as TableInfoRow[]).map(
+        (column) => column.name,
+      ),
+    );
+    if (!messageColumns.has('reply_to_message_id')) {
+      this.#database.exec('ALTER TABLE messages ADD COLUMN reply_to_message_id TEXT;');
+    }
+    if (!messageColumns.has('tombstoned_at')) {
+      this.#database.exec('ALTER TABLE messages ADD COLUMN tombstoned_at TEXT;');
+    }
+    if (!messageColumns.has('tombstoned_by')) {
+      this.#database.exec('ALTER TABLE messages ADD COLUMN tombstoned_by TEXT;');
+    }
+    this.#database.exec(`
+      INSERT INTO message_revisions (id, message_id, editor_id, text, created_at)
+      SELECT 'revision_' || messages.id, messages.id, messages.author_id, messages.text,
+             messages.created_at
+      FROM messages
+      WHERE NOT EXISTS (
+        SELECT 1 FROM message_revisions WHERE message_revisions.message_id = messages.id
+      );
+    `);
 
     const operationColumns = new Set(
       (
@@ -632,6 +697,13 @@ export class SqliteStore implements DatagramStore {
       .query('SELECT * FROM channel_invitations WHERE id = ?')
       .get(invitationId) as InvitationRow | null;
     return row ? invitationFromRow(row) : null;
+  }
+
+  async getMessage(messageId: string): Promise<Message | null> {
+    const row = this.#database.query('SELECT * FROM messages WHERE id = ?').get(messageId) as
+      | MessageRow
+      | null;
+    return row ? messageFromRow(row, this.#listMessageRevisions(messageId)) : null;
   }
 
   async getMembership(channelId: string, personId: string): Promise<ChannelMembership | null> {
@@ -780,7 +852,18 @@ export class SqliteStore implements DatagramStore {
     const rows = this.#database
       .query('SELECT * FROM messages WHERE channel_id = ? ORDER BY created_at, id')
       .all(channelId) as MessageRow[];
-    return rows.map(messageFromRow);
+    return rows.map((row) => messageFromRow(row, this.#listMessageRevisions(row.id)));
+  }
+
+  #listMessageRevisions(messageId: string): readonly MessageRevision[] {
+    const rows = this.#database
+      .query(
+        `SELECT * FROM message_revisions
+         WHERE message_id = ?
+         ORDER BY rowid`,
+      )
+      .all(messageId) as MessageRevisionRow[];
+    return rows.map(messageRevisionFromRow);
   }
 
   async listOperations(channelId: string): Promise<readonly Operation[]> {
@@ -1134,20 +1217,87 @@ export class SqliteStore implements DatagramStore {
         );
         return;
       case 'discussion.message-posted':
+        if (change.message.revisions.length !== 1) {
+          throw new Error('Posted Message must have exactly one initial revision');
+        }
+        if (
+          change.message.revisions[0]!.editorId !== change.message.authorId ||
+          change.message.revisions[0]!.text !== change.message.text
+        ) {
+          throw new Error('Initial Message revision must match posted Message');
+        }
+        if (change.message.replyToMessageId !== undefined) {
+          const replyTarget = this.#database
+            .query('SELECT channel_id FROM messages WHERE id = ?')
+            .get(change.message.replyToMessageId) as { channel_id: string } | null;
+          if (replyTarget?.channel_id !== change.message.channelId) {
+            throw new Error('Reply target must belong to the same Channel Discussion');
+          }
+        }
         this.#database.run(
           `INSERT INTO messages
-            (id, channel_id, author_id, text, record_references_json, created_at)
-           VALUES (?, ?, ?, ?, ?, ?)`,
+            (id, channel_id, author_id, text, record_references_json, reply_to_message_id,
+             created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
           [
             change.message.id,
             change.message.channelId,
             change.message.authorId,
             change.message.text,
             JSON.stringify(change.message.recordReferences),
+            change.message.replyToMessageId ?? null,
             change.message.createdAt,
           ],
         );
+        this.#database.run(
+          `INSERT INTO message_revisions (id, message_id, editor_id, text, created_at)
+           VALUES (?, ?, ?, ?, ?)`,
+          [
+            change.message.revisions[0]!.id,
+            change.message.id,
+            change.message.revisions[0]!.editorId,
+            change.message.revisions[0]!.text,
+            change.message.revisions[0]!.createdAt,
+          ],
+        );
         return;
+      case 'discussion.message-edited': {
+        const result = this.#database.run(
+          'UPDATE messages SET text = ? WHERE id = ? AND tombstoned_at IS NULL',
+          [change.revision.text, change.messageId],
+        );
+        if (result.changes !== 1) throw new Error('Message cannot be edited');
+        this.#database.run(
+          `INSERT INTO message_revisions (id, message_id, editor_id, text, created_at)
+           VALUES (?, ?, ?, ?, ?)`,
+          [
+            change.revision.id,
+            change.messageId,
+            change.revision.editorId,
+            change.revision.text,
+            change.revision.createdAt,
+          ],
+        );
+        return;
+      }
+      case 'discussion.message-tombstoned': {
+        const result = this.#database.run(
+          `UPDATE messages SET tombstoned_at = ?, tombstoned_by = ?
+           WHERE id = ? AND tombstoned_at IS NULL`,
+          [change.tombstonedAt, change.actorId, change.messageId],
+        );
+        if (result.changes !== 1) throw new Error('Message is already tombstoned');
+        return;
+      }
+      case 'discussion.message-restored': {
+        const result = this.#database.run(
+          `UPDATE messages SET tombstoned_at = NULL, tombstoned_by = NULL
+           WHERE id = ? AND tombstoned_at IS NOT NULL`,
+          [change.messageId],
+        );
+        if (result.changes !== 1) throw new Error('Message is not tombstoned');
+        return;
+      }
       case 'activity.appended':
         this.#database.run(
           `INSERT INTO channel_activities
