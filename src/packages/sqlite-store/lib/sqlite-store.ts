@@ -65,12 +65,14 @@ interface MembershipRow {
 }
 
 interface TableFieldRow {
+  cardinality: NonNullable<TableField['cardinality']> | null;
   channel_id: string;
   default_json: string | null;
   id: string;
   key: string;
   label: string;
   required: number;
+  target_channel_id: string | null;
   type: TableField['type'];
   unique_value: number;
 }
@@ -243,6 +245,7 @@ const membershipFromRow = (row: MembershipRow): ChannelMembership => ({
 });
 
 const tableFieldFromRow = (row: TableFieldRow): TableField => ({
+  ...(row.cardinality === null ? {} : { cardinality: row.cardinality }),
   channelId: row.channel_id,
   ...(row.default_json === null
     ? {}
@@ -251,6 +254,7 @@ const tableFieldFromRow = (row: TableFieldRow): TableField => ({
   key: row.key,
   label: row.label,
   required: row.required === 1,
+  ...(row.target_channel_id === null ? {} : { targetChannelId: row.target_channel_id }),
   type: row.type,
   unique: row.unique_value === 1,
 });
@@ -496,6 +500,8 @@ export class SqliteStore implements DatagramStore {
         required INTEGER NOT NULL DEFAULT 0,
         unique_value INTEGER NOT NULL DEFAULT 0,
         default_json TEXT,
+        target_channel_id TEXT REFERENCES channels(id),
+        cardinality TEXT CHECK (cardinality IN ('one', 'many')),
         UNIQUE (channel_id, key)
       );
 
@@ -730,6 +736,22 @@ export class SqliteStore implements DatagramStore {
     }
     if (!recordColumns.has('tombstoned_by')) {
       this.#database.exec('ALTER TABLE table_records ADD COLUMN tombstoned_by TEXT;');
+    }
+
+    const fieldColumns = new Set(
+      (
+        this.#database.query('PRAGMA table_info(table_fields)').all() as TableInfoRow[]
+      ).map((column) => column.name),
+    );
+    if (!fieldColumns.has('target_channel_id')) {
+      this.#database.exec(
+        'ALTER TABLE table_fields ADD COLUMN target_channel_id TEXT REFERENCES channels(id);',
+      );
+    }
+    if (!fieldColumns.has('cardinality')) {
+      this.#database.exec(
+        "ALTER TABLE table_fields ADD COLUMN cardinality TEXT CHECK (cardinality IN ('one', 'many'));",
+      );
     }
   }
 
@@ -1497,8 +1519,9 @@ export class SqliteStore implements DatagramStore {
       case 'table.field-added':
         this.#database.run(
           `INSERT INTO table_fields
-            (id, channel_id, key, label, type, required, unique_value, default_json)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            (id, channel_id, key, label, type, required, unique_value, default_json,
+             target_channel_id, cardinality)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             change.field.id,
             change.field.channelId,
@@ -1510,6 +1533,8 @@ export class SqliteStore implements DatagramStore {
             change.field.defaultValue === undefined
               ? null
               : JSON.stringify(change.field.defaultValue),
+            change.field.targetChannelId ?? null,
+            change.field.cardinality ?? null,
           ],
         );
         return;

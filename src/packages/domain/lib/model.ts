@@ -33,6 +33,11 @@ export const tableFieldTypeSchema = z.enum([
 ]);
 export type TableFieldType = z.infer<typeof tableFieldTypeSchema>;
 
+export const recordReferenceCardinalitySchema = z.enum(['one', 'many']);
+export type RecordReferenceCardinality = z.infer<
+  typeof recordReferenceCardinalitySchema
+>;
+
 export interface Person {
   readonly createdAt: string;
   readonly deactivatedAt?: string;
@@ -85,12 +90,14 @@ export interface DictionaryEntry {
 }
 
 export interface TableField {
+  readonly cardinality?: RecordReferenceCardinality;
   readonly channelId: string;
   readonly defaultValue?: JsonValue;
   readonly id: string;
   readonly key: string;
   readonly label: string;
   readonly required: boolean;
+  readonly targetChannelId?: string;
   readonly type: TableFieldType;
   readonly unique: boolean;
 }

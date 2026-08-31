@@ -7,6 +7,7 @@ import {
   jsonValueSchema,
   newId,
   nowIso,
+  recordReferenceCardinalitySchema,
   tableFieldTypeSchema,
 } from '../../domain/model';
 import type {
@@ -1261,11 +1262,13 @@ export class DatagramApplication {
       defineAction({
         description: 'Add a typed Field to a Table Channel. Admin role required.',
         inputSchema: z.object({
+          cardinality: recordReferenceCardinalitySchema.optional(),
           channelId: z.string().min(1),
           defaultValue: optionalJsonValueSchema,
           key: z.string().regex(/^[a-z][a-z0-9_]*$/),
           label: z.string().trim().min(1).max(120),
           required: z.boolean().default(false),
+          targetChannelId: z.string().min(1).optional(),
           type: tableFieldTypeSchema,
           unique: z.boolean().default(false),
         }),
@@ -1284,6 +1287,18 @@ export class DatagramApplication {
           const records = allRecords.filter(
             (record) => record.tombstonedAt === undefined,
           );
+          const isRecordReference = input.type === 'record-reference';
+          invariant(
+            isRecordReference
+              ? input.targetChannelId !== undefined && input.cardinality !== undefined
+              : input.targetChannelId === undefined && input.cardinality === undefined,
+            'table.field-reference-configuration',
+            'Record Reference Field requires one target Channel and cardinality',
+          );
+          if (isRecordReference) {
+            await this.#requireChannel(input.targetChannelId!, 'table');
+            await this.#requireRole(context.actorId, input.targetChannelId!, 'viewer');
+          }
           if (input.defaultValue !== undefined) {
             invariant(
               !(input.required && input.defaultValue === null),
@@ -1291,7 +1306,25 @@ export class DatagramApplication {
               `Required Field cannot default to null: ${input.key}`,
             );
             if (input.defaultValue !== null) {
-              this.#validateFieldValue(input.type, input.defaultValue);
+              const candidateField: TableField = {
+                ...(input.cardinality === undefined ? {} : { cardinality: input.cardinality }),
+                channelId: input.channelId,
+                id: 'candidate',
+                key: input.key,
+                label: input.label,
+                required: input.required,
+                ...(input.targetChannelId === undefined
+                  ? {}
+                  : { targetChannelId: input.targetChannelId }),
+                type: input.type,
+                unique: input.unique,
+              };
+              this.#validateFieldValue(candidateField, input.defaultValue);
+              await this.#validateRecordReferenceTargets(
+                context.actorId,
+                candidateField,
+                input.defaultValue,
+              );
             }
           }
           invariant(
@@ -1307,6 +1340,7 @@ export class DatagramApplication {
             409,
           );
           const field: TableField = {
+            ...(input.cardinality === undefined ? {} : { cardinality: input.cardinality }),
             channelId: input.channelId,
             ...(input.defaultValue === undefined
               ? {}
@@ -1315,6 +1349,9 @@ export class DatagramApplication {
             key: input.key,
             label: input.label,
             required: input.required,
+            ...(input.targetChannelId === undefined
+              ? {}
+              : { targetChannelId: input.targetChannelId }),
             type: input.type,
             unique: input.unique,
           };
@@ -1359,7 +1396,12 @@ export class DatagramApplication {
           await this.#requireRole(context.actorId, input.channelId, 'contributor');
           const fields = await this.store.listTableFields(input.channelId);
           const records = await this.store.listTableRecords(input.channelId);
-          const values = this.#validatedRecordValues(fields, records, input.values);
+          const values = await this.#validatedRecordValues(
+            context.actorId,
+            fields,
+            records,
+            input.values,
+          );
           const occurredAt = nowIso();
           const recordId = newId('record');
           return this.#commit(
@@ -1456,7 +1498,8 @@ export class DatagramApplication {
           );
           const fields = await this.store.listTableFields(input.channelId);
           const records = await this.store.listTableRecords(input.channelId);
-          const values = this.#validatedRecordValues(
+          const values = await this.#validatedRecordValues(
+            context.actorId,
             fields,
             records,
             { ...record.values, ...input.values },
@@ -1541,7 +1584,14 @@ export class DatagramApplication {
           );
           const fields = await this.store.listTableFields(input.channelId);
           const records = await this.store.listTableRecords(input.channelId);
-          const values = this.#validatedRecordValues(fields, records, record.values, record.id);
+          const values = await this.#validatedRecordValues(
+            context.actorId,
+            fields,
+            records,
+            record.values,
+            record.id,
+            false,
+          );
           const restoredAt = nowIso();
           return this.#commit(
             context,
@@ -2074,10 +2124,14 @@ export class DatagramApplication {
           const fields = await this.store.listTableFields(input.channelId);
           return {
             data: fields.map((field) => ({
+              ...(field.cardinality === undefined ? {} : { cardinality: field.cardinality }),
               id: field.id,
               key: field.key,
               label: field.label,
               required: field.required,
+              ...(field.targetChannelId === undefined
+                ? {}
+                : { targetChannelId: field.targetChannelId }),
               type: field.type,
               unique: field.unique,
             })),
@@ -2123,14 +2177,19 @@ export class DatagramApplication {
           const records = (await this.store.listTableRecords(input.channelId)).filter(
             (record) => input.includeTombstoned || record.tombstonedAt === undefined,
           );
+          const fields = await this.store.listTableFields(input.channelId);
           return {
-            data: records.map((record) => ({
+            data: await Promise.all(records.map(async (record) => ({
               id: record.id,
               ...(record.tombstonedAt === undefined
                 ? {}
                 : { tombstonedAt: record.tombstonedAt }),
-              values: record.values,
-            })),
+              values: await this.#resolveRecordReferenceValues(
+                context.actorId,
+                fields,
+                record.values,
+              ),
+            }))),
             view: {
               bindings: { rows: '$result' },
               commands: ['table.record.create'],
@@ -2316,12 +2375,14 @@ export class DatagramApplication {
     return { channelId, ...(recordId ? { recordId } : {}), status: 'resolved' };
   }
 
-  #validatedRecordValues(
+  async #validatedRecordValues(
+    actorId: string,
     fields: readonly TableField[],
     records: readonly TableRecord[],
     input: Readonly<Record<string, JsonValue>>,
     currentRecordId?: string,
-  ): Record<string, JsonValue> {
+    validateReferenceTargets = true,
+  ): Promise<Record<string, JsonValue>> {
     const fieldByKey = new Map(fields.map((field) => [field.key, field]));
     for (const key of Object.keys(input)) {
       invariant(
@@ -2343,7 +2404,21 @@ export class DatagramApplication {
         if (value === null) values[field.key] = null;
         continue;
       }
-      this.#validateFieldValue(field.type, value);
+      this.#validateFieldValue(field, value);
+      invariant(
+        !(
+          field.required &&
+          field.type === 'record-reference' &&
+          field.cardinality === 'many' &&
+          Array.isArray(value) &&
+          value.length === 0
+        ),
+        'table.record-required-field',
+        `Required Field is missing: ${field.key}`,
+      );
+      if (validateReferenceTargets) {
+        await this.#validateRecordReferenceTargets(actorId, field, value);
+      }
       if (field.unique) {
         invariant(
           !records.some(
@@ -2362,9 +2437,9 @@ export class DatagramApplication {
     return values;
   }
 
-  #validateFieldValue(type: TableField['type'], rawValue: unknown): JsonValue {
+  #validateFieldValue(field: TableField, rawValue: unknown): JsonValue {
     const value = toJson(rawValue);
-    switch (type) {
+    switch (field.type) {
       case 'text':
         invariant(typeof value === 'string', 'table.field-type', 'Expected text value');
         return value;
@@ -2386,15 +2461,96 @@ export class DatagramApplication {
         );
         return value;
       case 'dictionary':
-      case 'record-reference':
         invariant(
           typeof value === 'string',
           'table.field-type',
-          `Expected stable identity for ${type} value`,
+          `Expected stable identity for ${field.type} value`,
         );
         return value;
+      case 'record-reference':
+        invariant(
+          field.cardinality === 'one'
+            ? typeof value === 'string'
+            : Array.isArray(value) && value.every((item) => typeof item === 'string'),
+          'table.field-reference-cardinality',
+          `Expected ${field.cardinality ?? 'configured'} Record Reference value`,
+        );
+        if (Array.isArray(value)) {
+          invariant(
+            new Set(value).size === value.length,
+            'table.field-reference-duplicate',
+            'Record Reference values must be unique',
+          );
+        }
+        return value;
       default:
-        throw new DatagramError('table.field-type', `Unsupported Field type: ${String(type)}`);
+        throw new DatagramError(
+          'table.field-type',
+          `Unsupported Field type: ${String(field.type)}`,
+        );
     }
+  }
+
+  async #validateRecordReferenceTargets(
+    actorId: string,
+    field: TableField,
+    value: JsonValue,
+  ): Promise<void> {
+    if (field.type !== 'record-reference') return;
+    invariant(
+      field.targetChannelId !== undefined && field.cardinality !== undefined,
+      'table.field-reference-configuration',
+      'Record Reference Field is not configured',
+    );
+    const channel = await this.store.getChannel(field.targetChannelId);
+    const membership = await this.store.getMembership(field.targetChannelId, actorId);
+    invariant(
+      channel?.typeId === 'table' &&
+        channel.deletedAt === undefined &&
+        channel.purgedAt === undefined &&
+        membership !== null,
+      'table.record-reference-invalid',
+      'Record Reference target is unavailable',
+    );
+    const recordIds: readonly string[] =
+      typeof value === 'string'
+        ? [value]
+        : Array.isArray(value)
+          ? value.filter((recordId): recordId is string => typeof recordId === 'string')
+          : [];
+    for (const recordId of recordIds) {
+      const record = await this.store.getTableRecord(recordId);
+      invariant(
+        record?.channelId === field.targetChannelId && record.tombstonedAt === undefined,
+        'table.record-reference-invalid',
+        'Record Reference target is unavailable',
+      );
+    }
+  }
+
+  async #resolveRecordReferenceValues(
+    actorId: string,
+    fields: readonly TableField[],
+    values: Readonly<Record<string, JsonValue>>,
+  ): Promise<Record<string, JsonValue>> {
+    const resolved: Record<string, JsonValue> = { ...values };
+    for (const field of fields) {
+      if (field.type !== 'record-reference' || field.targetChannelId === undefined) continue;
+      const value = values[field.key];
+      if (typeof value === 'string') {
+        resolved[field.key] = await this.#resolveReference(
+          actorId,
+          field.targetChannelId,
+          value,
+        );
+      } else if (Array.isArray(value)) {
+        resolved[field.key] = await Promise.all(
+          value.map((recordId) =>
+            this.#resolveReference(actorId, field.targetChannelId!, String(recordId)),
+          ),
+        );
+      }
+    }
+    return resolved;
   }
 }
