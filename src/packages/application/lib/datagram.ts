@@ -1360,6 +1360,8 @@ export class DatagramApplication {
                     reversedRecords,
                     record.values,
                     record.id,
+                    true,
+                    new Set(),
                   );
                 }
               }
@@ -1816,6 +1818,8 @@ export class DatagramApplication {
               records,
               record.values,
               record.id,
+              true,
+              new Set(),
             );
           }
           const occurredAt = nowIso();
@@ -1927,16 +1931,27 @@ export class DatagramApplication {
             'Target Field type must differ',
             409,
           );
+          const isDictionary = input.targetType === 'dictionary';
           const isRecordReference = input.targetType === 'record-reference';
           invariant(
             isRecordReference
               ? input.targetChannelId !== undefined && input.cardinality !== undefined
-              : input.targetChannelId === undefined && input.cardinality === undefined,
+              : input.cardinality === undefined,
             'table.field-reference-configuration',
             'Record Reference Field requires one target Channel and cardinality',
           );
+          invariant(
+            isDictionary
+              ? input.targetChannelId !== undefined
+              : isRecordReference || input.targetChannelId === undefined,
+            'table.field-dictionary-configuration',
+            'Dictionary Field requires one target Dictionary Channel',
+          );
           if (isRecordReference) {
             await this.#requireChannel(input.targetChannelId!, 'table');
+            await this.#requireRole(context.actorId, input.targetChannelId!, 'viewer');
+          } else if (isDictionary) {
+            await this.#requireChannel(input.targetChannelId!, 'dictionary');
             await this.#requireRole(context.actorId, input.targetChannelId!, 'viewer');
           }
           const {
@@ -2010,10 +2025,16 @@ export class DatagramApplication {
                 'table.field-conversion-resolution-required',
                 'Correction or mapping needs a replacement value',
               );
-              nextDefault = this.#validateFieldValue(
+              const value = this.#validateFieldValue(
                 convertedField,
                 input.defaultResolution.value,
               );
+              invariant(
+                await this.#fieldAccepts(context.actorId, convertedField, value),
+                'table.field-conversion-resolution-invalid',
+                'Replacement value is incompatible with target Field',
+              );
+              nextDefault = value;
             }
           }
           const resolutions = new Map(
@@ -2031,7 +2052,7 @@ export class DatagramApplication {
             'Every incompatible value needs one explicit resolution',
             409,
           );
-          const updates = failures.map((record) => {
+          const updates = await Promise.all(failures.map(async (record) => {
             const resolution = resolutions.get(record.id)!;
             let value: JsonValue;
             if (resolution.kind === 'null') {
@@ -2056,9 +2077,14 @@ export class DatagramApplication {
                 convertedField,
                 resolution.value,
               );
+              invariant(
+                await this.#fieldAccepts(context.actorId, convertedField, value),
+                'table.field-conversion-resolution-invalid',
+                'Replacement value is incompatible with target Field',
+              );
             }
             return { record, value };
-          });
+          }));
           const next: TableField = {
             ...convertedField,
             ...(nextDefault === undefined ? {} : { defaultValue: nextDefault }),
@@ -2085,6 +2111,8 @@ export class DatagramApplication {
               nextRecords,
               record.values,
               record.id,
+              true,
+              new Set([field.key]),
             );
           }
           return this.#commit(
@@ -2972,16 +3000,27 @@ export class DatagramApplication {
             'Table Field is tombstoned',
             409,
           );
+          const isDictionary = input.targetType === 'dictionary';
           const isRecordReference = input.targetType === 'record-reference';
           invariant(
             isRecordReference
               ? input.targetChannelId !== undefined && input.cardinality !== undefined
-              : input.targetChannelId === undefined && input.cardinality === undefined,
+              : input.cardinality === undefined,
             'table.field-reference-configuration',
             'Record Reference Field requires one target Channel and cardinality',
           );
+          invariant(
+            isDictionary
+              ? input.targetChannelId !== undefined
+              : isRecordReference || input.targetChannelId === undefined,
+            'table.field-dictionary-configuration',
+            'Dictionary Field requires one target Dictionary Channel',
+          );
           if (isRecordReference) {
             await this.#requireChannel(input.targetChannelId!, 'table');
+            await this.#requireRole(context.actorId, input.targetChannelId!, 'viewer');
+          } else if (isDictionary) {
+            await this.#requireChannel(input.targetChannelId!, 'dictionary');
             await this.#requireRole(context.actorId, input.targetChannelId!, 'viewer');
           }
           const {
@@ -3300,11 +3339,14 @@ export class DatagramApplication {
     try {
       this.#validateFieldValue(field, value);
       await this.#validateRecordReferenceTargets(actorId, field, value);
+      await this.#validateDictionaryEntry(actorId, field, value);
       return true;
     } catch (error) {
       if (
         error instanceof DatagramError &&
-        (error.code.startsWith('table.field-') || error.code === 'table.record-reference-invalid')
+        (error.code.startsWith('table.field-') ||
+          error.code === 'table.record-reference-invalid' ||
+          error.code === 'table.dictionary-entry-invalid')
       ) {
         return false;
       }

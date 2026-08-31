@@ -314,4 +314,180 @@ describe('Dictionary-backed Table Fields', () => {
     expect(JSON.stringify(handle)).not.toContain('Apples');
     expect(JSON.stringify(handle)).not.toContain(entryId);
   });
+
+  test('requires a Dictionary target for empty-Table conversion', async () => {
+    const { dictionaryId, tableId, value } = await setup();
+    const field = await value.app.executeAction(value.owner.id, 'cli', 'table.field.add', {
+      channelId: tableId,
+      key: 'legacy',
+      label: 'Legacy',
+      required: false,
+      type: 'text',
+      unique: false,
+    });
+
+    await expect(
+      value.app.executeQuery(value.owner.id, 'cli', 'table.field.conversion.preview', {
+        channelId: tableId,
+        fieldId: field.subject!.id,
+        targetType: 'dictionary',
+      }),
+    ).rejects.toMatchObject({
+      code: 'table.field-dictionary-configuration',
+    } satisfies Partial<DatagramError>);
+    await expect(
+      value.app.executeAction(value.owner.id, 'cli', 'table.field.convert', {
+        channelId: tableId,
+        fieldId: field.subject!.id,
+        observedVersion: 1,
+        targetType: 'dictionary',
+      }),
+    ).rejects.toMatchObject({
+      code: 'table.field-dictionary-configuration',
+    } satisfies Partial<DatagramError>);
+
+    await value.app.executeAction(value.owner.id, 'cli', 'table.field.convert', {
+      channelId: tableId,
+      fieldId: field.subject!.id,
+      observedVersion: 1,
+      targetChannelId: dictionaryId,
+      targetType: 'dictionary',
+    });
+    expect(
+      (await value.store.listTableFields(tableId)).find(
+        (candidate) => candidate.id === field.subject!.id,
+      ),
+    ).toMatchObject({ targetChannelId: dictionaryId, type: 'dictionary', version: 2 });
+  });
+
+  test('previews invalid Dictionary conversions and requires target access', async () => {
+    const { dictionaryId, entryId, otherEntryId, tableId, value } = await setup();
+    const activeEntry = await value.app.executeAction(
+      value.owner.id,
+      'cli',
+      'dictionary.entry.create',
+      { channelId: dictionaryId, label: 'Pears' },
+    );
+    const field = await value.app.executeAction(value.owner.id, 'cli', 'table.field.add', {
+      channelId: tableId,
+      key: 'legacy',
+      label: 'Legacy',
+      required: false,
+      type: 'text',
+      unique: false,
+    });
+    const recordIds: string[] = [];
+    for (const legacy of ['missing-entry', entryId, otherEntryId, activeEntry.subject!.id]) {
+      const record = await value.app.executeAction(
+        value.owner.id,
+        'cli',
+        'table.record.create',
+        { channelId: tableId, values: { legacy } },
+      );
+      recordIds.push(record.subject!.id);
+    }
+    await value.app.executeAction(value.owner.id, 'cli', 'dictionary.entry.retire', {
+      channelId: dictionaryId,
+      entryId,
+    });
+
+    const preview = await value.app.executeQuery(
+      value.owner.id,
+      'cli',
+      'table.field.conversion.preview',
+      {
+        channelId: tableId,
+        fieldId: field.subject!.id,
+        targetChannelId: dictionaryId,
+        targetType: 'dictionary',
+      },
+    );
+    const failures = (preview.data as { failures: { recordId: string }[] }).failures;
+    expect(failures.map((failure) => failure.recordId).sort()).toEqual(
+      recordIds.slice(0, 3).sort(),
+    );
+
+    const admin = await value.app.executeAction(
+      value.owner.id,
+      'cli',
+      'service.person.create',
+      { displayName: 'Table-only Admin' },
+    );
+    await value.app.executeAction(value.owner.id, 'cli', 'channel.member.grant', {
+      channelId: tableId,
+      personId: admin.subject!.id,
+      role: 'admin',
+    });
+    await expect(
+      value.app.executeQuery(admin.subject!.id, 'cli', 'table.field.conversion.preview', {
+        channelId: tableId,
+        fieldId: field.subject!.id,
+        targetChannelId: dictionaryId,
+        targetType: 'dictionary',
+      }),
+    ).rejects.toMatchObject({ code: 'permission.denied' } satisfies Partial<DatagramError>);
+  });
+
+  test('keeps retired references through Field restore, unrelated conversion, and undo', async () => {
+    const { dictionaryId, entryId, tableId, value } = await setup();
+    const dictionaryField = await addDictionaryField(value, tableId, dictionaryId);
+    const spareField = await value.app.executeAction(
+      value.owner.id,
+      'cli',
+      'table.field.add',
+      {
+        channelId: tableId,
+        key: 'spare',
+        label: 'Spare',
+        required: false,
+        type: 'text',
+        unique: false,
+      },
+    );
+    const record = await value.app.executeAction(
+      value.owner.id,
+      'cli',
+      'table.record.create',
+      { channelId: tableId, values: { product: entryId } },
+    );
+    await value.app.executeAction(value.owner.id, 'cli', 'dictionary.entry.retire', {
+      channelId: dictionaryId,
+      entryId,
+    });
+
+    await value.app.executeAction(value.owner.id, 'cli', 'table.field.tombstone', {
+      channelId: tableId,
+      fieldId: dictionaryField.subject!.id,
+      observedVersion: 1,
+    });
+    await value.app.executeAction(value.owner.id, 'cli', 'table.field.restore', {
+      channelId: tableId,
+      fieldId: dictionaryField.subject!.id,
+      observedVersion: 2,
+    });
+    const converted = await value.app.executeAction(
+      value.owner.id,
+      'cli',
+      'table.field.convert',
+      {
+        channelId: tableId,
+        fieldId: spareField.subject!.id,
+        observedVersion: 1,
+        targetType: 'boolean',
+      },
+    );
+    await value.app.executeAction(value.owner.id, 'cli', 'operation.undo', {
+      channelId: tableId,
+      operationId: converted.operationId,
+    });
+
+    expect(await value.store.getTableRecord(record.subject!.id)).toMatchObject({
+      values: { product: entryId },
+    });
+    const restoredField = (await value.store.listTableFields(tableId)).find(
+      (field) => field.id === dictionaryField.subject!.id,
+    );
+    expect(restoredField).toMatchObject({ type: 'dictionary', version: 3 });
+    expect(restoredField?.tombstonedAt).toBeUndefined();
+  });
 });
