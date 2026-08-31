@@ -11,3 +11,17 @@ Preserve the zero-data agent boundary. Agent-facing queries may return control m
 Keep the scaffold narrow. Record broader product decisions in `CONTEXT.md` or an ADR; do not implement deferred behavior incidentally.
 
 Run `bun run check` before handing off changes.
+
+## Agent skills
+
+### Issue tracker
+
+Issues and specs live in GitHub Issues. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Use the five default triage labels. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+This repository uses the single-context layout. See `docs/agents/domain.md`.
