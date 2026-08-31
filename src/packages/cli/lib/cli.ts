@@ -2,6 +2,7 @@
 
 import { createRuntime } from '../../runtime';
 import { startHttpServer } from '../../server';
+import { renderView } from '../../view-host';
 
 const args = Bun.argv.slice(2);
 
@@ -83,11 +84,13 @@ if (command === 'serve') {
         break;
       case 'query':
         output(
-          await runtime.app.executeQuery(
-            actorId,
-            'cli',
-            required(args[1], 'Query name is required'),
-            input(),
+          renderView(
+            await runtime.app.executeQuery(
+              actorId,
+              'cli',
+              required(args[1], 'Query name is required'),
+              input(),
+            ),
           ),
         );
         break;

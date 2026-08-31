@@ -1,7 +1,12 @@
 import * as z from 'zod/v4';
 
 import { DatagramError } from '../../domain/errors';
-import type { ActionReceipt, OperationOrigin, QueryResult } from '../../domain/model';
+import {
+  viewDefinitionSchema,
+  type ActionReceipt,
+  type OperationOrigin,
+  type QueryResult,
+} from '../../domain/model';
 
 export interface ExecutionContext {
   readonly actorId: string;
@@ -103,6 +108,7 @@ export class QueryRegistry {
     rawInput: unknown,
   ): Promise<QueryResult> {
     const definition = this.#registry.require(name, 'query.unknown');
-    return definition.run(context, definition.inputSchema.parse(rawInput));
+    const result = await definition.run(context, definition.inputSchema.parse(rawInput));
+    return { ...result, view: viewDefinitionSchema.parse(result.view) };
   }
 }

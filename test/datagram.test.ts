@@ -140,7 +140,8 @@ describe('Datagram application', () => {
     const serialized = JSON.stringify(handle);
     expect(serialized).not.toContain('Secret Inventory');
     expect(serialized).not.toContain('Hidden Apples');
-    expect(handle.view.title).toBe('table.records.list');
+    expect(handle.view).not.toHaveProperty('title');
+    expect(handle.view.kind).toBe('table-records');
 
     const consumed = value.app.handles.consume(value.owner.id, handle.id, 'table.records.list');
     expect(JSON.stringify(consumed.data)).toContain('Hidden Apples');

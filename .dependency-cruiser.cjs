@@ -76,7 +76,7 @@ module.exports = {
       comment:
         'Adapters and composition packages depend on application entry points, never domain internals or domain entry points.',
       severity: 'error',
-      from: { path: `^${R}/(cli|http|mcp|runtime|server|sqlite-store)/` },
+      from: { path: `^${R}/(cli|http|mcp|runtime|server|sqlite-store|view-host)/` },
       to: { path: `^${R}/domain/` },
     },
 

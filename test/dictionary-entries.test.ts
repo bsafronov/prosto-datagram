@@ -173,6 +173,7 @@ describe('Dictionary Entry lifecycle', () => {
       { channelId, includeRetired: true },
     );
     expect(JSON.stringify(handle)).not.toContain('Hidden value');
-    expect(handle.view.title).toBe('dictionary.entries.list');
+    expect(handle.view).not.toHaveProperty('title');
+    expect(handle.view.kind).toBe('dictionary');
   });
 });

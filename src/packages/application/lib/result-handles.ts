@@ -1,5 +1,5 @@
 import { DatagramError } from '../../domain/errors';
-import type { QueryResult } from '../../domain/model';
+import type { QueryResult, ViewDefinition } from '../../domain/model';
 import { newId } from '../../domain/model';
 
 interface HandleEntry {
@@ -13,7 +13,21 @@ export interface IssuedResultHandle {
   readonly expiresAt: string;
   readonly id: string;
   readonly purpose: string;
-  readonly view: QueryResult['view'];
+  readonly view: AgentViewMetadata;
+}
+
+export type AgentViewMetadata = Readonly<Pick<
+  ViewDefinition,
+  'bindings' | 'commands' | 'kind' | 'schemaVersion'
+>>;
+
+export function sanitizeViewForAgent(view: ViewDefinition): AgentViewMetadata {
+  return {
+    bindings: { ...view.bindings },
+    commands: [...view.commands],
+    kind: view.kind,
+    schemaVersion: view.schemaVersion,
+  };
 }
 
 export class ResultHandleBroker {
@@ -29,7 +43,7 @@ export class ResultHandleBroker {
       expiresAt: new Date(expiresAt).toISOString(),
       id,
       purpose,
-      view: { ...result.view, title: purpose },
+      view: sanitizeViewForAgent(result.view),
     };
   }
 

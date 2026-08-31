@@ -217,7 +217,7 @@ export class DatagramApplication {
     actorId: string,
     channelId: string,
     minimum: ChannelRole,
-  ): Promise<void> {
+  ): Promise<ChannelRole> {
     const membership = await this.store.getMembership(channelId, actorId);
     invariant(membership, 'permission.denied', 'Channel membership is required', 403);
     invariant(
@@ -226,6 +226,7 @@ export class DatagramApplication {
       `Channel Role ${minimum} is required`,
       403,
     );
+    return membership.role;
   }
 
   async #requireGroup(actorId: string, groupId: string): Promise<ChannelGroup> {
@@ -2849,7 +2850,7 @@ export class DatagramApplication {
                 updatedAt: item.channel.updatedAt,
               })),
             view: {
-              bindings: { items: '$result' },
+              bindings: { channels: '$result' },
               commands: [
                 'channel.create',
                 'channel.navigation.archive',
@@ -2859,7 +2860,7 @@ export class DatagramApplication {
                 'channel.activity.mark-read',
                 'channel.group.channel.add',
               ],
-              kind: 'table',
+              kind: 'channel-list',
               schemaVersion: 'datagram/view@1',
               title: input.archived ? 'Archived Channels' : 'Channels',
             },
@@ -2910,7 +2911,7 @@ export class DatagramApplication {
         name: 'dictionary.entries.list',
         run: async (context, input): Promise<QueryResult> => {
           await this.#requireChannel(input.channelId, 'dictionary');
-          await this.#requireRole(context.actorId, input.channelId, 'viewer');
+          const role = await this.#requireRole(context.actorId, input.channelId, 'viewer');
           const entries = (await this.store.listDictionaryEntries(input.channelId)).filter(
             (entry) => input.includeRetired || entry.retiredAt === undefined,
           );
@@ -2922,13 +2923,16 @@ export class DatagramApplication {
             })),
             view: {
               bindings: { entries: '$result' },
-              commands: [
-                'dictionary.entry.create',
-                'dictionary.entry.rename',
-                'dictionary.entry.retire',
-                'dictionary.entry.restore',
-              ],
-              kind: 'table',
+              commands:
+                roleRank[role] >= roleRank.contributor
+                  ? [
+                      'dictionary.entry.create',
+                      'dictionary.entry.rename',
+                      'dictionary.entry.retire',
+                      'dictionary.entry.restore',
+                    ]
+                  : [],
+              kind: 'dictionary',
               schemaVersion: 'datagram/view@1',
               title: 'Dictionary Entries',
             },
@@ -2944,7 +2948,7 @@ export class DatagramApplication {
         name: 'table.describe',
         run: async (context, input): Promise<QueryResult> => {
           const channel = await this.#requireChannel(input.channelId, 'table');
-          await this.#requireRole(context.actorId, input.channelId, 'viewer');
+          const role = await this.#requireRole(context.actorId, input.channelId, 'viewer');
           const fields = await this.store.listTableFields(input.channelId);
           return {
             data: fields
@@ -2966,14 +2970,18 @@ export class DatagramApplication {
             view: {
               bindings: { fields: '$result' },
               commands: [
-                'table.field.add',
-                'table.field.tombstone',
-                'table.field.restore',
-                'table.field.convert',
-                'table.field.purge',
-                'table.record.create',
+                ...(roleRank[role] >= roleRank.admin
+                  ? [
+                      'table.field.add',
+                      'table.field.tombstone',
+                      'table.field.restore',
+                      'table.field.convert',
+                      'table.field.purge',
+                    ]
+                  : []),
+                ...(roleRank[role] >= roleRank.contributor ? ['table.record.create'] : []),
               ],
-              kind: 'table',
+              kind: 'table-schema',
               schemaVersion: 'datagram/view@1',
               title: `${channel.title} Fields`,
             },
@@ -3106,7 +3114,7 @@ export class DatagramApplication {
         name: 'table.records.list',
         run: async (context, input): Promise<QueryResult> => {
           const channel = await this.#requireChannel(input.channelId, 'table');
-          await this.#requireRole(context.actorId, input.channelId, 'viewer');
+          const role = await this.#requireRole(context.actorId, input.channelId, 'viewer');
           const records = (await this.store.listTableRecords(input.channelId)).filter(
             (record) => input.includeTombstoned || record.tombstonedAt === undefined,
           );
@@ -3137,13 +3145,16 @@ export class DatagramApplication {
             ),
             view: {
               bindings: { rows: '$result' },
-              commands: [
-                'table.record.create',
-                'table.record.edit',
-                'table.record.tombstone',
-                'table.record.restore',
-              ],
-              kind: 'table',
+              commands:
+                roleRank[role] >= roleRank.contributor
+                  ? [
+                      'table.record.create',
+                      'table.record.edit',
+                      'table.record.tombstone',
+                      'table.record.restore',
+                    ]
+                  : [],
+              kind: 'table-records',
               schemaVersion: 'datagram/view@1',
               title: channel.title,
             },
@@ -3174,7 +3185,7 @@ export class DatagramApplication {
             view: {
               bindings: { views: '$result' },
               commands: ['table.view.create'],
-              kind: 'table',
+              kind: 'table-views',
               schemaVersion: 'datagram/view@1',
               title: 'Table Views',
             },

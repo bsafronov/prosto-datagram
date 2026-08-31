@@ -407,10 +407,18 @@ export interface ActionReceipt {
   };
 }
 
-export const viewDefinitionSchema = z.object({
-  bindings: z.record(z.string(), z.string()),
-  commands: z.array(z.string()),
-  kind: z.enum(['chart', 'discussion', 'table', 'value']),
+const semanticIdentifierSchema = z
+  .string()
+  .regex(/^[a-z][a-z0-9]*(?:[.-][a-z0-9]+)*$/);
+
+export const viewBindingSchema = z
+  .string()
+  .regex(/^\$result(?:\.[A-Za-z_][A-Za-z0-9_-]*)*$/);
+
+export const viewDefinitionSchema = z.strictObject({
+  bindings: z.record(semanticIdentifierSchema, viewBindingSchema),
+  commands: z.array(semanticIdentifierSchema),
+  kind: semanticIdentifierSchema,
   schemaVersion: z.literal('datagram/view@1'),
   title: z.string().min(1),
 });
