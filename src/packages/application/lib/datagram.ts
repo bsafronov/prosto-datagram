@@ -1597,16 +1597,27 @@ export class DatagramApplication {
           const records = allRecords.filter(
             (record) => record.tombstonedAt === undefined,
           );
+          const isDictionary = input.type === 'dictionary';
           const isRecordReference = input.type === 'record-reference';
           invariant(
             isRecordReference
               ? input.targetChannelId !== undefined && input.cardinality !== undefined
-              : input.targetChannelId === undefined && input.cardinality === undefined,
+              : input.cardinality === undefined,
             'table.field-reference-configuration',
             'Record Reference Field requires one target Channel and cardinality',
           );
+          invariant(
+            isDictionary
+              ? input.targetChannelId !== undefined
+              : isRecordReference || input.targetChannelId === undefined,
+            'table.field-dictionary-configuration',
+            'Dictionary Field requires one target Dictionary Channel',
+          );
           if (isRecordReference) {
             await this.#requireChannel(input.targetChannelId!, 'table');
+            await this.#requireRole(context.actorId, input.targetChannelId!, 'viewer');
+          } else if (isDictionary) {
+            await this.#requireChannel(input.targetChannelId!, 'dictionary');
             await this.#requireRole(context.actorId, input.targetChannelId!, 'viewer');
           }
           if (input.defaultValue !== undefined) {
@@ -1632,6 +1643,11 @@ export class DatagramApplication {
               };
               this.#validateFieldValue(candidateField, input.defaultValue);
               await this.#validateRecordReferenceTargets(
+                context.actorId,
+                candidateField,
+                input.defaultValue,
+              );
+              await this.#validateDictionaryEntry(
                 context.actorId,
                 candidateField,
                 input.defaultValue,
@@ -2165,7 +2181,7 @@ export class DatagramApplication {
         },
       }),
       defineAction({
-        description: 'Select a Text Field as the Table Display Field. Admin role required.',
+        description: 'Select a Text or Dictionary Field as the Table Display Field. Admin role required.',
         inputSchema: z.object({
           channelId: z.string().min(1),
           fieldId: z.string().min(1).nullable(),
@@ -2185,9 +2201,9 @@ export class DatagramApplication {
               409,
             );
             invariant(
-              field.type === 'text',
+              field.type === 'text' || field.type === 'dictionary',
               'table.display-field-type',
-              'Display Field must be Text',
+              'Display Field must be Text or Dictionary',
             );
           }
           return this.#commit(
@@ -2260,6 +2276,8 @@ export class DatagramApplication {
             records,
             { ...record.values, ...input.values },
             record.id,
+            true,
+            new Set(Object.keys(input.values)),
           );
           const updatedAt = nowIso();
           return this.#commit(
@@ -3069,7 +3087,7 @@ export class DatagramApplication {
                 ...(record.tombstonedAt === undefined
                   ? {}
                   : { tombstonedAt: record.tombstonedAt }),
-                values: await this.#resolveRecordReferenceValues(
+                values: await this.#resolveTableValues(
                   context.actorId,
                   fields.filter((field) => visibleKeys.has(field.key)),
                   Object.fromEntries(
@@ -3301,6 +3319,7 @@ export class DatagramApplication {
     input: Readonly<Record<string, JsonValue>>,
     currentRecordId?: string,
     validateReferenceTargets = true,
+    newDictionaryValueKeys?: ReadonlySet<string>,
   ): Promise<Record<string, JsonValue>> {
     const activeFields = fields.filter((field) => field.tombstonedAt === undefined);
     const allFieldByKey = new Map(fields.map((field) => [field.key, field]));
@@ -3343,6 +3362,12 @@ export class DatagramApplication {
       );
       if (validateReferenceTargets) {
         await this.#validateRecordReferenceTargets(actorId, field, value);
+        if (
+          field.type === 'dictionary' &&
+          (newDictionaryValueKeys === undefined || newDictionaryValueKeys.has(field.key))
+        ) {
+          await this.#validateDictionaryEntry(actorId, field, value);
+        }
       }
       if (field.unique) {
         invariant(
@@ -3453,15 +3478,77 @@ export class DatagramApplication {
     }
   }
 
-  async #resolveRecordReferenceValues(
+  async #validateDictionaryEntry(
+    actorId: string,
+    field: TableField,
+    value: JsonValue,
+  ): Promise<void> {
+    if (field.type !== 'dictionary') return;
+    invariant(
+      field.targetChannelId !== undefined,
+      'table.field-dictionary-configuration',
+      'Dictionary Field is not configured',
+    );
+    const channel = await this.store.getChannel(field.targetChannelId);
+    const membership = await this.store.getMembership(field.targetChannelId, actorId);
+    const entry = typeof value === 'string' ? await this.store.getDictionaryEntry(value) : null;
+    invariant(
+      channel?.typeId === 'dictionary' &&
+        channel.deletedAt === undefined &&
+        channel.purgedAt === undefined &&
+        membership !== null &&
+        entry?.channelId === field.targetChannelId &&
+        entry.retiredAt === undefined,
+      'table.dictionary-entry-invalid',
+      'Dictionary Entry is unavailable',
+    );
+  }
+
+  async #resolveDictionaryEntry(
+    actorId: string,
+    channelId: string,
+    entryId: string,
+  ): Promise<JsonValue> {
+    const channel = await this.store.getChannel(channelId);
+    const membership = await this.store.getMembership(channelId, actorId);
+    if (
+      channel?.typeId !== 'dictionary' ||
+      channel.deletedAt !== undefined ||
+      channel.purgedAt !== undefined ||
+      !membership
+    ) {
+      return { entryId, status: 'unresolved' };
+    }
+    const entry = await this.store.getDictionaryEntry(entryId);
+    if (entry?.channelId !== channelId) return { entryId, status: 'unresolved' };
+    return {
+      entryId,
+      label: entry.label,
+      status: entry.retiredAt === undefined ? 'resolved' : 'retired',
+    };
+  }
+
+  async #resolveTableValues(
     actorId: string,
     fields: readonly TableField[],
     values: Readonly<Record<string, JsonValue>>,
   ): Promise<Record<string, JsonValue>> {
     const resolved: Record<string, JsonValue> = { ...values };
     for (const field of fields) {
-      if (field.type !== 'record-reference' || field.targetChannelId === undefined) continue;
       const value = values[field.key];
+      if (
+        field.type === 'dictionary' &&
+        field.targetChannelId !== undefined &&
+        typeof value === 'string'
+      ) {
+        resolved[field.key] = await this.#resolveDictionaryEntry(
+          actorId,
+          field.targetChannelId,
+          value,
+        );
+        continue;
+      }
+      if (field.type !== 'record-reference' || field.targetChannelId === undefined) continue;
       if (typeof value === 'string') {
         resolved[field.key] = await this.#resolveReference(
           actorId,
