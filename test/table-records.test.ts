@@ -15,11 +15,7 @@ async function setup() {
   return { channelId: channel.subject!.id, value };
 }
 
-async function addField(
-  value: DatagramRuntime,
-  channelId: string,
-  input: Record<string, unknown>,
-) {
+async function addField(value: DatagramRuntime, channelId: string, input: Record<string, unknown>) {
   return value.app.executeAction(value.owner.id, 'cli', 'table.field.add', {
     channelId,
     required: false,
@@ -60,14 +56,17 @@ describe('typed Table Record lifecycle', () => {
       type: 'date-time',
     });
 
-    const created = await value.app.executeAction(
-      value.owner.id,
-      'cli',
-      'table.record.create',
-      { channelId, values: { name: 'First', when: '2026-09-01T12:30:00.000Z' } },
-    );
+    const created = await value.app.executeAction(value.owner.id, 'cli', 'table.record.create', {
+      channelId,
+      values: { name: 'First', when: '2026-09-01T12:30:00.000Z' },
+    });
     expect(await value.store.getTableRecord(created.subject!.id)).toMatchObject({
-      values: { count: 1, enabled: false, name: 'First', when: '2026-09-01T12:30:00.000Z' },
+      values: {
+        count: 1,
+        enabled: false,
+        name: 'First',
+        when: '2026-09-01T12:30:00.000Z',
+      },
     });
 
     const beforeOperations = await value.store.listOperations(channelId);
@@ -77,19 +76,25 @@ describe('typed Table Record lifecycle', () => {
         channelId,
         values: { name: 'First', unknown: 'rejected' },
       }),
-    ).rejects.toMatchObject({ code: 'table.record-unknown-field' } satisfies Partial<DatagramError>);
+    ).rejects.toMatchObject({
+      code: 'table.record-unknown-field',
+    } satisfies Partial<DatagramError>);
     await expect(
       value.app.executeAction(value.owner.id, 'cli', 'table.record.create', {
         channelId,
         values: { name: 'First' },
       }),
-    ).rejects.toMatchObject({ code: 'table.record-unique-field' } satisfies Partial<DatagramError>);
+    ).rejects.toMatchObject({
+      code: 'table.record-unique-field',
+    } satisfies Partial<DatagramError>);
     await expect(
       value.app.executeAction(value.owner.id, 'cli', 'table.record.create', {
         channelId,
         values: { name: 'Second', when: 'tomorrow' },
       }),
-    ).rejects.toMatchObject({ code: 'table.field-type' } satisfies Partial<DatagramError>);
+    ).rejects.toMatchObject({
+      code: 'table.field-type',
+    } satisfies Partial<DatagramError>);
     expect(await value.store.listTableRecords(channelId)).toHaveLength(1);
     expect(await value.store.listOperations(channelId)).toEqual(beforeOperations);
     expect(await value.store.listActivities(channelId)).toEqual(beforeActivities);
@@ -107,12 +112,10 @@ describe('typed Table Record lifecycle', () => {
       channelId,
       fieldId: nameField.subject!.id,
     });
-    const created = await value.app.executeAction(
-      value.owner.id,
-      'cli',
-      'table.record.create',
-      { channelId, values: { name: 'Original' } },
-    );
+    const created = await value.app.executeAction(value.owner.id, 'cli', 'table.record.create', {
+      channelId,
+      values: { name: 'Original' },
+    });
     const person = await value.app.executeAction(value.owner.id, 'cli', 'service.person.create', {
       displayName: 'Contributor',
     });
@@ -124,27 +127,34 @@ describe('typed Table Record lifecycle', () => {
 
     const before = (await value.store.listOperations(channelId)).length;
     for (const action of ['table.record.edit', 'table.record.tombstone', 'table.record.restore']) {
+      const observed = await value.store.getTableRecord(created.subject!.id);
       await value.app.executeAction(person.subject!.id, 'http', action, {
         channelId,
         recordId: created.subject!.id,
-        ...(action === 'table.record.edit' ? { values: { name: 'Changed' } } : {}),
+        ...(action === 'table.record.edit'
+          ? {
+              observedVersions: observed!.fieldVersions,
+              values: { name: 'Changed' },
+            }
+          : {}),
       });
     }
     const record = await value.store.getTableRecord(created.subject!.id);
-    expect(record).toMatchObject({ id: created.subject!.id, values: { name: 'Changed' } });
+    expect(record).toMatchObject({
+      id: created.subject!.id,
+      values: { name: 'Changed' },
+    });
     expect(record?.tombstonedAt).toBeUndefined();
-    expect((await value.store.listOperations(channelId)).slice(before).map((item) => item.action)).toEqual([
-      'table.record.edit',
-      'table.record.tombstone',
-      'table.record.restore',
-    ]);
-    expect((await value.store.listActivities(channelId)).slice(-3).map((item) => item.kind)).toEqual([
-      'table.record-edited',
-      'table.record-tombstoned',
-      'table.record-restored',
-    ]);
-    expect((await value.app.executeQuery(value.owner.id, 'cli', 'table.configuration', { channelId })).data)
-      .toEqual({ displayFieldId: nameField.subject!.id });
+    expect(
+      (await value.store.listOperations(channelId)).slice(before).map((item) => item.action),
+    ).toEqual(['table.record.edit', 'table.record.tombstone', 'table.record.restore']);
+    expect(
+      (await value.store.listActivities(channelId)).slice(-3).map((item) => item.kind),
+    ).toEqual(['table.record-edited', 'table.record-tombstoned', 'table.record-restored']);
+    expect(
+      (await value.app.executeQuery(value.owner.id, 'cli', 'table.configuration', { channelId }))
+        .data,
+    ).toEqual({ displayFieldId: nameField.subject!.id });
   });
 
   test('stores personal/shared Views and hides personal definitions from other members', async () => {
@@ -180,7 +190,9 @@ describe('typed Table Record lifecycle', () => {
         name: 'Shared',
         visibility: 'shared',
       }),
-    ).rejects.toMatchObject({ code: 'permission.denied' } satisfies Partial<DatagramError>);
+    ).rejects.toMatchObject({
+      code: 'permission.denied',
+    } satisfies Partial<DatagramError>);
     await value.app.executeAction(value.owner.id, 'cli', 'table.view.create', {
       ...definition,
       name: 'Shared',
@@ -191,12 +203,10 @@ describe('typed Table Record lifecycle', () => {
 
   test('backfills tombstoned Records before restoring after a required Field addition', async () => {
     const { channelId, value } = await setup();
-    const created = await value.app.executeAction(
-      value.owner.id,
-      'cli',
-      'table.record.create',
-      { channelId, values: {} },
-    );
+    const created = await value.app.executeAction(value.owner.id, 'cli', 'table.record.create', {
+      channelId,
+      values: {},
+    });
     await value.app.executeAction(value.owner.id, 'cli', 'table.record.tombstone', {
       channelId,
       recordId: created.subject!.id,

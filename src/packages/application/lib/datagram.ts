@@ -32,12 +32,7 @@ import type {
   TableView,
 } from '../../domain/model';
 import type { DatagramStore } from './store';
-import {
-  ActionRegistry,
-  QueryRegistry,
-  defineAction,
-  defineQuery,
-} from './contracts';
+import { ActionRegistry, QueryRegistry, defineAction, defineQuery } from './contracts';
 import type { ExecutionContext } from './contracts';
 import { ResultHandleBroker } from './result-handles';
 import type { IssuedResultHandle } from './result-handles';
@@ -74,6 +69,17 @@ const tableViewFilterSchema = z.object({
 const tableViewSortSchema = z.object({
   direction: z.enum(['ascending', 'descending']),
   fieldId: z.string().min(1),
+});
+
+const fieldConversionResolutionSchema = z.object({
+  kind: z.enum(['correct', 'map', 'null']),
+  recordId: z.string().min(1),
+  value: optionalJsonValueSchema,
+});
+
+const fieldDefaultConversionResolutionSchema = z.object({
+  kind: z.enum(['correct', 'map', 'null']),
+  value: optionalJsonValueSchema,
 });
 
 const toJson = (value: unknown): JsonValue => jsonValueSchema.parse(value);
@@ -287,7 +293,11 @@ export class DatagramApplication {
       status: 'succeeded',
     };
     await this.store.commit(operation);
-    return { action, operationId, ...(subject === undefined ? {} : { subject }) };
+    return {
+      action,
+      operationId,
+      ...(subject === undefined ? {} : { subject }),
+    };
   }
 
   #activity(
@@ -311,7 +321,9 @@ export class DatagramApplication {
     return [
       defineAction({
         description: 'Create a Service-local person. Deployment Operator only.',
-        inputSchema: z.object({ displayName: z.string().trim().min(1).max(120) }),
+        inputSchema: z.object({
+          displayName: z.string().trim().min(1).max(120),
+        }),
         name: 'service.person.create',
         run: async (context, input) => {
           const actor = await this.#requirePerson(context.actorId);
@@ -351,7 +363,13 @@ export class DatagramApplication {
             context,
             'service.person.deactivate',
             undefined,
-            () => [{ deactivatedAt, kind: 'person.deactivated', personId: input.personId }],
+            () => [
+              {
+                deactivatedAt,
+                kind: 'person.deactivated',
+                personId: input.personId,
+              },
+            ],
             { id: input.personId, kind: 'person' },
           );
         },
@@ -384,7 +402,11 @@ export class DatagramApplication {
               { channel, kind: 'channel.created' },
               {
                 kind: 'membership.granted',
-                membership: { channelId, personId: context.actorId, role: 'owner' },
+                membership: {
+                  channelId,
+                  personId: context.actorId,
+                  role: 'owner',
+                },
               },
               {
                 activity: this.#activity(
@@ -474,10 +496,7 @@ export class DatagramApplication {
         run: async (context, input) => {
           await this.#requireChannel(input.channelId);
           await this.#requireRole(context.actorId, input.channelId, 'viewer');
-          const current = await this.store.getChannelNavigation(
-            input.channelId,
-            context.actorId,
-          );
+          const current = await this.store.getChannelNavigation(input.channelId, context.actorId);
           const { archivedAt: _, ...navigation } = current;
           return this.#commit(
             context,
@@ -555,10 +574,7 @@ export class DatagramApplication {
               404,
             );
           }
-          const current = await this.store.getChannelNavigation(
-            input.channelId,
-            context.actorId,
-          );
+          const current = await this.store.getChannelNavigation(input.channelId, context.actorId);
           if (activityId !== undefined && current.lastReadActivityId !== undefined) {
             const currentIndex = activities.findIndex(
               (activity) => activity.id === current.lastReadActivityId,
@@ -572,9 +588,7 @@ export class DatagramApplication {
             );
           }
           const navigation: ChannelNavigation =
-            activityId === undefined
-              ? current
-              : { ...current, lastReadActivityId: activityId };
+            activityId === undefined ? current : { ...current, lastReadActivityId: activityId };
           return this.#commit(
             context,
             'channel.activity.mark-read',
@@ -623,12 +637,9 @@ export class DatagramApplication {
             name: input.name,
             position: input.position,
           };
-          return this.#commit(
-            context,
-            'channel.group.update',
-            undefined,
-            () => [{ group, kind: 'channel-group.updated' }],
-          );
+          return this.#commit(context, 'channel.group.update', undefined, () => [
+            { group, kind: 'channel-group.updated' },
+          ]);
         },
       }),
       defineAction({
@@ -975,9 +986,7 @@ export class DatagramApplication {
             'channel.invitation.accept',
             invitation.channelId,
             (operationId, occurredAt) => [
-              ...(newPerson
-                ? ([{ kind: 'person.created', person: newPerson }] as const)
-                : []),
+              ...(newPerson ? ([{ kind: 'person.created', person: newPerson }] as const) : []),
               {
                 kind: 'membership.granted' as const,
                 membership: {
@@ -1009,7 +1018,7 @@ export class DatagramApplication {
         },
       }),
       defineAction({
-        description: 'Undo a reversible membership grant when its effect is still current.',
+        description: 'Undo a reversible Operation only while its effects remain current.',
         inputSchema: z.object({
           channelId: z.string().min(1),
           operationId: z.string().min(1),
@@ -1022,39 +1031,28 @@ export class DatagramApplication {
           const original = operations.find((operation) => operation.id === input.operationId);
           invariant(original, 'operation.not-found', 'Operation does not exist', 404);
           invariant(
-            original.action === 'channel.member.grant',
-            'operation.not-reversible',
-            'Operation is not reversible',
-            409,
-          );
-          const granted = original.changes.find(
-            (change) => change.kind === 'membership.granted',
-          );
-          invariant(
-            granted?.kind === 'membership.granted',
-            'operation.not-reversible',
-            'Operation has no reversible membership change',
-            409,
-          );
-          invariant(
             !operations.some(
               (operation) =>
                 operation.action === 'operation.undo' &&
                 operation.changes.some(
                   (change) =>
-                    change.kind === 'membership.reverted' &&
-                    change.revertedOperationId === original.id,
+                    'revertedOperationId' in change && change.revertedOperationId === original.id,
                 ),
             ),
             'operation.already-undone',
             'Operation was already undone',
             409,
           );
-          return this.#commit(
-            context,
-            'operation.undo',
-            input.channelId,
-            (operationId, occurredAt) => [
+          let reversed: DomainChange[];
+          if (original.action === 'channel.member.grant') {
+            const granted = original.changes.find((change) => change.kind === 'membership.granted');
+            invariant(
+              granted?.kind === 'membership.granted',
+              'operation.not-reversible',
+              'Operation has no reversible membership change',
+              409,
+            );
+            reversed = [
               {
                 channelId: granted.membership.channelId,
                 expectedRole: granted.membership.role,
@@ -1063,6 +1061,318 @@ export class DatagramApplication {
                 revertedOperationId: original.id,
                 ...(granted.previousRole ? { restoredRole: granted.previousRole } : {}),
               },
+            ];
+          } else if (original.action === 'table.record.edit') {
+            const updates = original.changes.filter(
+              (change) => change.kind === 'table.record-updated',
+            );
+            invariant(
+              updates.length > 0 && updates.every((change) => change.previousValues !== undefined),
+              'operation.not-reversible',
+              'Operation has no reversible Record change',
+              409,
+            );
+            reversed = [];
+            for (const update of updates) {
+              const record = await this.#requireTableRecord(input.channelId, update.recordId);
+              const expectedVersions = Object.fromEntries(
+                Object.entries(update.expectedVersions ?? {}).map(([key, version]) => [
+                  key,
+                  version + 1,
+                ]),
+              );
+              invariant(
+                Object.entries(expectedVersions).every(
+                  ([key, version]) => (record.fieldVersions[key] ?? 0) === version,
+                ),
+                'operation.undo-conflict',
+                'Table Record changed after original Operation',
+                409,
+              );
+              reversed.push({
+                expectedVersions,
+                kind: 'table.record-updated',
+                recordId: update.recordId,
+                removedKeys: update
+                  .previousValues!.filter((entry) => !entry.existed)
+                  .map((entry) => entry.key),
+                revertedOperationId: original.id,
+                updatedAt: nowIso(),
+                values: Object.fromEntries(
+                  update
+                    .previousValues!.filter((entry) => entry.existed)
+                    .map((entry) => [entry.key, entry.value!]),
+                ),
+              });
+            }
+          } else if (original.action === 'table.record.create') {
+            const created = original.changes.find(
+              (change) => change.kind === 'table.record-created',
+            );
+            invariant(
+              created?.kind === 'table.record-created',
+              'operation.not-reversible',
+              'Operation has no created Record',
+              409,
+            );
+            const record = await this.#requireTableRecord(input.channelId, created.record.id);
+            invariant(
+              record.tombstonedAt === undefined &&
+                record.updatedAt === undefined &&
+                Object.values(record.fieldVersions).every((version) => version === 1),
+              'operation.undo-conflict',
+              'Table Record changed after original Operation',
+              409,
+            );
+            reversed = [
+              {
+                actorId: context.actorId,
+                expectedUpdatedAt: null,
+                kind: 'table.record-tombstoned',
+                recordId: record.id,
+                revertedOperationId: original.id,
+                tombstonedAt: nowIso(),
+              },
+            ];
+          } else if (original.action === 'table.record.tombstone') {
+            const tombstoned = original.changes.find(
+              (change) => change.kind === 'table.record-tombstoned',
+            );
+            invariant(
+              tombstoned?.kind === 'table.record-tombstoned',
+              'operation.not-reversible',
+              'Operation has no tombstoned Record',
+              409,
+            );
+            const record = await this.#requireTableRecord(input.channelId, tombstoned.recordId);
+            invariant(
+              record.tombstonedAt === tombstoned.tombstonedAt,
+              'operation.undo-conflict',
+              'Table Record lifecycle changed after original Operation',
+              409,
+            );
+            reversed = [
+              {
+                expectedTombstonedAt: tombstoned.tombstonedAt,
+                kind: 'table.record-restored',
+                recordId: record.id,
+                revertedOperationId: original.id,
+                restoredAt: nowIso(),
+              },
+            ];
+          } else if (original.action === 'table.record.restore') {
+            const restored = original.changes.find(
+              (change) => change.kind === 'table.record-restored',
+            );
+            invariant(
+              restored?.kind === 'table.record-restored',
+              'operation.not-reversible',
+              'Operation has no restored Record',
+              409,
+            );
+            const record = await this.#requireTableRecord(input.channelId, restored.recordId);
+            invariant(
+              record.tombstonedAt === undefined && record.updatedAt === restored.restoredAt,
+              'operation.undo-conflict',
+              'Table Record lifecycle changed after original Operation',
+              409,
+            );
+            reversed = [
+              {
+                actorId: context.actorId,
+                expectedUpdatedAt: restored.restoredAt,
+                kind: 'table.record-tombstoned',
+                recordId: record.id,
+                revertedOperationId: original.id,
+                tombstonedAt: nowIso(),
+              },
+            ];
+          } else if (
+            original.action === 'table.field.add' ||
+            original.action === 'table.field.tombstone' ||
+            original.action === 'table.field.restore' ||
+            original.action === 'table.field.convert'
+          ) {
+            const fieldChange = original.changes.find(
+              (change) => change.kind === 'table.field-updated',
+            );
+            const added = original.changes.find((change) => change.kind === 'table.field-added');
+            invariant(
+              fieldChange?.kind === 'table.field-updated' || added?.kind === 'table.field-added',
+              'operation.not-reversible',
+              'Operation has no reversible schema change',
+              409,
+            );
+            const currentField = await this.#requireTableField(
+              input.channelId,
+              fieldChange?.field.id ?? added!.field.id,
+            );
+            const expectedFieldVersion = fieldChange?.field.version ?? added!.field.version;
+            invariant(
+              currentField.version === expectedFieldVersion,
+              'operation.undo-conflict',
+              'Table Field changed after original Operation',
+              409,
+            );
+            const currentDisplayFieldId = await this.store.getTableDisplayFieldId(input.channelId);
+            if (added?.kind === 'table.field-added') {
+              invariant(
+                currentDisplayFieldId !== added.field.id,
+                'operation.undo-conflict',
+                'Table display configuration changed after original Operation',
+                409,
+              );
+              const records = await this.store.listTableRecords(input.channelId);
+              invariant(
+                records.every((record) => (record.fieldVersions[added.field.key] ?? 0) <= 1),
+                'operation.undo-conflict',
+                'Table Field values changed after original Operation',
+                409,
+              );
+              reversed = [
+                {
+                  expectedVersion: currentField.version,
+                  field: {
+                    ...currentField,
+                    tombstonedAt: nowIso(),
+                    tombstonedBy: context.actorId,
+                    version: currentField.version + 1,
+                  },
+                  kind: 'table.field-updated',
+                  previousField: currentField,
+                  revertedOperationId: original.id,
+                },
+              ];
+            } else {
+              invariant(
+                fieldChange?.kind === 'table.field-updated',
+                'operation.not-reversible',
+                'Operation has no reversible schema change',
+                409,
+              );
+              if (original.action === 'table.field.restore') {
+                invariant(
+                  currentDisplayFieldId !== fieldChange.field.id,
+                  'operation.undo-conflict',
+                  'Table display configuration changed after original Operation',
+                  409,
+                );
+              }
+              const restoredDisplay =
+                original.action === 'table.field.tombstone' &&
+                original.changes.some(
+                  (change) =>
+                    change.kind === 'table.display-field-set' &&
+                    change.displayFieldId === undefined,
+                );
+              if (restoredDisplay) {
+                invariant(
+                  currentDisplayFieldId === null,
+                  'operation.undo-conflict',
+                  'Table display configuration changed after original Operation',
+                  409,
+                );
+              }
+              reversed = [
+                {
+                  expectedVersion: currentField.version,
+                  field: {
+                    ...fieldChange.previousField,
+                    version: currentField.version + 1,
+                  },
+                  kind: 'table.field-updated',
+                  previousField: currentField,
+                  revertedOperationId: original.id,
+                },
+              ];
+              if (restoredDisplay) {
+                reversed.push({
+                  channelId: input.channelId,
+                  displayFieldId: fieldChange.field.id,
+                  kind: 'table.display-field-set',
+                });
+              }
+              for (const update of original.changes.filter(
+                (change) => change.kind === 'table.record-updated',
+              )) {
+                if (!update.previousValues) continue;
+                const record = await this.#requireTableRecord(input.channelId, update.recordId);
+                const expectedVersions = Object.fromEntries(
+                  Object.entries(update.expectedVersions ?? {}).map(([key, version]) => [
+                    key,
+                    version + 1,
+                  ]),
+                );
+                invariant(
+                  Object.entries(expectedVersions).every(
+                    ([key, version]) => (record.fieldVersions[key] ?? 0) === version,
+                  ),
+                  'operation.undo-conflict',
+                  'Table Record changed after original Operation',
+                  409,
+                );
+                reversed.push({
+                  expectedVersions,
+                  kind: 'table.record-updated',
+                  recordId: update.recordId,
+                  removedKeys: update.previousValues
+                    .filter((entry) => !entry.existed)
+                    .map((entry) => entry.key),
+                  revertedOperationId: original.id,
+                  updatedAt: nowIso(),
+                  values: Object.fromEntries(
+                    update.previousValues
+                      .filter((entry) => entry.existed)
+                      .map((entry) => [entry.key, entry.value!]),
+                  ),
+                });
+              }
+              const reversedField = reversed.find(
+                (change) => change.kind === 'table.field-updated',
+              );
+              if (
+                reversedField?.kind === 'table.field-updated' &&
+                reversedField.field.tombstonedAt === undefined
+              ) {
+                const currentRecords = await this.store.listTableRecords(input.channelId);
+                const reversedRecords = currentRecords.map((record) => {
+                  const update = reversed.find(
+                    (change) =>
+                      change.kind === 'table.record-updated' &&
+                      change.recordId === record.id,
+                  );
+                  if (update?.kind !== 'table.record-updated') return record;
+                  const values = { ...record.values, ...update.values };
+                  for (const key of update.removedKeys ?? []) delete values[key];
+                  return { ...record, values };
+                });
+                const reversedFields = (
+                  await this.store.listTableFields(input.channelId)
+                ).map((field) =>
+                  field.id === reversedField.field.id ? reversedField.field : field,
+                );
+                for (const record of reversedRecords.filter(
+                  (candidate) => candidate.tombstonedAt === undefined,
+                )) {
+                  await this.#validatedRecordValues(
+                    context.actorId,
+                    reversedFields,
+                    reversedRecords,
+                    record.values,
+                    record.id,
+                  );
+                }
+              }
+            }
+          } else {
+            throw new DatagramError('operation.not-reversible', 'Operation is not reversible', 409);
+          }
+          return this.#commit(
+            context,
+            'operation.undo',
+            input.channelId,
+            (operationId, occurredAt) => [
+              ...reversed,
               {
                 activity: this.#activity(
                   context.actorId,
@@ -1318,6 +1628,7 @@ export class DatagramApplication {
                   : { targetChannelId: input.targetChannelId }),
                 type: input.type,
                 unique: input.unique,
+                version: 1,
               };
               this.#validateFieldValue(candidateField, input.defaultValue);
               await this.#validateRecordReferenceTargets(
@@ -1342,9 +1653,7 @@ export class DatagramApplication {
           const field: TableField = {
             ...(input.cardinality === undefined ? {} : { cardinality: input.cardinality }),
             channelId: input.channelId,
-            ...(input.defaultValue === undefined
-              ? {}
-              : { defaultValue: input.defaultValue }),
+            ...(input.defaultValue === undefined ? {} : { defaultValue: input.defaultValue }),
             id: newId('field'),
             key: input.key,
             label: input.label,
@@ -1354,6 +1663,7 @@ export class DatagramApplication {
               : { targetChannelId: input.targetChannelId }),
             type: input.type,
             unique: input.unique,
+            version: 1,
           };
           return this.#commit(
             context,
@@ -1364,11 +1674,430 @@ export class DatagramApplication {
               ...(input.defaultValue === undefined
                 ? []
                 : allRecords.map((record) => ({
+                    expectedVersions: { [input.key]: 0 },
                     kind: 'table.record-updated' as const,
                     recordId: record.id,
                     updatedAt: occurredAt,
-                    values: { ...record.values, [input.key]: input.defaultValue! },
+                    values: { [input.key]: input.defaultValue! },
                   }))),
+              {
+                activity: this.#activity(
+                  context.actorId,
+                  input.channelId,
+                  'table.schema-changed',
+                  operationId,
+                  occurredAt,
+                ),
+                kind: 'activity.appended',
+              },
+            ],
+            { id: field.id, kind: 'field' },
+          );
+        },
+      }),
+      defineAction({
+        description: 'Tombstone one Table Field while retaining its definition and values.',
+        inputSchema: z.object({
+          channelId: z.string().min(1),
+          fieldId: z.string().min(1),
+          observedVersion: z.number().int().positive(),
+        }),
+        name: 'table.field.tombstone',
+        run: async (context, input) => {
+          await this.#requireChannel(input.channelId, 'table');
+          await this.#requireRole(context.actorId, input.channelId, 'admin');
+          const field = await this.#requireTableField(input.channelId, input.fieldId);
+          invariant(
+            field.tombstonedAt === undefined,
+            'table.field-already-tombstoned',
+            'Table Field is already tombstoned',
+            409,
+          );
+          invariant(
+            field.version === input.observedVersion,
+            'table.field-conflict',
+            'Table Field changed after observation',
+            409,
+          );
+          const occurredAt = nowIso();
+          const next: TableField = {
+            ...field,
+            tombstonedAt: occurredAt,
+            tombstonedBy: context.actorId,
+            version: field.version + 1,
+          };
+          const displayFieldId = await this.store.getTableDisplayFieldId(input.channelId);
+          return this.#commit(
+            context,
+            'table.field.tombstone',
+            input.channelId,
+            (operationId) => [
+              {
+                expectedVersion: field.version,
+                field: next,
+                kind: 'table.field-updated',
+                previousField: field,
+              },
+              ...(displayFieldId === field.id
+                ? [
+                    {
+                      channelId: input.channelId,
+                      kind: 'table.display-field-set' as const,
+                    },
+                  ]
+                : []),
+              {
+                activity: this.#activity(
+                  context.actorId,
+                  input.channelId,
+                  'table.schema-changed',
+                  operationId,
+                  occurredAt,
+                ),
+                kind: 'activity.appended',
+              },
+            ],
+            { id: field.id, kind: 'field' },
+          );
+        },
+      }),
+      defineAction({
+        description: 'Restore one tombstoned Table Field and its retained values.',
+        inputSchema: z.object({
+          channelId: z.string().min(1),
+          fieldId: z.string().min(1),
+          observedVersion: z.number().int().positive(),
+        }),
+        name: 'table.field.restore',
+        run: async (context, input) => {
+          await this.#requireChannel(input.channelId, 'table');
+          await this.#requireRole(context.actorId, input.channelId, 'admin');
+          const field = await this.#requireTableField(input.channelId, input.fieldId);
+          invariant(
+            field.tombstonedAt !== undefined,
+            'table.field-not-tombstoned',
+            'Table Field is not tombstoned',
+            409,
+          );
+          invariant(
+            field.version === input.observedVersion,
+            'table.field-conflict',
+            'Table Field changed after observation',
+            409,
+          );
+          const { tombstonedAt: _at, tombstonedBy: _by, ...active } = field;
+          const next: TableField = { ...active, version: field.version + 1 };
+          const fields = (await this.store.listTableFields(input.channelId)).map((candidate) =>
+            candidate.id === field.id ? next : candidate,
+          );
+          const records = await this.store.listTableRecords(input.channelId);
+          for (const record of records.filter(
+            (candidate) => candidate.tombstonedAt === undefined,
+          )) {
+            await this.#validatedRecordValues(
+              context.actorId,
+              fields,
+              records,
+              record.values,
+              record.id,
+            );
+          }
+          const occurredAt = nowIso();
+          return this.#commit(
+            context,
+            'table.field.restore',
+            input.channelId,
+            (operationId) => [
+              {
+                expectedVersion: field.version,
+                field: next,
+                kind: 'table.field-updated',
+                previousField: field,
+              },
+              {
+                activity: this.#activity(
+                  context.actorId,
+                  input.channelId,
+                  'table.schema-changed',
+                  operationId,
+                  occurredAt,
+                ),
+                kind: 'activity.appended',
+              },
+            ],
+            { id: field.id, kind: 'field' },
+          );
+        },
+      }),
+      defineAction({
+        description: 'Permanently purge one tombstoned Table Field and its retained values.',
+        inputSchema: z.object({
+          channelId: z.string().min(1),
+          fieldId: z.string().min(1),
+          observedVersion: z.number().int().positive(),
+        }),
+        name: 'table.field.purge',
+        run: async (context, input) => {
+          await this.#requireChannel(input.channelId, 'table');
+          await this.#requireRole(context.actorId, input.channelId, 'admin');
+          const field = await this.#requireTableField(input.channelId, input.fieldId);
+          invariant(
+            field.tombstonedAt !== undefined,
+            'table.field-not-tombstoned',
+            'Table Field must be tombstoned before purge',
+            409,
+          );
+          invariant(
+            field.version === input.observedVersion,
+            'table.field-conflict',
+            'Table Field changed after observation',
+            409,
+          );
+          const occurredAt = nowIso();
+          return this.#commit(context, 'table.field.purge', input.channelId, (operationId) => [
+            {
+              channelId: input.channelId,
+              expectedVersion: field.version,
+              fieldId: field.id,
+              fieldKey: field.key,
+              kind: 'table.field-purged',
+            },
+            {
+              activity: this.#activity(
+                context.actorId,
+                input.channelId,
+                'table.schema-changed',
+                operationId,
+                occurredAt,
+              ),
+              kind: 'activity.appended',
+            },
+          ]);
+        },
+      }),
+      defineAction({
+        description: 'Convert a Table Field only after resolving every incompatible value.',
+        inputSchema: z.object({
+          cardinality: recordReferenceCardinalitySchema.optional(),
+          cancel: z.boolean().default(false),
+          channelId: z.string().min(1),
+          defaultResolution: fieldDefaultConversionResolutionSchema.optional(),
+          fieldId: z.string().min(1),
+          observedVersion: z.number().int().positive(),
+          resolutions: z.array(fieldConversionResolutionSchema).default([]),
+          targetChannelId: z.string().min(1).optional(),
+          targetType: tableFieldTypeSchema,
+        }),
+        name: 'table.field.convert',
+        run: async (context, input) => {
+          await this.#requireChannel(input.channelId, 'table');
+          await this.#requireRole(context.actorId, input.channelId, 'admin');
+          const field = await this.#requireTableField(input.channelId, input.fieldId);
+          invariant(
+            field.tombstonedAt === undefined,
+            'table.field-tombstoned',
+            'Table Field is tombstoned',
+            409,
+          );
+          invariant(
+            field.version === input.observedVersion,
+            'table.field-conflict',
+            'Table Field changed after observation',
+            409,
+          );
+          invariant(
+            field.type !== input.targetType,
+            'table.field-type-unchanged',
+            'Target Field type must differ',
+            409,
+          );
+          const isRecordReference = input.targetType === 'record-reference';
+          invariant(
+            isRecordReference
+              ? input.targetChannelId !== undefined && input.cardinality !== undefined
+              : input.targetChannelId === undefined && input.cardinality === undefined,
+            'table.field-reference-configuration',
+            'Record Reference Field requires one target Channel and cardinality',
+          );
+          if (isRecordReference) {
+            await this.#requireChannel(input.targetChannelId!, 'table');
+            await this.#requireRole(context.actorId, input.targetChannelId!, 'viewer');
+          }
+          const {
+            cardinality: _previousCardinality,
+            targetChannelId: _previousTargetChannelId,
+            ...fieldWithoutReference
+          } = field;
+          const convertedField: TableField = {
+            ...fieldWithoutReference,
+            ...(input.cardinality === undefined ? {} : { cardinality: input.cardinality }),
+            ...(input.targetChannelId === undefined
+              ? {}
+              : { targetChannelId: input.targetChannelId }),
+            type: input.targetType,
+          };
+          const occurredAt = nowIso();
+          if (input.cancel) {
+            invariant(
+              input.resolutions.length === 0 && input.defaultResolution === undefined,
+              'table.field-conversion-cancelled',
+              'Cancelled conversion cannot include resolutions',
+            );
+            return this.#commit(context, 'table.field.convert', input.channelId, () => [], {
+              id: field.id,
+              kind: 'field',
+            });
+          }
+          const records = await this.store.listTableRecords(input.channelId);
+          const failures = (
+            await Promise.all(
+              records.map(async (record) => {
+                const value = record.values[field.key];
+                return value !== undefined &&
+                  value !== null &&
+                  !(await this.#fieldAccepts(context.actorId, convertedField, value))
+                  ? record
+                  : null;
+              }),
+            )
+          ).filter((record): record is TableRecord => record !== null);
+          const defaultFails =
+            field.defaultValue !== undefined &&
+            field.defaultValue !== null &&
+            !(await this.#fieldAccepts(context.actorId, convertedField, field.defaultValue));
+          invariant(
+            defaultFails === (input.defaultResolution !== undefined),
+            'table.field-conversion-default-unresolved',
+            defaultFails
+              ? 'Incompatible default value needs one explicit resolution'
+              : 'Default resolution does not match an incompatible default',
+            409,
+          );
+          let nextDefault = field.defaultValue;
+          if (input.defaultResolution !== undefined) {
+            if (input.defaultResolution.kind === 'null') {
+              invariant(
+                !field.required,
+                'table.field-conversion-null-required',
+                'Required Field cannot be explicitly nulled',
+              );
+              invariant(
+                input.defaultResolution.value === undefined,
+                'table.field-conversion-resolution-invalid',
+                'Null resolution cannot include a value',
+              );
+              nextDefault = null;
+            } else {
+              invariant(
+                input.defaultResolution.value !== undefined &&
+                  input.defaultResolution.value !== null,
+                'table.field-conversion-resolution-required',
+                'Correction or mapping needs a replacement value',
+              );
+              nextDefault = this.#validateFieldValue(
+                convertedField,
+                input.defaultResolution.value,
+              );
+            }
+          }
+          const resolutions = new Map(
+            input.resolutions.map((resolution) => [resolution.recordId, resolution]),
+          );
+          invariant(
+            resolutions.size === input.resolutions.length,
+            'table.field-conversion-resolution-duplicate',
+            'Each Record may have one conversion resolution',
+          );
+          invariant(
+            failures.every((record) => resolutions.has(record.id)) &&
+              resolutions.size === failures.length,
+            'table.field-conversion-unresolved',
+            'Every incompatible value needs one explicit resolution',
+            409,
+          );
+          const updates = failures.map((record) => {
+            const resolution = resolutions.get(record.id)!;
+            let value: JsonValue;
+            if (resolution.kind === 'null') {
+              invariant(
+                !field.required,
+                'table.field-conversion-null-required',
+                'Required Field cannot be explicitly nulled',
+              );
+              invariant(
+                resolution.value === undefined,
+                'table.field-conversion-resolution-invalid',
+                'Null resolution cannot include a value',
+              );
+              value = null;
+            } else {
+              invariant(
+                resolution.value !== undefined && resolution.value !== null,
+                'table.field-conversion-resolution-required',
+                'Correction or mapping needs a replacement value',
+              );
+              value = this.#validateFieldValue(
+                convertedField,
+                resolution.value,
+              );
+            }
+            return { record, value };
+          });
+          const next: TableField = {
+            ...convertedField,
+            ...(nextDefault === undefined ? {} : { defaultValue: nextDefault }),
+            version: field.version + 1,
+          };
+          const nextFields = (await this.store.listTableFields(input.channelId)).map((candidate) =>
+            candidate.id === field.id ? next : candidate,
+          );
+          const nextRecords = records.map((record) => {
+            const update = updates.find((candidate) => candidate.record.id === record.id);
+            return update
+              ? {
+                  ...record,
+                  values: { ...record.values, [field.key]: update.value },
+                }
+              : record;
+          });
+          for (const record of nextRecords.filter(
+            (candidate) => candidate.tombstonedAt === undefined,
+          )) {
+            await this.#validatedRecordValues(
+              context.actorId,
+              nextFields,
+              nextRecords,
+              record.values,
+              record.id,
+            );
+          }
+          return this.#commit(
+            context,
+            'table.field.convert',
+            input.channelId,
+            (operationId) => [
+              {
+                expectedVersion: field.version,
+                field: next,
+                kind: 'table.field-updated',
+                previousField: field,
+              },
+              ...updates.map(({ record, value }) => ({
+                expectedVersions: {
+                  [field.key]: record.fieldVersions[field.key] ?? 0,
+                },
+                kind: 'table.record-updated' as const,
+                previousValues: [
+                  {
+                    existed: true,
+                    key: field.key,
+                    value: record.values[field.key]!,
+                  },
+                ],
+                recordId: record.id,
+                updatedAt: occurredAt,
+                values: { [field.key]: value },
+              })),
               {
                 activity: this.#activity(
                   context.actorId,
@@ -1415,6 +2144,7 @@ export class DatagramApplication {
                   channelId: input.channelId,
                   createdAt: occurredAt,
                   createdBy: context.actorId,
+                  fieldVersions: Object.fromEntries(Object.keys(values).map((key) => [key, 1])),
                   id: recordId,
                   values,
                 },
@@ -1449,6 +2179,12 @@ export class DatagramApplication {
             const field = fields.find((candidate) => candidate.id === input.fieldId);
             invariant(field, 'table.field-not-found', 'Display Field does not exist', 404);
             invariant(
+              field.tombstonedAt === undefined,
+              'table.field-tombstoned',
+              'Display Field is tombstoned',
+              409,
+            );
+            invariant(
               field.type === 'text',
               'table.display-field-type',
               'Display Field must be Text',
@@ -1482,6 +2218,7 @@ export class DatagramApplication {
         description: 'Edit any active Table Record. Contributor role required.',
         inputSchema: z.object({
           channelId: z.string().min(1),
+          observedVersions: z.record(z.string(), z.number().int().nonnegative()),
           recordId: z.string().min(1),
           values: z.record(z.string(), jsonValueSchema),
         }),
@@ -1496,6 +2233,25 @@ export class DatagramApplication {
             'Table Record is tombstoned',
             409,
           );
+          const changedKeys = Object.keys(input.values);
+          invariant(
+            changedKeys.length > 0,
+            'table.record-empty-edit',
+            'Table Record edit needs at least one Field',
+          );
+          invariant(
+            changedKeys.every((key) => input.observedVersions[key] !== undefined),
+            'table.record-observed-version-required',
+            'Observed version is required for every edited Field',
+          );
+          for (const key of changedKeys) {
+            invariant(
+              (record.fieldVersions[key] ?? 0) === input.observedVersions[key],
+              'table.record-edit-conflict',
+              `Table Field value changed after observation: ${key}`,
+              409,
+            );
+          }
           const fields = await this.store.listTableFields(input.channelId);
           const records = await this.store.listTableRecords(input.channelId);
           const values = await this.#validatedRecordValues(
@@ -1511,7 +2267,20 @@ export class DatagramApplication {
             'table.record.edit',
             input.channelId,
             (operationId) => [
-              { kind: 'table.record-updated', recordId: record.id, updatedAt, values },
+              {
+                expectedVersions: Object.fromEntries(
+                  changedKeys.map((key) => [key, input.observedVersions[key]!]),
+                ),
+                kind: 'table.record-updated',
+                previousValues: changedKeys.map((key) => ({
+                  existed: Object.hasOwn(record.values, key),
+                  key,
+                  ...(Object.hasOwn(record.values, key) ? { value: record.values[key] } : {}),
+                })),
+                recordId: record.id,
+                updatedAt,
+                values: Object.fromEntries(changedKeys.map((key) => [key, values[key]!])),
+              },
               {
                 activity: this.#activity(
                   context.actorId,
@@ -1529,7 +2298,10 @@ export class DatagramApplication {
       }),
       defineAction({
         description: 'Tombstone any active Table Record. Contributor role required.',
-        inputSchema: z.object({ channelId: z.string().min(1), recordId: z.string().min(1) }),
+        inputSchema: z.object({
+          channelId: z.string().min(1),
+          recordId: z.string().min(1),
+        }),
         name: 'table.record.tombstone',
         run: async (context, input) => {
           await this.#requireChannel(input.channelId, 'table');
@@ -1549,6 +2321,7 @@ export class DatagramApplication {
             (operationId) => [
               {
                 actorId: context.actorId,
+                expectedUpdatedAt: record.updatedAt ?? null,
                 kind: 'table.record-tombstoned',
                 recordId: record.id,
                 tombstonedAt,
@@ -1570,7 +2343,10 @@ export class DatagramApplication {
       }),
       defineAction({
         description: 'Restore a tombstoned Table Record. Contributor role required.',
-        inputSchema: z.object({ channelId: z.string().min(1), recordId: z.string().min(1) }),
+        inputSchema: z.object({
+          channelId: z.string().min(1),
+          recordId: z.string().min(1),
+        }),
         name: 'table.record.restore',
         run: async (context, input) => {
           await this.#requireChannel(input.channelId, 'table');
@@ -1599,12 +2375,11 @@ export class DatagramApplication {
             input.channelId,
             (operationId) => [
               {
-                kind: 'table.record-updated',
+                expectedTombstonedAt: record.tombstonedAt!,
+                kind: 'table.record-restored',
                 recordId: record.id,
-                updatedAt: restoredAt,
-                values,
+                restoredAt,
               },
-              { kind: 'table.record-restored', recordId: record.id, restoredAt },
               {
                 activity: this.#activity(
                   context.actorId,
@@ -2116,31 +2891,129 @@ export class DatagramApplication {
       }),
       defineQuery({
         description: 'Describe the active Fields in a Table Channel.',
-        inputSchema: z.object({ channelId: z.string().min(1) }),
+        inputSchema: z.object({
+          channelId: z.string().min(1),
+          includeTombstoned: z.boolean().default(false),
+        }),
         name: 'table.describe',
         run: async (context, input): Promise<QueryResult> => {
           const channel = await this.#requireChannel(input.channelId, 'table');
           await this.#requireRole(context.actorId, input.channelId, 'viewer');
           const fields = await this.store.listTableFields(input.channelId);
           return {
-            data: fields.map((field) => ({
-              ...(field.cardinality === undefined ? {} : { cardinality: field.cardinality }),
-              id: field.id,
-              key: field.key,
-              label: field.label,
-              required: field.required,
-              ...(field.targetChannelId === undefined
-                ? {}
-                : { targetChannelId: field.targetChannelId }),
-              type: field.type,
-              unique: field.unique,
-            })),
+            data: fields
+              .filter((field) => input.includeTombstoned || field.tombstonedAt === undefined)
+              .map((field) => ({
+                ...(field.cardinality === undefined ? {} : { cardinality: field.cardinality }),
+                id: field.id,
+                key: field.key,
+                label: field.label,
+                required: field.required,
+                ...(field.targetChannelId === undefined
+                  ? {}
+                  : { targetChannelId: field.targetChannelId }),
+                ...(field.tombstonedAt === undefined ? {} : { tombstonedAt: field.tombstonedAt }),
+                type: field.type,
+                unique: field.unique,
+                version: field.version,
+              })),
             view: {
               bindings: { fields: '$result' },
-              commands: ['table.field.add', 'table.record.create'],
+              commands: [
+                'table.field.add',
+                'table.field.tombstone',
+                'table.field.restore',
+                'table.field.convert',
+                'table.field.purge',
+                'table.record.create',
+              ],
               kind: 'table',
               schemaVersion: 'datagram/view@1',
               title: `${channel.title} Fields`,
+            },
+          };
+        },
+      }),
+      defineQuery({
+        description: 'Preview every value incompatible with a proposed Table Field type.',
+        inputSchema: z.object({
+          cardinality: recordReferenceCardinalitySchema.optional(),
+          channelId: z.string().min(1),
+          fieldId: z.string().min(1),
+          targetChannelId: z.string().min(1).optional(),
+          targetType: tableFieldTypeSchema,
+        }),
+        name: 'table.field.conversion.preview',
+        run: async (context, input): Promise<QueryResult> => {
+          await this.#requireChannel(input.channelId, 'table');
+          await this.#requireRole(context.actorId, input.channelId, 'admin');
+          const field = await this.#requireTableField(input.channelId, input.fieldId);
+          invariant(
+            field.tombstonedAt === undefined,
+            'table.field-tombstoned',
+            'Table Field is tombstoned',
+            409,
+          );
+          const isRecordReference = input.targetType === 'record-reference';
+          invariant(
+            isRecordReference
+              ? input.targetChannelId !== undefined && input.cardinality !== undefined
+              : input.targetChannelId === undefined && input.cardinality === undefined,
+            'table.field-reference-configuration',
+            'Record Reference Field requires one target Channel and cardinality',
+          );
+          if (isRecordReference) {
+            await this.#requireChannel(input.targetChannelId!, 'table');
+            await this.#requireRole(context.actorId, input.targetChannelId!, 'viewer');
+          }
+          const {
+            cardinality: _previousCardinality,
+            targetChannelId: _previousTargetChannelId,
+            ...fieldWithoutReference
+          } = field;
+          const convertedField: TableField = {
+            ...fieldWithoutReference,
+            ...(input.cardinality === undefined ? {} : { cardinality: input.cardinality }),
+            ...(input.targetChannelId === undefined
+              ? {}
+              : { targetChannelId: input.targetChannelId }),
+            type: input.targetType,
+          };
+          const records = await this.store.listTableRecords(input.channelId);
+          return {
+            data: {
+              defaultFailure:
+                field.defaultValue !== undefined &&
+                field.defaultValue !== null &&
+                !(await this.#fieldAccepts(
+                  context.actorId,
+                  convertedField,
+                  field.defaultValue,
+                ))
+                  ? field.defaultValue
+                  : null,
+              failures: (
+                await Promise.all(
+                  records.map(async (record) => {
+                    const value = record.values[field.key];
+                    return value !== undefined &&
+                      value !== null &&
+                      !(await this.#fieldAccepts(context.actorId, convertedField, value))
+                      ? { originalValue: value, recordId: record.id }
+                      : null;
+                  }),
+                )
+              ).filter((failure) => failure !== null),
+              fieldId: field.id,
+              observedVersion: field.version,
+              targetType: input.targetType,
+            },
+            view: {
+              bindings: { preview: '$result' },
+              commands: ['table.field.convert'],
+              kind: 'table',
+              schemaVersion: 'datagram/view@1',
+              title: 'Field Conversion Preview',
             },
           };
         },
@@ -2153,7 +3026,9 @@ export class DatagramApplication {
           await this.#requireChannel(input.channelId, 'table');
           await this.#requireRole(context.actorId, input.channelId, 'viewer');
           return {
-            data: { displayFieldId: await this.store.getTableDisplayFieldId(input.channelId) },
+            data: {
+              displayFieldId: await this.store.getTableDisplayFieldId(input.channelId),
+            },
             view: {
               bindings: { configuration: '$result' },
               commands: ['table.display-field.set'],
@@ -2168,6 +3043,7 @@ export class DatagramApplication {
         description: 'List current Records in a Table Channel.',
         inputSchema: z.object({
           channelId: z.string().min(1),
+          includeTombstonedFields: z.boolean().default(false),
           includeTombstoned: z.boolean().default(false),
         }),
         name: 'table.records.list',
@@ -2178,21 +3054,38 @@ export class DatagramApplication {
             (record) => input.includeTombstoned || record.tombstonedAt === undefined,
           );
           const fields = await this.store.listTableFields(input.channelId);
+          const visibleKeys = new Set(
+            fields
+              .filter((field) => input.includeTombstonedFields || field.tombstonedAt === undefined)
+              .map((field) => field.key),
+          );
           return {
-            data: await Promise.all(records.map(async (record) => ({
-              id: record.id,
-              ...(record.tombstonedAt === undefined
-                ? {}
-                : { tombstonedAt: record.tombstonedAt }),
-              values: await this.#resolveRecordReferenceValues(
-                context.actorId,
-                fields,
-                record.values,
-              ),
-            }))),
+            data: await Promise.all(
+              records.map(async (record) => ({
+                fieldVersions: Object.fromEntries(
+                  Object.entries(record.fieldVersions).filter(([key]) => visibleKeys.has(key)),
+                ),
+                id: record.id,
+                ...(record.tombstonedAt === undefined
+                  ? {}
+                  : { tombstonedAt: record.tombstonedAt }),
+                values: await this.#resolveRecordReferenceValues(
+                  context.actorId,
+                  fields.filter((field) => visibleKeys.has(field.key)),
+                  Object.fromEntries(
+                    Object.entries(record.values).filter(([key]) => visibleKeys.has(key)),
+                  ),
+                ),
+              })),
+            ),
             view: {
               bindings: { rows: '$result' },
-              commands: ['table.record.create'],
+              commands: [
+                'table.record.create',
+                'table.record.edit',
+                'table.record.tombstone',
+                'table.record.restore',
+              ],
               kind: 'table',
               schemaVersion: 'datagram/view@1',
               title: channel.title,
@@ -2209,16 +3102,18 @@ export class DatagramApplication {
           await this.#requireRole(context.actorId, input.channelId, 'viewer');
           const views = await this.store.listTableViews(input.channelId, context.actorId);
           return {
-            data: toJson(views.map((view) => ({
-              filters: [...view.filters],
-              grouping: [...view.grouping],
-              id: view.id,
-              name: view.name,
-              ownerId: view.ownerId,
-              sorting: [...view.sorting],
-              visibility: view.visibility,
-              visibleFieldIds: [...view.visibleFieldIds],
-            }))),
+            data: toJson(
+              views.map((view) => ({
+                filters: [...view.filters],
+                grouping: [...view.grouping],
+                id: view.id,
+                name: view.name,
+                ownerId: view.ownerId,
+                sorting: [...view.sorting],
+                visibility: view.visibility,
+                visibleFieldIds: [...view.visibleFieldIds],
+              })),
+            ),
             view: {
               bindings: { views: '$result' },
               commands: ['table.view.create'],
@@ -2375,6 +3270,30 @@ export class DatagramApplication {
     return { channelId, ...(recordId ? { recordId } : {}), status: 'resolved' };
   }
 
+  async #requireTableField(channelId: string, fieldId: string): Promise<TableField> {
+    const field = (await this.store.listTableFields(channelId)).find(
+      (candidate) => candidate.id === fieldId,
+    );
+    invariant(field, 'table.field-not-found', 'Table Field does not exist', 404);
+    return field;
+  }
+
+  async #fieldAccepts(actorId: string, field: TableField, value: JsonValue): Promise<boolean> {
+    try {
+      this.#validateFieldValue(field, value);
+      await this.#validateRecordReferenceTargets(actorId, field, value);
+      return true;
+    } catch (error) {
+      if (
+        error instanceof DatagramError &&
+        (error.code.startsWith('table.field-') || error.code === 'table.record-reference-invalid')
+      ) {
+        return false;
+      }
+      throw error;
+    }
+  }
+
   async #validatedRecordValues(
     actorId: string,
     fields: readonly TableField[],
@@ -2383,16 +3302,22 @@ export class DatagramApplication {
     currentRecordId?: string,
     validateReferenceTargets = true,
   ): Promise<Record<string, JsonValue>> {
-    const fieldByKey = new Map(fields.map((field) => [field.key, field]));
+    const activeFields = fields.filter((field) => field.tombstonedAt === undefined);
+    const allFieldByKey = new Map(fields.map((field) => [field.key, field]));
+    const currentRecord = records.find((record) => record.id === currentRecordId);
     for (const key of Object.keys(input)) {
+      const field = allFieldByKey.get(key);
       invariant(
-        fieldByKey.has(key),
+        field !== undefined &&
+          (field.tombstonedAt === undefined ||
+            (currentRecord !== undefined &&
+              JSON.stringify(input[key]) === JSON.stringify(currentRecord.values[key]))),
         'table.record-unknown-field',
         `Unknown Field: ${key}`,
       );
     }
     const values: Record<string, JsonValue> = {};
-    for (const field of fields) {
+    for (const field of activeFields) {
       const supplied = input[field.key];
       const value = supplied === undefined ? field.defaultValue : supplied;
       if (value === undefined || value === null) {

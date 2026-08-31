@@ -32,7 +32,14 @@ export const bundledChannelTypes: readonly ChannelTypeDefinition[] = [
     actions: [
       'channel.create',
       'table.field.add',
+      'table.field.tombstone',
+      'table.field.restore',
+      'table.field.convert',
+      'table.field.purge',
       'table.record.create',
+      'table.record.edit',
+      'table.record.tombstone',
+      'table.record.restore',
       ...discussionActions,
     ],
     activityKinds: [

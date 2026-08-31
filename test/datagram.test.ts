@@ -78,7 +78,11 @@ describe('Datagram application', () => {
       { channelId },
     );
     expect(records.data).toEqual([
-      { id: record.subject!.id, values: { available: true, name: 'Apples' } },
+      {
+        fieldVersions: { available: 1, name: 1 },
+        id: record.subject!.id,
+        values: { available: true, name: 'Apples' },
+      },
     ]);
     expect(messages.data).toHaveLength(1);
     expect(viewDefinitionSchema.parse(records.view)).toEqual(records.view);

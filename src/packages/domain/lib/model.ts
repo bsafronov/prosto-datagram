@@ -13,14 +13,7 @@ export const jsonValueSchema: z.ZodType<JsonValue> = z.json();
 export const channelRoleSchema = z.enum(['owner', 'admin', 'contributor', 'viewer']);
 export type ChannelRole = z.infer<typeof channelRoleSchema>;
 
-export const operationOriginSchema = z.enum([
-  'cli',
-  'http',
-  'mcp',
-  'agent',
-  'workflow',
-  'system',
-]);
+export const operationOriginSchema = z.enum(['cli', 'http', 'mcp', 'agent', 'workflow', 'system']);
 export type OperationOrigin = z.infer<typeof operationOriginSchema>;
 
 export const tableFieldTypeSchema = z.enum([
@@ -98,8 +91,11 @@ export interface TableField {
   readonly label: string;
   readonly required: boolean;
   readonly targetChannelId?: string;
+  readonly tombstonedAt?: string;
+  readonly tombstonedBy?: string;
   readonly type: TableFieldType;
   readonly unique: boolean;
+  readonly version: number;
 }
 
 export interface TableRecord {
@@ -107,6 +103,7 @@ export interface TableRecord {
   readonly createdAt: string;
   readonly createdBy: string;
   readonly id: string;
+  readonly fieldVersions: Readonly<Record<string, number>>;
   readonly tombstonedAt?: string;
   readonly tombstonedBy?: string;
   readonly updatedAt?: string;
@@ -282,7 +279,10 @@ export type DomainChange =
       readonly nextOwnerId: string;
       readonly previousOwnerId: string;
     }
-  | { readonly invitation: ChannelInvitation; readonly kind: 'invitation.created' }
+  | {
+      readonly invitation: ChannelInvitation;
+      readonly kind: 'invitation.created';
+    }
   | {
       readonly acceptedAt: string;
       readonly acceptedBy: string;
@@ -291,7 +291,10 @@ export type DomainChange =
     }
   | { readonly group: ChannelGroup; readonly kind: 'channel-group.created' }
   | { readonly group: ChannelGroup; readonly kind: 'channel-group.updated' }
-  | { readonly entry: ChannelGroupEntry; readonly kind: 'channel-group.entry-set' }
+  | {
+      readonly entry: ChannelGroupEntry;
+      readonly kind: 'channel-group.entry-set';
+    }
   | {
       readonly channelId: string;
       readonly groupId: string;
@@ -319,26 +322,52 @@ export type DomainChange =
     }
   | { readonly field: TableField; readonly kind: 'table.field-added' }
   | {
+      readonly expectedVersion: number;
+      readonly field: TableField;
+      readonly kind: 'table.field-updated';
+      readonly previousField: TableField;
+      readonly revertedOperationId?: string;
+    }
+  | {
+      readonly channelId: string;
+      readonly expectedVersion: number;
+      readonly fieldId: string;
+      readonly fieldKey: string;
+      readonly kind: 'table.field-purged';
+    }
+  | {
       readonly channelId: string;
       readonly displayFieldId?: string;
       readonly kind: 'table.display-field-set';
     }
   | { readonly kind: 'table.record-created'; readonly record: TableRecord }
   | {
+      readonly expectedVersions?: Readonly<Record<string, number>>;
       readonly kind: 'table.record-updated';
+      readonly previousValues?: readonly {
+        readonly existed: boolean;
+        readonly key: string;
+        readonly value?: JsonValue;
+      }[];
       readonly recordId: string;
+      readonly removedKeys?: readonly string[];
+      readonly revertedOperationId?: string;
       readonly updatedAt: string;
       readonly values: Readonly<Record<string, JsonValue>>;
     }
   | {
       readonly actorId: string;
+      readonly expectedUpdatedAt?: string | null;
       readonly kind: 'table.record-tombstoned';
       readonly recordId: string;
+      readonly revertedOperationId?: string;
       readonly tombstonedAt: string;
     }
   | {
+      readonly expectedTombstonedAt?: string;
       readonly kind: 'table.record-restored';
       readonly recordId: string;
+      readonly revertedOperationId?: string;
       readonly restoredAt: string;
     }
   | { readonly kind: 'table.view-saved'; readonly view: TableView }

@@ -19,7 +19,8 @@ export interface StoreFixture {
 
 export type StoreFixtureFactory = () => Promise<StoreFixture>;
 
-const timestamp = (second: number): string => `2026-01-01T00:00:${String(second).padStart(2, '0')}.000Z`;
+const timestamp = (second: number): string =>
+  `2026-01-01T00:00:${String(second).padStart(2, '0')}.000Z`;
 
 const operation = (input: {
   readonly action: string;
@@ -152,6 +153,7 @@ export function storeConformance(name: string, createFixture: StoreFixtureFactor
                   channelId: 'channel-reference',
                   createdAt: timestamp(2),
                   createdBy: owner.id,
+                  fieldVersions: { name: 1 },
                   id: recordId,
                   values: { name: 'Preserved' },
                 },
@@ -325,8 +327,14 @@ export function storeConformance(name: string, createFixture: StoreFixtureFactor
           action: 'channel.create',
           actorId: owner.id,
           changes: [
-            { channel: channel('channel-rolled-back', owner, 2), kind: 'channel.created' },
-            { channel: channel('channel-rolled-back', owner, 2), kind: 'channel.created' },
+            {
+              channel: channel('channel-rolled-back', owner, 2),
+              kind: 'channel.created',
+            },
+            {
+              channel: channel('channel-rolled-back', owner, 2),
+              kind: 'channel.created',
+            },
           ],
           channelId: 'channel-rolled-back',
           id: 'operation-invalid-state',
@@ -344,6 +352,7 @@ export function storeConformance(name: string, createFixture: StoreFixtureFactor
             channelId: 'channel-atomic',
             createdAt: timestamp(3),
             createdBy: owner.id,
+            fieldVersions: {},
             id: 'record-operation-failure',
             values: {},
           },
@@ -372,6 +381,7 @@ export function storeConformance(name: string, createFixture: StoreFixtureFactor
                 channelId: 'channel-atomic',
                 createdAt: timestamp(4),
                 createdBy: owner.id,
+                fieldVersions: {},
                 id: 'record-activity-failure',
                 values: {},
               },
@@ -524,7 +534,9 @@ export function storeConformance(name: string, createFixture: StoreFixtureFactor
         ]);
         await expect(
           app.executeQuery(viewerId, 'cli', 'operation.history', { channelId }),
-        ).rejects.toMatchObject({ code: 'permission.denied' } satisfies Partial<DatagramError>);
+        ).rejects.toMatchObject({
+          code: 'permission.denied',
+        } satisfies Partial<DatagramError>);
 
         await app.executeAction(owner.id, 'cli', 'operation.undo', {
           channelId,

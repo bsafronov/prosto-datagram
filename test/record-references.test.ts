@@ -121,6 +121,7 @@ describe('Record Reference Fields', () => {
       })).data,
     ).toEqual([
       {
+        fieldVersions: { primary: 1, related: 1 },
         id: created.subject!.id,
         values: {
           primary: { channelId: targetChannelId, recordId: first.subject!.id, status: 'resolved' },
@@ -249,6 +250,7 @@ describe('Record Reference Fields', () => {
     );
     await value.app.executeAction(value.owner.id, 'mcp', 'table.record.edit', {
       channelId: sourceChannelId,
+      observedVersions: { target: 1 },
       recordId: created.subject!.id,
       values: { target: second.subject!.id },
     });
@@ -275,5 +277,64 @@ describe('Record Reference Fields', () => {
     );
     expect(JSON.stringify(handle)).not.toContain(second.subject!.id);
     expect(JSON.stringify(handle)).not.toContain('Second hidden value');
+  });
+
+  test('preserves reference configuration through explicit Field conversion plans', async () => {
+    const { sourceChannelId, targetChannelId, value } = await setup();
+    const target = await createTarget(value, targetChannelId, 'Conversion target');
+    const field = await value.app.executeAction(value.owner.id, 'cli', 'table.field.add', {
+      channelId: sourceChannelId,
+      key: 'target',
+      label: 'Target',
+      required: false,
+      type: 'text',
+      unique: false,
+    });
+    await value.app.executeAction(value.owner.id, 'cli', 'table.record.create', {
+      channelId: sourceChannelId,
+      values: { target: target.subject!.id },
+    });
+
+    expect(
+      (
+        await value.app.executeQuery(
+          value.owner.id,
+          'cli',
+          'table.field.conversion.preview',
+          {
+            cardinality: 'one',
+            channelId: sourceChannelId,
+            fieldId: field.subject!.id,
+            targetChannelId,
+            targetType: 'record-reference',
+          },
+        )
+      ).data,
+    ).toMatchObject({ failures: [] });
+    await value.app.executeAction(value.owner.id, 'cli', 'table.field.convert', {
+      cardinality: 'one',
+      channelId: sourceChannelId,
+      fieldId: field.subject!.id,
+      observedVersion: 1,
+      targetChannelId,
+      targetType: 'record-reference',
+    });
+    expect(
+      (await value.store.listTableFields(sourceChannelId)).find(
+        (candidate) => candidate.id === field.subject!.id,
+      ),
+    ).toMatchObject({ cardinality: 'one', targetChannelId, type: 'record-reference', version: 2 });
+
+    await value.app.executeAction(value.owner.id, 'cli', 'table.field.convert', {
+      channelId: sourceChannelId,
+      fieldId: field.subject!.id,
+      observedVersion: 2,
+      targetType: 'text',
+    });
+    expect(
+      (await value.store.listTableFields(sourceChannelId)).find(
+        (candidate) => candidate.id === field.subject!.id,
+      ),
+    ).toEqual(expect.not.objectContaining({ cardinality: expect.anything(), targetChannelId }));
   });
 });

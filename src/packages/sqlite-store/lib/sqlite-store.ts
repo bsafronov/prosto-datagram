@@ -73,8 +73,11 @@ interface TableFieldRow {
   label: string;
   required: number;
   target_channel_id: string | null;
+  tombstoned_at: string | null;
+  tombstoned_by: string | null;
   type: TableField['type'];
   unique_value: number;
+  version: number;
 }
 
 interface DictionaryEntryRow {
@@ -94,6 +97,7 @@ interface TableRecordRow {
   created_at: string;
   created_by: string;
   id: string;
+  field_versions_json: string;
   tombstoned_at: string | null;
   tombstoned_by: string | null;
   updated_at: string | null;
@@ -247,16 +251,17 @@ const membershipFromRow = (row: MembershipRow): ChannelMembership => ({
 const tableFieldFromRow = (row: TableFieldRow): TableField => ({
   ...(row.cardinality === null ? {} : { cardinality: row.cardinality }),
   channelId: row.channel_id,
-  ...(row.default_json === null
-    ? {}
-    : { defaultValue: JSON.parse(row.default_json) as JsonValue }),
+  ...(row.default_json === null ? {} : { defaultValue: JSON.parse(row.default_json) as JsonValue }),
   id: row.id,
   key: row.key,
   label: row.label,
   required: row.required === 1,
   ...(row.target_channel_id === null ? {} : { targetChannelId: row.target_channel_id }),
+  ...(row.tombstoned_at === null ? {} : { tombstonedAt: row.tombstoned_at }),
+  ...(row.tombstoned_by === null ? {} : { tombstonedBy: row.tombstoned_by }),
   type: row.type,
   unique: row.unique_value === 1,
+  version: row.version,
 });
 
 const dictionaryEntryFromRow = (row: DictionaryEntryRow): DictionaryEntry => ({
@@ -276,6 +281,7 @@ const tableRecordFromRow = (row: TableRecordRow): TableRecord => ({
   createdAt: row.created_at,
   createdBy: row.created_by,
   id: row.id,
+  fieldVersions: JSON.parse(row.field_versions_json) as Record<string, number>,
   ...(row.tombstoned_at === null ? {} : { tombstonedAt: row.tombstoned_at }),
   ...(row.tombstoned_by === null ? {} : { tombstonedBy: row.tombstoned_by }),
   ...(row.updated_at === null ? {} : { updatedAt: row.updated_at }),
@@ -305,18 +311,13 @@ const messageRevisionFromRow = (row: MessageRevisionRow): MessageRevision => ({
   text: row.text,
 });
 
-const messageFromRow = (
-  row: MessageRow,
-  revisions: readonly MessageRevision[],
-): Message => ({
+const messageFromRow = (row: MessageRow, revisions: readonly MessageRevision[]): Message => ({
   authorId: row.author_id,
   channelId: row.channel_id,
   createdAt: row.created_at,
   id: row.id,
   recordReferences: JSON.parse(row.record_references_json) as string[],
-  ...(row.reply_to_message_id === null
-    ? {}
-    : { replyToMessageId: row.reply_to_message_id }),
+  ...(row.reply_to_message_id === null ? {} : { replyToMessageId: row.reply_to_message_id }),
   revisions,
   text: row.text,
   ...(row.tombstoned_at === null ? {} : { tombstonedAt: row.tombstoned_at }),
@@ -349,9 +350,7 @@ const activityFromRow = (row: ActivityRow): ChannelActivity => ({
 const navigationFromRow = (row: NavigationRow): ChannelNavigation => ({
   ...(row.archived_at === null ? {} : { archivedAt: row.archived_at }),
   channelId: row.channel_id,
-  ...(row.last_read_activity_id === null
-    ? {}
-    : { lastReadActivityId: row.last_read_activity_id }),
+  ...(row.last_read_activity_id === null ? {} : { lastReadActivityId: row.last_read_activity_id }),
   muted: row.muted === 1,
   personId: row.person_id,
   pinned: row.pinned === 1,
@@ -502,6 +501,9 @@ export class SqliteStore implements DatagramStore {
         default_json TEXT,
         target_channel_id TEXT REFERENCES channels(id),
         cardinality TEXT CHECK (cardinality IN ('one', 'many')),
+        version INTEGER NOT NULL DEFAULT 1,
+        tombstoned_at TEXT,
+        tombstoned_by TEXT REFERENCES persons(id),
         UNIQUE (channel_id, key)
       );
 
@@ -522,6 +524,7 @@ export class SqliteStore implements DatagramStore {
         id TEXT PRIMARY KEY,
         channel_id TEXT NOT NULL REFERENCES channels(id),
         values_json TEXT NOT NULL,
+        field_versions_json TEXT NOT NULL DEFAULT '{}',
         created_by TEXT NOT NULL REFERENCES persons(id),
         created_at TEXT NOT NULL,
         updated_at TEXT,
@@ -698,9 +701,9 @@ export class SqliteStore implements DatagramStore {
     }
 
     const operationColumns = new Set(
-      (
-        this.#database.query('PRAGMA table_info(operations)').all() as TableInfoRow[]
-      ).map((column) => column.name),
+      (this.#database.query('PRAGMA table_info(operations)').all() as TableInfoRow[]).map(
+        (column) => column.name,
+      ),
     );
     if (!operationColumns.has('intent_json')) {
       this.#database.exec('ALTER TABLE operations ADD COLUMN intent_json TEXT;');
@@ -724,12 +727,17 @@ export class SqliteStore implements DatagramStore {
     for (const row of missingResults) updateResult.run(JSON.stringify(row.status), row.id);
 
     const recordColumns = new Set(
-      (
-        this.#database.query('PRAGMA table_info(table_records)').all() as TableInfoRow[]
-      ).map((column) => column.name),
+      (this.#database.query('PRAGMA table_info(table_records)').all() as TableInfoRow[]).map(
+        (column) => column.name,
+      ),
     );
     if (!recordColumns.has('updated_at')) {
       this.#database.exec('ALTER TABLE table_records ADD COLUMN updated_at TEXT;');
+    }
+    if (!recordColumns.has('field_versions_json')) {
+      this.#database.exec(
+        "ALTER TABLE table_records ADD COLUMN field_versions_json TEXT NOT NULL DEFAULT '{}';",
+      );
     }
     if (!recordColumns.has('tombstoned_at')) {
       this.#database.exec('ALTER TABLE table_records ADD COLUMN tombstoned_at TEXT;');
@@ -737,7 +745,6 @@ export class SqliteStore implements DatagramStore {
     if (!recordColumns.has('tombstoned_by')) {
       this.#database.exec('ALTER TABLE table_records ADD COLUMN tombstoned_by TEXT;');
     }
-
     const fieldColumns = new Set(
       (
         this.#database.query('PRAGMA table_info(table_fields)').all() as TableInfoRow[]
@@ -751,6 +758,30 @@ export class SqliteStore implements DatagramStore {
     if (!fieldColumns.has('cardinality')) {
       this.#database.exec(
         "ALTER TABLE table_fields ADD COLUMN cardinality TEXT CHECK (cardinality IN ('one', 'many'));",
+      );
+    }
+    if (!fieldColumns.has('version')) {
+      this.#database.exec(
+        'ALTER TABLE table_fields ADD COLUMN version INTEGER NOT NULL DEFAULT 1;',
+      );
+    }
+    if (!fieldColumns.has('tombstoned_at')) {
+      this.#database.exec('ALTER TABLE table_fields ADD COLUMN tombstoned_at TEXT;');
+    }
+    if (!fieldColumns.has('tombstoned_by')) {
+      this.#database.exec('ALTER TABLE table_fields ADD COLUMN tombstoned_by TEXT;');
+    }
+    const recordsWithoutVersions = this.#database
+      .query("SELECT id, values_json FROM table_records WHERE field_versions_json = '{}'")
+      .all() as Array<{ id: string; values_json: string }>;
+    const updateVersions = this.#database.prepare(
+      'UPDATE table_records SET field_versions_json = ? WHERE id = ?',
+    );
+    for (const row of recordsWithoutVersions) {
+      const values = JSON.parse(row.values_json) as Record<string, JsonValue>;
+      updateVersions.run(
+        JSON.stringify(Object.fromEntries(Object.keys(values).map((key) => [key, 1]))),
+        row.id,
       );
     }
   }
@@ -779,16 +810,16 @@ export class SqliteStore implements DatagramStore {
   }
 
   async getPerson(personId: string): Promise<Person | null> {
-    const row = this.#database.query('SELECT * FROM persons WHERE id = ?').get(personId) as
-      | PersonRow
-      | null;
+    const row = this.#database
+      .query('SELECT * FROM persons WHERE id = ?')
+      .get(personId) as PersonRow | null;
     return row ? personFromRow(row) : null;
   }
 
   async getChannel(channelId: string): Promise<Channel | null> {
-    const row = this.#database.query('SELECT * FROM channels WHERE id = ?').get(channelId) as
-      | ChannelRow
-      | null;
+    const row = this.#database
+      .query('SELECT * FROM channels WHERE id = ?')
+      .get(channelId) as ChannelRow | null;
     return row ? channelFromRow(row) : null;
   }
 
@@ -810,10 +841,7 @@ export class SqliteStore implements DatagramStore {
     return row ? groupFromRow(row) : null;
   }
 
-  async getChannelNavigation(
-    channelId: string,
-    personId: string,
-  ): Promise<ChannelNavigation> {
+  async getChannelNavigation(channelId: string, personId: string): Promise<ChannelNavigation> {
     const row = this.#database
       .query('SELECT * FROM channel_navigation WHERE channel_id = ? AND person_id = ?')
       .get(channelId, personId) as NavigationRow | null;
@@ -830,9 +858,9 @@ export class SqliteStore implements DatagramStore {
   }
 
   async getMessage(messageId: string): Promise<Message | null> {
-    const row = this.#database.query('SELECT * FROM messages WHERE id = ?').get(messageId) as
-      | MessageRow
-      | null;
+    const row = this.#database
+      .query('SELECT * FROM messages WHERE id = ?')
+      .get(messageId) as MessageRow | null;
     return row ? messageFromRow(row, this.#listMessageRevisions(messageId)) : null;
   }
 
@@ -858,9 +886,9 @@ export class SqliteStore implements DatagramStore {
   }
 
   async getTableRecord(recordId: string): Promise<TableRecord | null> {
-    const row = this.#database.query('SELECT * FROM table_records WHERE id = ?').get(recordId) as
-      | TableRecordRow
-      | null;
+    const row = this.#database
+      .query('SELECT * FROM table_records WHERE id = ?')
+      .get(recordId) as TableRecordRow | null;
     return row ? tableRecordFromRow(row) : null;
   }
 
@@ -1519,9 +1547,9 @@ export class SqliteStore implements DatagramStore {
       case 'table.field-added':
         this.#database.run(
           `INSERT INTO table_fields
-            (id, channel_id, key, label, type, required, unique_value, default_json,
-             target_channel_id, cardinality)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             (id, channel_id, key, label, type, required, unique_value, default_json, version,
+              tombstoned_at, tombstoned_by, target_channel_id, cardinality)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             change.field.id,
             change.field.channelId,
@@ -1533,11 +1561,98 @@ export class SqliteStore implements DatagramStore {
             change.field.defaultValue === undefined
               ? null
               : JSON.stringify(change.field.defaultValue),
+            change.field.version,
+            change.field.tombstonedAt ?? null,
+            change.field.tombstonedBy ?? null,
             change.field.targetChannelId ?? null,
             change.field.cardinality ?? null,
           ],
         );
         return;
+      case 'table.field-updated': {
+        const result = this.#database.run(
+           `UPDATE table_fields
+           SET label = ?, type = ?, required = ?, unique_value = ?, default_json = ?,
+               version = ?, tombstoned_at = ?, tombstoned_by = ?, target_channel_id = ?,
+               cardinality = ?
+           WHERE id = ? AND version = ?`,
+          [
+            change.field.label,
+            change.field.type,
+            change.field.required ? 1 : 0,
+            change.field.unique ? 1 : 0,
+            change.field.defaultValue === undefined
+              ? null
+              : JSON.stringify(change.field.defaultValue),
+            change.field.version,
+            change.field.tombstonedAt ?? null,
+            change.field.tombstonedBy ?? null,
+            change.field.targetChannelId ?? null,
+            change.field.cardinality ?? null,
+            change.field.id,
+            change.expectedVersion,
+          ],
+        );
+        if (result.changes !== 1) throw new Error('Table Field changed after observation');
+        return;
+      }
+      case 'table.field-purged': {
+        const result = this.#database.run(
+          `DELETE FROM table_fields
+           WHERE id = ? AND channel_id = ? AND version = ? AND tombstoned_at IS NOT NULL`,
+          [change.fieldId, change.channelId, change.expectedVersion],
+        );
+        if (result.changes !== 1) throw new Error('Table Field changed after observation');
+        const rows = this.#database
+          .query(
+            'SELECT id, values_json, field_versions_json FROM table_records WHERE channel_id = ?',
+          )
+          .all(change.channelId) as Array<{
+          field_versions_json: string;
+          id: string;
+          values_json: string;
+        }>;
+        const update = this.#database.prepare(
+          'UPDATE table_records SET values_json = ?, field_versions_json = ? WHERE id = ?',
+        );
+        for (const row of rows) {
+          const values = JSON.parse(row.values_json) as Record<string, JsonValue>;
+          const versions = JSON.parse(row.field_versions_json) as Record<string, number>;
+          delete values[change.fieldKey];
+          delete versions[change.fieldKey];
+          update.run(JSON.stringify(values), JSON.stringify(versions), row.id);
+        }
+        const operationRows = this.#database
+          .query('SELECT id, changes_json FROM operations WHERE channel_id = ?')
+          .all(change.channelId) as Array<{ changes_json: string; id: string }>;
+        const updateOperation = this.#database.prepare(
+          'UPDATE operations SET changes_json = ? WHERE id = ?',
+        );
+        for (const operationRow of operationRows) {
+          const changes = JSON.parse(operationRow.changes_json) as Array<Record<string, unknown>>;
+          for (const historical of changes) {
+            if (historical.kind === 'table.record-created') {
+              const record = historical.record as {
+                fieldVersions?: Record<string, number>;
+                values: Record<string, JsonValue>;
+              };
+              delete record.values[change.fieldKey];
+              if (record.fieldVersions) delete record.fieldVersions[change.fieldKey];
+            }
+            if (historical.kind === 'table.record-updated') {
+              const values = historical.values as Record<string, JsonValue>;
+              delete values[change.fieldKey];
+              if (Array.isArray(historical.previousValues)) {
+                historical.previousValues = historical.previousValues.filter(
+                  (entry) => (entry as { key?: unknown }).key !== change.fieldKey,
+                );
+              }
+            }
+          }
+          updateOperation.run(JSON.stringify(changes), operationRow.id);
+        }
+        return;
+      }
       case 'table.display-field-set':
         this.#database.run(
           `INSERT INTO table_settings (channel_id, display_field_id) VALUES (?, ?)
@@ -1547,41 +1662,89 @@ export class SqliteStore implements DatagramStore {
         return;
       case 'table.record-created':
         this.#database.run(
-          `INSERT INTO table_records (id, channel_id, values_json, created_by, created_at)
-           VALUES (?, ?, ?, ?, ?)`,
+          `INSERT INTO table_records
+            (id, channel_id, values_json, field_versions_json, created_by, created_at)
+           VALUES (?, ?, ?, ?, ?, ?)`,
           [
             change.record.id,
             change.record.channelId,
             JSON.stringify(change.record.values),
+            JSON.stringify(change.record.fieldVersions),
             change.record.createdBy,
             change.record.createdAt,
           ],
         );
         return;
       case 'table.record-updated': {
+        const row = this.#database
+          .query('SELECT values_json, field_versions_json FROM table_records WHERE id = ?')
+          .get(change.recordId) as {
+          field_versions_json: string;
+          values_json: string;
+        } | null;
+        if (!row) throw new Error('Table Record is unavailable');
+        const values = JSON.parse(row.values_json) as Record<string, JsonValue>;
+        const versions = JSON.parse(row.field_versions_json) as Record<string, number>;
+        for (const [key, expected] of Object.entries(change.expectedVersions ?? {})) {
+          if ((versions[key] ?? 0) !== expected) {
+            throw new Error(`Table Field value changed after observation: ${key}`);
+          }
+        }
+        const changedKeys = new Set([...Object.keys(change.values), ...(change.removedKeys ?? [])]);
+        for (const [key, value] of Object.entries(change.values)) values[key] = value;
+        for (const key of change.removedKeys ?? []) delete values[key];
+        for (const key of changedKeys) versions[key] = (versions[key] ?? 0) + 1;
         const result = this.#database.run(
-          'UPDATE table_records SET values_json = ?, updated_at = ? WHERE id = ?',
-          [JSON.stringify(change.values), change.updatedAt, change.recordId],
+          `UPDATE table_records
+           SET values_json = ?, field_versions_json = ?, updated_at = ? WHERE id = ?`,
+          [JSON.stringify(values), JSON.stringify(versions), change.updatedAt, change.recordId],
         );
         if (result.changes !== 1) throw new Error('Table Record is unavailable');
         return;
       }
       case 'table.record-tombstoned': {
-        const result = this.#database.run(
-          `UPDATE table_records SET tombstoned_at = ?, tombstoned_by = ?, updated_at = ?
-           WHERE id = ? AND tombstoned_at IS NULL`,
-          [change.tombstonedAt, change.actorId, change.tombstonedAt, change.recordId],
-        );
+        const result =
+          change.expectedUpdatedAt === undefined
+            ? this.#database.run(
+                `UPDATE table_records SET tombstoned_at = ?, tombstoned_by = ?, updated_at = ?
+                 WHERE id = ? AND tombstoned_at IS NULL`,
+                [change.tombstonedAt, change.actorId, change.tombstonedAt, change.recordId],
+              )
+            : change.expectedUpdatedAt === null
+              ? this.#database.run(
+                  `UPDATE table_records SET tombstoned_at = ?, tombstoned_by = ?, updated_at = ?
+                   WHERE id = ? AND tombstoned_at IS NULL AND updated_at IS NULL`,
+                  [change.tombstonedAt, change.actorId, change.tombstonedAt, change.recordId],
+                )
+              : this.#database.run(
+                  `UPDATE table_records SET tombstoned_at = ?, tombstoned_by = ?, updated_at = ?
+                   WHERE id = ? AND tombstoned_at IS NULL AND updated_at = ?`,
+                  [
+                    change.tombstonedAt,
+                    change.actorId,
+                    change.tombstonedAt,
+                    change.recordId,
+                    change.expectedUpdatedAt,
+                  ],
+                );
         if (result.changes !== 1) throw new Error('Table Record is already tombstoned');
         return;
       }
       case 'table.record-restored': {
-        const result = this.#database.run(
-          `UPDATE table_records
-           SET tombstoned_at = NULL, tombstoned_by = NULL, updated_at = ?
-           WHERE id = ? AND tombstoned_at IS NOT NULL`,
-          [change.restoredAt, change.recordId],
-        );
+        const result =
+          change.expectedTombstonedAt === undefined
+            ? this.#database.run(
+                `UPDATE table_records
+               SET tombstoned_at = NULL, tombstoned_by = NULL, updated_at = ?
+               WHERE id = ? AND tombstoned_at IS NOT NULL`,
+                [change.restoredAt, change.recordId],
+              )
+            : this.#database.run(
+                `UPDATE table_records
+               SET tombstoned_at = NULL, tombstoned_by = NULL, updated_at = ?
+               WHERE id = ? AND tombstoned_at = ?`,
+                [change.restoredAt, change.recordId, change.expectedTombstonedAt],
+              );
         if (result.changes !== 1) throw new Error('Table Record is not tombstoned');
         return;
       }
@@ -1623,7 +1786,9 @@ export class SqliteStore implements DatagramStore {
         if (change.message.replyToMessageId !== undefined) {
           const replyTarget = this.#database
             .query('SELECT channel_id FROM messages WHERE id = ?')
-            .get(change.message.replyToMessageId) as { channel_id: string } | null;
+            .get(change.message.replyToMessageId) as {
+            channel_id: string;
+          } | null;
           if (replyTarget?.channel_id !== change.message.channelId) {
             throw new Error('Reply target must belong to the same Channel Discussion');
           }
@@ -1706,10 +1871,10 @@ export class SqliteStore implements DatagramStore {
             change.activity.occurredAt,
           ],
         );
-        this.#database.run(
-          'UPDATE channels SET updated_at = ? WHERE id = ?',
-          [change.activity.occurredAt, change.activity.channelId],
-        );
+        this.#database.run('UPDATE channels SET updated_at = ? WHERE id = ?', [
+          change.activity.occurredAt,
+          change.activity.channelId,
+        ]);
         this.#database.run(
           `UPDATE channel_navigation SET archived_at = NULL
            WHERE channel_id = ? AND archived_at IS NOT NULL AND muted = 0`,
