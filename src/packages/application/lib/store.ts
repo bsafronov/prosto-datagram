@@ -1,5 +1,6 @@
 import type {
   Channel,
+  ChannelActivity,
   ChannelMembership,
   Message,
   Operation,
@@ -17,6 +18,7 @@ export interface DatagramStore {
   getPerson(personId: string): Promise<Person | null>;
   initialize(): Promise<void>;
   listChannels(personId: string): Promise<readonly Channel[]>;
+  listActivities(channelId: string): Promise<readonly ChannelActivity[]>;
   listMessages(channelId: string): Promise<readonly Message[]>;
   listOperations(channelId: string): Promise<readonly Operation[]>;
   listTableFields(channelId: string): Promise<readonly TableField[]>;

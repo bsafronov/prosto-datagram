@@ -4,6 +4,7 @@ import {
   newId,
   nowIso,
   type Channel,
+  type ChannelActivity,
   type ChannelMembership,
   type DatagramStore,
   type DomainChange,
@@ -77,6 +78,15 @@ interface OperationRow {
   status: Operation['status'];
 }
 
+interface ActivityRow {
+  actor_id: string;
+  channel_id: string;
+  id: string;
+  kind: string;
+  occurred_at: string;
+  operation_id: string;
+}
+
 const personFromRow = (row: PersonRow): Person => ({
   createdAt: row.created_at,
   displayName: row.display_name,
@@ -136,9 +146,20 @@ const operationFromRow = (row: OperationRow): Operation => ({
   changes: JSON.parse(row.changes_json) as DomainChange[],
   ...(row.channel_id === null ? {} : { channelId: row.channel_id }),
   id: row.id,
+  intent: row.action,
   occurredAt: row.occurred_at,
   origin: row.origin,
+  result: row.status,
   status: row.status,
+});
+
+const activityFromRow = (row: ActivityRow): ChannelActivity => ({
+  actorId: row.actor_id,
+  channelId: row.channel_id,
+  id: row.id,
+  kind: row.kind,
+  occurredAt: row.occurred_at,
+  operationId: row.operation_id,
 });
 
 export class SqliteStore implements DatagramStore {
@@ -291,6 +312,18 @@ export class SqliteStore implements DatagramStore {
     return rows.map(channelFromRow);
   }
 
+  async listActivities(channelId: string): Promise<readonly ChannelActivity[]> {
+    const rows = this.#database
+      .query(
+        `SELECT actor_id, channel_id, id, kind, occurred_at, operation_id
+         FROM channel_activities
+         WHERE channel_id = ?
+         ORDER BY sequence`,
+      )
+      .all(channelId) as ActivityRow[];
+    return rows.map(activityFromRow);
+  }
+
   async listTableFields(channelId: string): Promise<readonly TableField[]> {
     const rows = this.#database
       .query('SELECT * FROM table_fields WHERE channel_id = ? ORDER BY rowid')
@@ -386,6 +419,22 @@ export class SqliteStore implements DatagramStore {
           [change.membership.channelId, change.membership.personId, change.membership.role],
         );
         return;
+      case 'membership.reverted': {
+        const result = change.restoredRole
+          ? this.#database.run(
+              `UPDATE channel_memberships
+               SET role = ?
+               WHERE channel_id = ? AND person_id = ? AND role = ?`,
+              [change.restoredRole, change.channelId, change.personId, change.expectedRole],
+            )
+          : this.#database.run(
+              `DELETE FROM channel_memberships
+               WHERE channel_id = ? AND person_id = ? AND role = ?`,
+              [change.channelId, change.personId, change.expectedRole],
+            );
+        if (result.changes !== 1) throw new Error('Membership changed after original Operation');
+        return;
+      }
       case 'table.field-added':
         this.#database.run(
           `INSERT INTO table_fields

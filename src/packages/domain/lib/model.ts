@@ -99,15 +99,29 @@ export interface Operation {
   readonly changes: readonly DomainChange[];
   readonly channelId?: string;
   readonly id: string;
+  readonly intent: string;
   readonly occurredAt: string;
   readonly origin: OperationOrigin;
+  readonly result: 'succeeded';
   readonly status: 'succeeded';
 }
 
 export type DomainChange =
   | { readonly kind: 'person.created'; readonly person: Person }
   | { readonly channel: Channel; readonly kind: 'channel.created' }
-  | { readonly kind: 'membership.granted'; readonly membership: ChannelMembership }
+  | {
+      readonly kind: 'membership.granted';
+      readonly membership: ChannelMembership;
+      readonly previousRole?: ChannelRole;
+    }
+  | {
+      readonly channelId: string;
+      readonly expectedRole: ChannelRole;
+      readonly kind: 'membership.reverted';
+      readonly personId: string;
+      readonly revertedOperationId: string;
+      readonly restoredRole?: ChannelRole;
+    }
   | { readonly field: TableField; readonly kind: 'table.field-added' }
   | { readonly kind: 'table.record-created'; readonly record: TableRecord }
   | { readonly kind: 'discussion.message-posted'; readonly message: Message }

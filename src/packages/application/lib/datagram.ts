@@ -136,8 +136,10 @@ export class DatagramApplication {
       changes: build(operationId, occurredAt),
       ...(channelId === undefined ? {} : { channelId }),
       id: operationId,
+      intent: action,
       occurredAt,
       origin: context.origin,
+      result: 'succeeded',
       status: 'succeeded',
     };
     await this.store.commit(operation);
@@ -242,6 +244,7 @@ export class DatagramApplication {
           await this.#requireChannel(input.channelId);
           await this.#requirePerson(input.personId);
           await this.#requireRole(context.actorId, input.channelId, 'admin');
+          const previous = await this.store.getMembership(input.channelId, input.personId);
           return this.#commit(
             context,
             'channel.member.grant',
@@ -254,12 +257,82 @@ export class DatagramApplication {
                   personId: input.personId,
                   role: input.role,
                 },
+                ...(previous ? { previousRole: previous.role } : {}),
               },
               {
                 activity: this.#activity(
                   context.actorId,
                   input.channelId,
                   'channel.member-granted',
+                  operationId,
+                  occurredAt,
+                ),
+                kind: 'activity.appended',
+              },
+            ],
+          );
+        },
+      }),
+      defineAction({
+        description: 'Undo a reversible membership grant when its effect is still current.',
+        inputSchema: z.object({
+          channelId: z.string().min(1),
+          operationId: z.string().min(1),
+        }),
+        name: 'operation.undo',
+        run: async (context, input) => {
+          await this.#requireChannel(input.channelId);
+          await this.#requireRole(context.actorId, input.channelId, 'admin');
+          const operations = await this.store.listOperations(input.channelId);
+          const original = operations.find((operation) => operation.id === input.operationId);
+          invariant(original, 'operation.not-found', 'Operation does not exist', 404);
+          invariant(
+            original.action === 'channel.member.grant',
+            'operation.not-reversible',
+            'Operation is not reversible',
+            409,
+          );
+          const granted = original.changes.find(
+            (change) => change.kind === 'membership.granted',
+          );
+          invariant(
+            granted?.kind === 'membership.granted',
+            'operation.not-reversible',
+            'Operation has no reversible membership change',
+            409,
+          );
+          invariant(
+            !operations.some(
+              (operation) =>
+                operation.action === 'operation.undo' &&
+                operation.changes.some(
+                  (change) =>
+                    change.kind === 'membership.reverted' &&
+                    change.revertedOperationId === original.id,
+                ),
+            ),
+            'operation.already-undone',
+            'Operation was already undone',
+            409,
+          );
+          return this.#commit(
+            context,
+            'operation.undo',
+            input.channelId,
+            (operationId, occurredAt) => [
+              {
+                channelId: granted.membership.channelId,
+                expectedRole: granted.membership.role,
+                kind: 'membership.reverted',
+                personId: granted.membership.personId,
+                revertedOperationId: original.id,
+                ...(granted.previousRole ? { restoredRole: granted.previousRole } : {}),
+              },
+              {
+                activity: this.#activity(
+                  context.actorId,
+                  input.channelId,
+                  'operation.undone',
                   operationId,
                   occurredAt,
                 ),
@@ -451,6 +524,45 @@ export class DatagramApplication {
 
   #queryDefinitions() {
     return [
+      defineQuery({
+        description: 'Inspect permitted Operation History for one Channel.',
+        inputSchema: z.object({ channelId: z.string().min(1) }),
+        name: 'operation.history',
+        run: async (context, input): Promise<QueryResult> => {
+          await this.#requireChannel(input.channelId);
+          const membership = await this.store.getMembership(input.channelId, context.actorId);
+          invariant(membership, 'permission.denied', 'Channel membership is required', 403);
+          invariant(
+            membership.role !== 'viewer',
+            'permission.denied',
+            'Operation History is not available to Viewers',
+            403,
+          );
+          const operations = await this.store.listOperations(input.channelId);
+          const visible =
+            membership.role === 'contributor'
+              ? operations.filter((operation) => operation.actorId === context.actorId)
+              : operations;
+          return {
+            data: visible.map((operation) => ({
+              actorId: operation.actorId,
+              changes: toJson(operation.changes),
+              id: operation.id,
+              intent: operation.intent,
+              occurredAt: operation.occurredAt,
+              origin: operation.origin,
+              result: operation.result,
+            })),
+            view: {
+              bindings: { operations: '$result' },
+              commands: ['operation.undo'],
+              kind: 'table',
+              schemaVersion: 'datagram/view@1',
+              title: 'Operation History',
+            },
+          };
+        },
+      }),
       defineQuery({
         description: 'List Channels accessible to the requesting person.',
         inputSchema: z.object({}),
