@@ -5,6 +5,7 @@ import {
   nowIso,
   type Channel,
   type ChannelActivity,
+  type ChannelInvitation,
   type ChannelMembership,
   type DatagramStore,
   type DomainChange,
@@ -18,9 +19,21 @@ import {
 
 interface PersonRow {
   created_at: string;
+  deactivated_at: string | null;
   display_name: string;
   id: string;
   is_operator: number;
+}
+
+interface InvitationRow {
+  accepted_at: string | null;
+  accepted_by: string | null;
+  channel_id: string;
+  created_at: string;
+  created_by: string;
+  expires_at: string;
+  id: string;
+  proposed_role: ChannelInvitation['proposedRole'];
 }
 
 interface ChannelRow {
@@ -95,9 +108,21 @@ interface ActivityRow {
 
 const personFromRow = (row: PersonRow): Person => ({
   createdAt: row.created_at,
+  ...(row.deactivated_at === null ? {} : { deactivatedAt: row.deactivated_at }),
   displayName: row.display_name,
   id: row.id,
   isOperator: row.is_operator === 1,
+});
+
+const invitationFromRow = (row: InvitationRow): ChannelInvitation => ({
+  ...(row.accepted_at === null ? {} : { acceptedAt: row.accepted_at }),
+  ...(row.accepted_by === null ? {} : { acceptedBy: row.accepted_by }),
+  channelId: row.channel_id,
+  createdAt: row.created_at,
+  createdBy: row.created_by,
+  expiresAt: row.expires_at,
+  id: row.id,
+  proposedRole: row.proposed_role,
 });
 
 const channelFromRow = (row: ChannelRow): Channel => ({
@@ -183,7 +208,8 @@ export class SqliteStore implements DatagramStore {
         id TEXT PRIMARY KEY,
         display_name TEXT NOT NULL,
         is_operator INTEGER NOT NULL DEFAULT 0,
-        created_at TEXT NOT NULL
+        created_at TEXT NOT NULL,
+        deactivated_at TEXT
       );
 
       CREATE TABLE IF NOT EXISTS channels (
@@ -201,6 +227,20 @@ export class SqliteStore implements DatagramStore {
         person_id TEXT NOT NULL REFERENCES persons(id),
         role TEXT NOT NULL CHECK (role IN ('owner', 'admin', 'contributor', 'viewer')),
         PRIMARY KEY (channel_id, person_id)
+      );
+
+      CREATE UNIQUE INDEX IF NOT EXISTS channel_single_owner
+        ON channel_memberships(channel_id) WHERE role = 'owner';
+
+      CREATE TABLE IF NOT EXISTS channel_invitations (
+        id TEXT PRIMARY KEY,
+        channel_id TEXT NOT NULL REFERENCES channels(id),
+        proposed_role TEXT NOT NULL CHECK (proposed_role IN ('admin', 'contributor', 'viewer')),
+        expires_at TEXT NOT NULL,
+        created_by TEXT NOT NULL REFERENCES persons(id),
+        created_at TEXT NOT NULL,
+        accepted_by TEXT REFERENCES persons(id),
+        accepted_at TEXT
       );
 
       CREATE TABLE IF NOT EXISTS operations (
@@ -265,6 +305,15 @@ export class SqliteStore implements DatagramStore {
         ON messages(channel_id, created_at);
     `);
 
+    const personColumns = new Set(
+      (this.#database.query('PRAGMA table_info(persons)').all() as TableInfoRow[]).map(
+        (column) => column.name,
+      ),
+    );
+    if (!personColumns.has('deactivated_at')) {
+      this.#database.exec('ALTER TABLE persons ADD COLUMN deactivated_at TEXT;');
+    }
+
     const operationColumns = new Set(
       (
         this.#database.query('PRAGMA table_info(operations)').all() as TableInfoRow[]
@@ -294,7 +343,11 @@ export class SqliteStore implements DatagramStore {
 
   async ensureLocalOwner(displayName = 'Local Owner'): Promise<Person> {
     const existing = this.#database
-      .query('SELECT * FROM persons WHERE is_operator = 1 ORDER BY created_at LIMIT 1')
+      .query(
+        `SELECT * FROM persons
+         WHERE is_operator = 1 AND deactivated_at IS NULL
+         ORDER BY created_at LIMIT 1`,
+      )
       .get() as PersonRow | null;
     if (existing) return personFromRow(existing);
 
@@ -325,6 +378,13 @@ export class SqliteStore implements DatagramStore {
     return row ? channelFromRow(row) : null;
   }
 
+  async getInvitation(invitationId: string): Promise<ChannelInvitation | null> {
+    const row = this.#database
+      .query('SELECT * FROM channel_invitations WHERE id = ?')
+      .get(invitationId) as InvitationRow | null;
+    return row ? invitationFromRow(row) : null;
+  }
+
   async getMembership(channelId: string, personId: string): Promise<ChannelMembership | null> {
     const row = this.#database
       .query('SELECT * FROM channel_memberships WHERE channel_id = ? AND person_id = ?')
@@ -342,6 +402,13 @@ export class SqliteStore implements DatagramStore {
          WHERE channel_memberships.person_id = ?
          ORDER BY channels.updated_at DESC, channels.id`,
       )
+      .all(personId) as ChannelRow[];
+    return rows.map(channelFromRow);
+  }
+
+  async listOwnedChannels(personId: string): Promise<readonly Channel[]> {
+    const rows = this.#database
+      .query('SELECT * FROM channels WHERE owner_id = ? ORDER BY created_at, id')
       .all(personId) as ChannelRow[];
     return rows.map(channelFromRow);
   }
@@ -386,11 +453,33 @@ export class SqliteStore implements DatagramStore {
     return rows.map(operationFromRow);
   }
 
+  async listServiceOperations(): Promise<readonly Operation[]> {
+    const rows = this.#database
+      .query('SELECT * FROM operations WHERE channel_id IS NULL ORDER BY occurred_at, id')
+      .all() as OperationRow[];
+    return rows.map(operationFromRow);
+  }
+
   async commit(operation: Operation): Promise<void> {
     const apply = this.#database.transaction((candidate: Operation) => {
       for (const change of candidate.changes) {
         if (change.kind !== 'activity.appended') this.#applyChange(change);
       }
+
+      const invalidOwnership = this.#database
+        .query(
+          `SELECT channels.id
+           FROM channels
+           LEFT JOIN channel_memberships
+             ON channel_memberships.channel_id = channels.id
+            AND channel_memberships.role = 'owner'
+           GROUP BY channels.id
+           HAVING COUNT(channel_memberships.person_id) <> 1
+              OR MAX(channel_memberships.person_id = channels.owner_id) <> 1
+           LIMIT 1`,
+        )
+        .get();
+      if (invalidOwnership) throw new Error('Each Channel must have exactly one Owner');
 
       this.#database.run(
         `INSERT INTO operations
@@ -432,6 +521,21 @@ export class SqliteStore implements DatagramStore {
           ],
         );
         return;
+      case 'person.deactivated': {
+        const ownedChannel = this.#database
+          .query('SELECT id FROM channels WHERE owner_id = ? LIMIT 1')
+          .get(change.personId);
+        if (ownedChannel) {
+          throw new Error('Channel ownership must be transferred before deactivation');
+        }
+        const result = this.#database.run(
+          `UPDATE persons SET deactivated_at = ?
+           WHERE id = ? AND deactivated_at IS NULL`,
+          [change.deactivatedAt, change.personId],
+        );
+        if (result.changes !== 1) throw new Error('Person is already deactivated');
+        return;
+      }
       case 'channel.created':
         this.#database.run(
           `INSERT INTO channels
@@ -449,6 +553,21 @@ export class SqliteStore implements DatagramStore {
         );
         return;
       case 'membership.granted':
+        if (change.membership.role === 'owner') {
+          const channel = this.#database
+            .query('SELECT owner_id FROM channels WHERE id = ?')
+            .get(change.membership.channelId) as { owner_id: string } | null;
+          if (channel?.owner_id !== change.membership.personId) {
+            throw new Error('Ownership requires an ownership transfer');
+          }
+        } else {
+          const channel = this.#database
+            .query('SELECT owner_id FROM channels WHERE id = ?')
+            .get(change.membership.channelId) as { owner_id: string } | null;
+          if (channel?.owner_id === change.membership.personId) {
+            throw new Error('Channel Owner cannot receive a non-owner role');
+          }
+        }
         this.#database.run(
           `INSERT INTO channel_memberships (channel_id, person_id, role)
            VALUES (?, ?, ?)
@@ -457,6 +576,9 @@ export class SqliteStore implements DatagramStore {
         );
         return;
       case 'membership.reverted': {
+        if (change.expectedRole === 'owner') {
+          throw new Error('Channel Owner membership cannot be reverted');
+        }
         const result = change.restoredRole
           ? this.#database.run(
               `UPDATE channel_memberships
@@ -470,6 +592,50 @@ export class SqliteStore implements DatagramStore {
               [change.channelId, change.personId, change.expectedRole],
             );
         if (result.changes !== 1) throw new Error('Membership changed after original Operation');
+        return;
+      }
+      case 'channel.ownership-transferred': {
+        const channelUpdate = this.#database.run(
+          'UPDATE channels SET owner_id = ? WHERE id = ? AND owner_id = ?',
+          [change.nextOwnerId, change.channelId, change.previousOwnerId],
+        );
+        if (channelUpdate.changes !== 1) throw new Error('Channel ownership changed');
+        const oldOwnerUpdate = this.#database.run(
+          `UPDATE channel_memberships SET role = 'admin'
+           WHERE channel_id = ? AND person_id = ? AND role = 'owner'`,
+          [change.channelId, change.previousOwnerId],
+        );
+        if (oldOwnerUpdate.changes !== 1) throw new Error('Previous Owner membership changed');
+        this.#database.run(
+          `INSERT INTO channel_memberships (channel_id, person_id, role)
+           VALUES (?, ?, 'owner')
+           ON CONFLICT(channel_id, person_id) DO UPDATE SET role = 'owner'`,
+          [change.channelId, change.nextOwnerId],
+        );
+        return;
+      }
+      case 'invitation.created':
+        this.#database.run(
+          `INSERT INTO channel_invitations
+            (id, channel_id, proposed_role, expires_at, created_by, created_at)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+          [
+            change.invitation.id,
+            change.invitation.channelId,
+            change.invitation.proposedRole,
+            change.invitation.expiresAt,
+            change.invitation.createdBy,
+            change.invitation.createdAt,
+          ],
+        );
+        return;
+      case 'invitation.accepted': {
+        const result = this.#database.run(
+          `UPDATE channel_invitations SET accepted_by = ?, accepted_at = ?
+           WHERE id = ? AND accepted_at IS NULL`,
+          [change.acceptedBy, change.acceptedAt, change.invitationId],
+        );
+        if (result.changes !== 1) throw new Error('Invitation is already accepted');
         return;
       }
       case 'table.field-added':

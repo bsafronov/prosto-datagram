@@ -291,6 +291,60 @@ export function storeConformance(name: string, createFixture: StoreFixtureFactor
       }
     });
 
+    test('enforces exactly one Owner per Channel atomically', async () => {
+      const fixture = await createFixture();
+      try {
+        const store = fixture.store;
+        const owner = await store.ensureLocalOwner('Owner');
+        await commitChannel(store, owner, 'channel-owner', 1);
+        const other: Person = {
+          createdAt: timestamp(2),
+          displayName: 'Other',
+          id: 'person-other',
+          isOperator: false,
+        };
+        await store.commit(
+          operation({
+            action: 'service.person.create',
+            actorId: owner.id,
+            changes: [{ kind: 'person.created', person: other }],
+            id: 'operation-person-other',
+            second: 2,
+          }),
+        );
+        const before = await store.listOperations('channel-owner');
+
+        await expect(
+          store.commit(
+            operation({
+              action: 'channel.member.grant',
+              actorId: owner.id,
+              changes: [
+                {
+                  kind: 'membership.granted',
+                  membership: {
+                    channelId: 'channel-owner',
+                    personId: other.id,
+                    role: 'owner',
+                  },
+                },
+              ],
+              channelId: 'channel-owner',
+              id: 'operation-second-owner',
+              second: 3,
+            }),
+          ),
+        ).rejects.toThrow();
+        expect(await store.getMembership('channel-owner', other.id)).toBeNull();
+        expect(await store.getMembership('channel-owner', owner.id)).toMatchObject({
+          role: 'owner',
+        });
+        expect(await store.listOperations('channel-owner')).toEqual(before);
+      } finally {
+        await fixture.dispose();
+      }
+    });
+
     test('enforces Operation History visibility and conflict-safe undo', async () => {
       const fixture = await createFixture();
       try {

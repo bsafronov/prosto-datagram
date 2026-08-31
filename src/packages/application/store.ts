@@ -1,6 +1,7 @@
 export type {
   Channel,
   ChannelActivity,
+  ChannelInvitation,
   ChannelMembership,
   DomainChange,
   JsonValue,

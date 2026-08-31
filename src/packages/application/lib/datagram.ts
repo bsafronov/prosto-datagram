@@ -13,6 +13,7 @@ import type {
   ActionReceipt,
   Channel,
   ChannelActivity,
+  ChannelInvitation,
   ChannelRole,
   DomainChange,
   JsonValue,
@@ -59,21 +60,23 @@ export class DatagramApplication {
     this.queries = new QueryRegistry(this.#queryDefinitions());
   }
 
-  executeAction(
+  async executeAction(
     actorId: string,
     origin: OperationOrigin,
     name: string,
     input: unknown,
   ): Promise<ActionReceipt> {
+    await this.#requirePerson(actorId);
     return this.actions.execute(name, { actorId, origin }, input);
   }
 
-  executeQuery(
+  async executeQuery(
     actorId: string,
     origin: OperationOrigin,
     name: string,
     input: unknown,
   ): Promise<QueryResult> {
+    await this.#requirePerson(actorId);
     return this.queries.execute(name, { actorId, origin }, input);
   }
 
@@ -90,6 +93,12 @@ export class DatagramApplication {
   async #requirePerson(personId: string): Promise<Person> {
     const person = await this.store.getPerson(personId);
     invariant(person, 'person.not-found', 'Person does not exist', 404);
+    invariant(
+      person.deactivatedAt === undefined,
+      'person.deactivated',
+      'Person is deactivated',
+      403,
+    );
     return person;
   }
 
@@ -191,6 +200,31 @@ export class DatagramApplication {
         },
       }),
       defineAction({
+        description: 'Deactivate a Service-local person. Deployment Operator only.',
+        inputSchema: z.object({ personId: z.string().min(1) }),
+        name: 'service.person.deactivate',
+        run: async (context, input) => {
+          const actor = await this.#requirePerson(context.actorId);
+          invariant(actor.isOperator, 'permission.denied', 'Deployment Operator is required', 403);
+          await this.#requirePerson(input.personId);
+          const ownedChannels = await this.store.listOwnedChannels(input.personId);
+          invariant(
+            ownedChannels.length === 0,
+            'person.owns-channels',
+            'Channel ownership must be transferred before deactivation',
+            409,
+          );
+          const deactivatedAt = nowIso();
+          return this.#commit(
+            context,
+            'service.person.deactivate',
+            undefined,
+            () => [{ deactivatedAt, kind: 'person.deactivated', personId: input.personId }],
+            { id: input.personId, kind: 'person' },
+          );
+        },
+      }),
+      defineAction({
         description: 'Create a Channel from an approved bundled Channel Type.',
         inputSchema: z.object({
           title: z.string().trim().min(1).max(160),
@@ -244,9 +278,15 @@ export class DatagramApplication {
         }),
         name: 'channel.member.grant',
         run: async (context, input) => {
-          await this.#requireChannel(input.channelId);
+          const channel = await this.#requireChannel(input.channelId);
           await this.#requirePerson(input.personId);
           await this.#requireRole(context.actorId, input.channelId, 'admin');
+          invariant(
+            channel.ownerId !== input.personId,
+            'channel.owner-role-fixed',
+            'Transfer ownership before changing the Owner role',
+            409,
+          );
           const previous = await this.store.getMembership(input.channelId, input.personId);
           return this.#commit(
             context,
@@ -273,6 +313,189 @@ export class DatagramApplication {
                 kind: 'activity.appended',
               },
             ],
+          );
+        },
+      }),
+      defineAction({
+        description: 'Transfer a Channel to a new single Owner. Owner only.',
+        inputSchema: z.object({
+          channelId: z.string().min(1),
+          personId: z.string().min(1),
+        }),
+        name: 'channel.owner.transfer',
+        run: async (context, input) => {
+          const channel = await this.#requireChannel(input.channelId);
+          await this.#requirePerson(input.personId);
+          invariant(
+            channel.ownerId === context.actorId,
+            'permission.denied',
+            'Channel Owner is required',
+            403,
+          );
+          invariant(
+            input.personId !== context.actorId,
+            'channel.owner-unchanged',
+            'New Owner must be another person',
+            409,
+          );
+          return this.#commit(
+            context,
+            'channel.owner.transfer',
+            input.channelId,
+            (operationId, occurredAt) => [
+              {
+                channelId: input.channelId,
+                kind: 'channel.ownership-transferred',
+                nextOwnerId: input.personId,
+                previousOwnerId: context.actorId,
+              },
+              {
+                activity: this.#activity(
+                  context.actorId,
+                  input.channelId,
+                  'channel.owner-transferred',
+                  operationId,
+                  occurredAt,
+                ),
+                kind: 'activity.appended',
+              },
+            ],
+          );
+        },
+      }),
+      defineAction({
+        description: 'Create an expiring invitation for one Channel and non-owner role.',
+        inputSchema: z.object({
+          channelId: z.string().min(1),
+          expiresAt: z.string().refine((value) => !Number.isNaN(Date.parse(value)), {
+            message: 'Expected ISO date-time',
+          }),
+          role: channelRoleSchema.exclude(['owner']),
+        }),
+        name: 'channel.invitation.create',
+        run: async (context, input) => {
+          await this.#requireChannel(input.channelId);
+          await this.#requireRole(context.actorId, input.channelId, 'admin');
+          invariant(
+            Date.parse(input.expiresAt) > Date.now(),
+            'invitation.expiry-invalid',
+            'Invitation expiry must be in the future',
+          );
+          const invitation: ChannelInvitation = {
+            channelId: input.channelId,
+            createdAt: nowIso(),
+            createdBy: context.actorId,
+            expiresAt: new Date(input.expiresAt).toISOString(),
+            id: newId('invitation'),
+            proposedRole: input.role,
+          };
+          return this.#commit(
+            context,
+            'channel.invitation.create',
+            input.channelId,
+            (operationId, occurredAt) => [
+              { invitation, kind: 'invitation.created' },
+              {
+                activity: this.#activity(
+                  context.actorId,
+                  input.channelId,
+                  'channel.invitation-created',
+                  operationId,
+                  occurredAt,
+                ),
+                kind: 'activity.appended',
+              },
+            ],
+            { id: invitation.id, kind: 'invitation' },
+          );
+        },
+      }),
+      defineAction({
+        description: 'Accept a Channel invitation for an existing or new Service-local person.',
+        inputSchema: z
+          .object({
+            displayName: z.string().trim().min(1).max(120).optional(),
+            invitationId: z.string().min(1),
+            personId: z.string().min(1).optional(),
+          })
+          .refine((input) => !(input.displayName && input.personId), {
+            message: 'Choose an existing person or a new display name',
+          }),
+        name: 'channel.invitation.accept',
+        run: async (context, input) => {
+          const invitation = await this.store.getInvitation(input.invitationId);
+          invariant(invitation, 'invitation.not-found', 'Invitation does not exist', 404);
+          invariant(
+            invitation.acceptedAt === undefined,
+            'invitation.already-accepted',
+            'Invitation was already accepted',
+            409,
+          );
+          invariant(
+            Date.parse(invitation.expiresAt) > Date.now(),
+            'invitation.expired',
+            'Invitation has expired',
+            410,
+          );
+          const channel = await this.#requireChannel(invitation.channelId);
+          if (input.displayName !== undefined || input.personId !== undefined) {
+            await this.#requireRole(context.actorId, invitation.channelId, 'admin');
+          }
+
+          const newPerson: Person | undefined =
+            input.displayName === undefined
+              ? undefined
+              : {
+                  createdAt: nowIso(),
+                  displayName: input.displayName,
+                  id: newId('person'),
+                  isOperator: false,
+                };
+          const personId = newPerson?.id ?? input.personId ?? context.actorId;
+          if (!newPerson) await this.#requirePerson(personId);
+          invariant(
+            personId !== channel.ownerId,
+            'channel.owner-role-fixed',
+            'Channel Owner cannot accept a non-owner role',
+            409,
+          );
+          const previous = await this.store.getMembership(invitation.channelId, personId);
+          const acceptedAt = nowIso();
+          return this.#commit(
+            context,
+            'channel.invitation.accept',
+            invitation.channelId,
+            (operationId, occurredAt) => [
+              ...(newPerson
+                ? ([{ kind: 'person.created', person: newPerson }] as const)
+                : []),
+              {
+                kind: 'membership.granted' as const,
+                membership: {
+                  channelId: invitation.channelId,
+                  personId,
+                  role: invitation.proposedRole,
+                },
+                ...(previous ? { previousRole: previous.role } : {}),
+              },
+              {
+                acceptedAt,
+                acceptedBy: personId,
+                invitationId: invitation.id,
+                kind: 'invitation.accepted' as const,
+              },
+              {
+                activity: this.#activity(
+                  context.actorId,
+                  invitation.channelId,
+                  'channel.invitation-accepted',
+                  operationId,
+                  occurredAt,
+                ),
+                kind: 'activity.appended' as const,
+              },
+            ],
+            { id: personId, kind: 'person' },
           );
         },
       }),

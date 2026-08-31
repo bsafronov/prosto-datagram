@@ -35,6 +35,7 @@ export type TableFieldType = z.infer<typeof tableFieldTypeSchema>;
 
 export interface Person {
   readonly createdAt: string;
+  readonly deactivatedAt?: string;
   readonly displayName: string;
   readonly id: string;
   readonly isOperator: boolean;
@@ -54,6 +55,17 @@ export interface ChannelMembership {
   readonly channelId: string;
   readonly personId: string;
   readonly role: ChannelRole;
+}
+
+export interface ChannelInvitation {
+  readonly acceptedAt?: string;
+  readonly acceptedBy?: string;
+  readonly channelId: string;
+  readonly createdAt: string;
+  readonly createdBy: string;
+  readonly expiresAt: string;
+  readonly id: string;
+  readonly proposedRole: Exclude<ChannelRole, 'owner'>;
 }
 
 export interface TableField {
@@ -108,6 +120,11 @@ export interface Operation {
 
 export type DomainChange =
   | { readonly kind: 'person.created'; readonly person: Person }
+  | {
+      readonly deactivatedAt: string;
+      readonly kind: 'person.deactivated';
+      readonly personId: string;
+    }
   | { readonly channel: Channel; readonly kind: 'channel.created' }
   | {
       readonly kind: 'membership.granted';
@@ -122,6 +139,19 @@ export type DomainChange =
       readonly revertedOperationId: string;
       readonly restoredRole?: ChannelRole;
     }
+  | {
+      readonly channelId: string;
+      readonly kind: 'channel.ownership-transferred';
+      readonly nextOwnerId: string;
+      readonly previousOwnerId: string;
+    }
+  | { readonly invitation: ChannelInvitation; readonly kind: 'invitation.created' }
+  | {
+      readonly acceptedAt: string;
+      readonly acceptedBy: string;
+      readonly invitationId: string;
+      readonly kind: 'invitation.accepted';
+    }
   | { readonly field: TableField; readonly kind: 'table.field-added' }
   | { readonly kind: 'table.record-created'; readonly record: TableRecord }
   | { readonly kind: 'discussion.message-posted'; readonly message: Message }
@@ -132,7 +162,7 @@ export interface ActionReceipt {
   readonly operationId: string;
   readonly subject?: {
     readonly id: string;
-    readonly kind: 'channel' | 'field' | 'message' | 'person' | 'record';
+    readonly kind: 'channel' | 'field' | 'invitation' | 'message' | 'person' | 'record';
   };
 }
 
