@@ -13,6 +13,8 @@ import type {
   ActionReceipt,
   Channel,
   ChannelActivity,
+  ChannelGroup,
+  ChannelNavigation,
   ChannelInvitation,
   ChannelRole,
   DomainChange,
@@ -128,6 +130,27 @@ export class DatagramApplication {
       `Channel Role ${minimum} is required`,
       403,
     );
+  }
+
+  async #requireGroup(actorId: string, groupId: string): Promise<ChannelGroup> {
+    const group = await this.store.getChannelGroup(groupId);
+    invariant(group, 'channel-group.not-found', 'Channel Group does not exist', 404);
+    invariant(
+      group.personId === actorId,
+      'permission.denied',
+      'Channel Group belongs to another person',
+      403,
+    );
+    return group;
+  }
+
+  async #navigation(
+    actorId: string,
+    channelId: string,
+    update: Partial<Omit<ChannelNavigation, 'channelId' | 'personId'>>,
+  ): Promise<ChannelNavigation> {
+    const current = await this.store.getChannelNavigation(channelId, actorId);
+    return { ...current, ...update };
   }
 
   async #commit(
@@ -313,6 +336,247 @@ export class DatagramApplication {
                 kind: 'activity.appended',
               },
             ],
+          );
+        },
+      }),
+      defineAction({
+        description: 'Archive one Channel for the acting person only.',
+        inputSchema: z.object({ channelId: z.string().min(1) }),
+        name: 'channel.navigation.archive',
+        run: async (context, input) => {
+          await this.#requireChannel(input.channelId);
+          await this.#requireRole(context.actorId, input.channelId, 'viewer');
+          const navigation = await this.#navigation(context.actorId, input.channelId, {
+            archivedAt: nowIso(),
+          });
+          return this.#commit(
+            context,
+            'channel.navigation.archive',
+            input.channelId,
+            () => [{ kind: 'channel-navigation.updated', navigation }],
+            { id: input.channelId, kind: 'channel' },
+          );
+        },
+      }),
+      defineAction({
+        description: 'Restore one personally Archived Channel.',
+        inputSchema: z.object({ channelId: z.string().min(1) }),
+        name: 'channel.navigation.restore',
+        run: async (context, input) => {
+          await this.#requireChannel(input.channelId);
+          await this.#requireRole(context.actorId, input.channelId, 'viewer');
+          const current = await this.store.getChannelNavigation(
+            input.channelId,
+            context.actorId,
+          );
+          const { archivedAt: _, ...navigation } = current;
+          return this.#commit(
+            context,
+            'channel.navigation.restore',
+            input.channelId,
+            () => [{ kind: 'channel-navigation.updated', navigation }],
+            { id: input.channelId, kind: 'channel' },
+          );
+        },
+      }),
+      defineAction({
+        description: 'Mute or unmute Activity notifications without changing unread state.',
+        inputSchema: z.object({
+          channelId: z.string().min(1),
+          muted: z.boolean(),
+        }),
+        name: 'channel.navigation.mute',
+        run: async (context, input) => {
+          await this.#requireChannel(input.channelId);
+          await this.#requireRole(context.actorId, input.channelId, 'viewer');
+          const navigation = await this.#navigation(context.actorId, input.channelId, {
+            muted: input.muted,
+          });
+          return this.#commit(
+            context,
+            'channel.navigation.mute',
+            input.channelId,
+            () => [{ kind: 'channel-navigation.updated', navigation }],
+            { id: input.channelId, kind: 'channel' },
+          );
+        },
+      }),
+      defineAction({
+        description: 'Pin and personally order one Channel in the Flat Channel List.',
+        inputSchema: z.object({
+          channelId: z.string().min(1),
+          pinned: z.boolean(),
+          position: z.number().int().nonnegative().default(0),
+        }),
+        name: 'channel.navigation.pin',
+        run: async (context, input) => {
+          await this.#requireChannel(input.channelId);
+          await this.#requireRole(context.actorId, input.channelId, 'viewer');
+          const navigation = await this.#navigation(context.actorId, input.channelId, {
+            pinned: input.pinned,
+            position: input.position,
+          });
+          return this.#commit(
+            context,
+            'channel.navigation.pin',
+            input.channelId,
+            () => [{ kind: 'channel-navigation.updated', navigation }],
+            { id: input.channelId, kind: 'channel' },
+          );
+        },
+      }),
+      defineAction({
+        description: 'Mark Channel Activity through one visible Activity as read.',
+        inputSchema: z.object({
+          activityId: z.string().min(1).optional(),
+          channelId: z.string().min(1),
+        }),
+        name: 'channel.activity.mark-read',
+        run: async (context, input) => {
+          await this.#requireChannel(input.channelId);
+          await this.#requireRole(context.actorId, input.channelId, 'viewer');
+          const activities = await this.store.listActivities(input.channelId);
+          const activityId = input.activityId ?? activities.at(-1)?.id;
+          if (activityId !== undefined) {
+            const activity = await this.store.getActivity(activityId);
+            invariant(
+              activity?.channelId === input.channelId,
+              'activity.not-found',
+              'Activity does not exist in Channel',
+              404,
+            );
+          }
+          const current = await this.store.getChannelNavigation(
+            input.channelId,
+            context.actorId,
+          );
+          if (activityId !== undefined && current.lastReadActivityId !== undefined) {
+            const currentIndex = activities.findIndex(
+              (activity) => activity.id === current.lastReadActivityId,
+            );
+            const nextIndex = activities.findIndex((activity) => activity.id === activityId);
+            invariant(
+              nextIndex >= currentIndex,
+              'activity.read-position-regression',
+              'Read position cannot move backward',
+              409,
+            );
+          }
+          const navigation: ChannelNavigation =
+            activityId === undefined
+              ? current
+              : { ...current, lastReadActivityId: activityId };
+          return this.#commit(
+            context,
+            'channel.activity.mark-read',
+            input.channelId,
+            () => [{ kind: 'channel-navigation.updated', navigation }],
+            { id: input.channelId, kind: 'channel' },
+          );
+        },
+      }),
+      defineAction({
+        description: 'Create one personal Channel Group.',
+        inputSchema: z.object({
+          name: z.string().trim().min(1).max(120),
+          position: z.number().int().nonnegative().default(0),
+        }),
+        name: 'channel.group.create',
+        run: async (context, input) => {
+          const group: ChannelGroup = {
+            createdAt: nowIso(),
+            id: newId('channel_group'),
+            name: input.name,
+            personId: context.actorId,
+            position: input.position,
+          };
+          return this.#commit(
+            context,
+            'channel.group.create',
+            undefined,
+            () => [{ group, kind: 'channel-group.created' }],
+            { id: group.id, kind: 'channel-group' },
+          );
+        },
+      }),
+      defineAction({
+        description: 'Rename or reorder one personal Channel Group.',
+        inputSchema: z.object({
+          groupId: z.string().min(1),
+          name: z.string().trim().min(1).max(120),
+          position: z.number().int().nonnegative(),
+        }),
+        name: 'channel.group.update',
+        run: async (context, input) => {
+          const current = await this.#requireGroup(context.actorId, input.groupId);
+          const group: ChannelGroup = {
+            ...current,
+            name: input.name,
+            position: input.position,
+          };
+          return this.#commit(
+            context,
+            'channel.group.update',
+            undefined,
+            () => [{ group, kind: 'channel-group.updated' }],
+          );
+        },
+      }),
+      defineAction({
+        description: 'Add or reorder one Channel in a personal overlapping Channel Group.',
+        inputSchema: z.object({
+          channelId: z.string().min(1),
+          groupId: z.string().min(1),
+          pinned: z.boolean().default(false),
+          position: z.number().int().nonnegative().default(0),
+        }),
+        name: 'channel.group.channel.add',
+        run: async (context, input) => {
+          await this.#requireGroup(context.actorId, input.groupId);
+          await this.#requireChannel(input.channelId);
+          await this.#requireRole(context.actorId, input.channelId, 'viewer');
+          return this.#commit(
+            context,
+            'channel.group.channel.add',
+            input.channelId,
+            () => [
+              {
+                entry: {
+                  channelId: input.channelId,
+                  groupId: input.groupId,
+                  pinned: input.pinned,
+                  position: input.position,
+                },
+                kind: 'channel-group.entry-set',
+              },
+            ],
+            { id: input.channelId, kind: 'channel' },
+          );
+        },
+      }),
+      defineAction({
+        description: 'Remove one Channel from one personal Channel Group.',
+        inputSchema: z.object({
+          channelId: z.string().min(1),
+          groupId: z.string().min(1),
+        }),
+        name: 'channel.group.channel.remove',
+        run: async (context, input) => {
+          await this.#requireGroup(context.actorId, input.groupId);
+          await this.#requireChannel(input.channelId);
+          await this.#requireRole(context.actorId, input.channelId, 'viewer');
+          return this.#commit(
+            context,
+            'channel.group.channel.remove',
+            input.channelId,
+            () => [
+              {
+                channelId: input.channelId,
+                groupId: input.groupId,
+                kind: 'channel-group.entry-removed',
+              },
+            ],
+            { id: input.channelId, kind: 'channel' },
           );
         },
       }),
@@ -791,25 +1055,86 @@ export class DatagramApplication {
       }),
       defineQuery({
         description: 'List Channels accessible to the requesting person.',
-        inputSchema: z.object({}),
+        inputSchema: z.object({ archived: z.boolean().default(false) }),
         name: 'channel.list',
-        run: async (context): Promise<QueryResult> => {
+        run: async (context, input): Promise<QueryResult> => {
           await this.#requirePerson(context.actorId);
-          const channels = await this.store.listChannels(context.actorId);
+          const items = await this.store.listChannelNavigation(context.actorId);
+          const groups = await this.store.listChannelGroups(context.actorId);
+          const entries = (
+            await Promise.all(groups.map((group) => this.store.listChannelGroupEntries(group.id)))
+          ).flat();
           return {
-            data: channels.map((channel) => ({
-              id: channel.id,
-              title: channel.title,
-              typeId: channel.typeId,
-              typeVersion: channel.typeVersion,
-              updatedAt: channel.updatedAt,
-            })),
+            data: items
+              .filter((item) => (item.navigation.archivedAt !== undefined) === input.archived)
+              .map((item) => ({
+                archivedAt: item.navigation.archivedAt ?? null,
+                groups: entries
+                  .filter((entry) => entry.channelId === item.channel.id)
+                  .map((entry) => ({
+                    groupId: entry.groupId,
+                    pinned: entry.pinned,
+                    position: entry.position,
+                  })),
+                id: item.channel.id,
+                muted: item.navigation.muted,
+                pinned: item.navigation.pinned,
+                position: item.navigation.position,
+                title: item.channel.title,
+                typeId: item.channel.typeId,
+                typeVersion: item.channel.typeVersion,
+                unreadCount: item.unreadCount,
+                updatedAt: item.channel.updatedAt,
+              })),
             view: {
               bindings: { items: '$result' },
-              commands: ['channel.create'],
+              commands: [
+                'channel.create',
+                'channel.navigation.archive',
+                'channel.navigation.restore',
+                'channel.navigation.mute',
+                'channel.navigation.pin',
+                'channel.activity.mark-read',
+                'channel.group.channel.add',
+              ],
               kind: 'table',
               schemaVersion: 'datagram/view@1',
-              title: 'Channels',
+              title: input.archived ? 'Archived Channels' : 'Channels',
+            },
+          };
+        },
+      }),
+      defineQuery({
+        description: 'List personal Channel Groups and their ordered overlapping entries.',
+        inputSchema: z.object({}),
+        name: 'channel.groups.list',
+        run: async (context): Promise<QueryResult> => {
+          const groups = await this.store.listChannelGroups(context.actorId);
+          const data = await Promise.all(
+            groups.map(async (group) => ({
+              entries: (await this.store.listChannelGroupEntries(group.id)).map((entry) => ({
+                channelId: entry.channelId,
+                pinned: entry.pinned,
+                position: entry.position,
+              })),
+              id: group.id,
+              name: group.name,
+              position: group.position,
+            })),
+          );
+          return {
+            data,
+            view: {
+              bindings: { groups: '$result' },
+              commands: [
+                'channel.group.create',
+                'channel.group.update',
+                'channel.group.channel.add',
+                'channel.group.channel.remove',
+              ],
+              kind: 'table',
+              schemaVersion: 'datagram/view@1',
+              title: 'Channel Groups',
             },
           };
         },

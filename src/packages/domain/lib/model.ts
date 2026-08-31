@@ -105,6 +105,37 @@ export interface ChannelActivity {
   readonly operationId: string;
 }
 
+export interface ChannelNavigation {
+  readonly archivedAt?: string;
+  readonly channelId: string;
+  readonly lastReadActivityId?: string;
+  readonly muted: boolean;
+  readonly personId: string;
+  readonly pinned: boolean;
+  readonly position: number;
+}
+
+export interface ChannelGroup {
+  readonly createdAt: string;
+  readonly id: string;
+  readonly name: string;
+  readonly personId: string;
+  readonly position: number;
+}
+
+export interface ChannelGroupEntry {
+  readonly channelId: string;
+  readonly groupId: string;
+  readonly pinned: boolean;
+  readonly position: number;
+}
+
+export interface ChannelListItem {
+  readonly channel: Channel;
+  readonly navigation: ChannelNavigation;
+  readonly unreadCount: number;
+}
+
 export interface Operation {
   readonly action: string;
   readonly actorId: string;
@@ -152,6 +183,15 @@ export type DomainChange =
       readonly invitationId: string;
       readonly kind: 'invitation.accepted';
     }
+  | { readonly group: ChannelGroup; readonly kind: 'channel-group.created' }
+  | { readonly group: ChannelGroup; readonly kind: 'channel-group.updated' }
+  | { readonly entry: ChannelGroupEntry; readonly kind: 'channel-group.entry-set' }
+  | {
+      readonly channelId: string;
+      readonly groupId: string;
+      readonly kind: 'channel-group.entry-removed';
+    }
+  | { readonly kind: 'channel-navigation.updated'; readonly navigation: ChannelNavigation }
   | { readonly field: TableField; readonly kind: 'table.field-added' }
   | { readonly kind: 'table.record-created'; readonly record: TableRecord }
   | { readonly kind: 'discussion.message-posted'; readonly message: Message }
@@ -162,7 +202,14 @@ export interface ActionReceipt {
   readonly operationId: string;
   readonly subject?: {
     readonly id: string;
-    readonly kind: 'channel' | 'field' | 'invitation' | 'message' | 'person' | 'record';
+    readonly kind:
+      | 'channel'
+      | 'channel-group'
+      | 'field'
+      | 'invitation'
+      | 'message'
+      | 'person'
+      | 'record';
   };
 }
 

@@ -1,8 +1,12 @@
 import type {
   Channel,
   ChannelActivity,
+  ChannelGroup,
+  ChannelGroupEntry,
   ChannelInvitation,
+  ChannelListItem,
   ChannelMembership,
+  ChannelNavigation,
   Message,
   Operation,
   Person,
@@ -14,7 +18,10 @@ export interface DatagramStore {
   close(): Promise<void>;
   commit(operation: Operation): Promise<void>;
   ensureLocalOwner(displayName?: string): Promise<Person>;
+  getActivity(activityId: string): Promise<ChannelActivity | null>;
   getChannel(channelId: string): Promise<Channel | null>;
+  getChannelGroup(groupId: string): Promise<ChannelGroup | null>;
+  getChannelNavigation(channelId: string, personId: string): Promise<ChannelNavigation>;
   getInvitation(invitationId: string): Promise<ChannelInvitation | null>;
   getMembership(channelId: string, personId: string): Promise<ChannelMembership | null>;
   getPerson(personId: string): Promise<Person | null>;
@@ -22,6 +29,9 @@ export interface DatagramStore {
   listChannels(personId: string): Promise<readonly Channel[]>;
   listOwnedChannels(personId: string): Promise<readonly Channel[]>;
   listActivities(channelId: string): Promise<readonly ChannelActivity[]>;
+  listChannelGroupEntries(groupId: string): Promise<readonly ChannelGroupEntry[]>;
+  listChannelGroups(personId: string): Promise<readonly ChannelGroup[]>;
+  listChannelNavigation(personId: string): Promise<readonly ChannelListItem[]>;
   listMessages(channelId: string): Promise<readonly Message[]>;
   listOperations(channelId: string): Promise<readonly Operation[]>;
   listServiceOperations(): Promise<readonly Operation[]>;

@@ -5,8 +5,12 @@ import {
   nowIso,
   type Channel,
   type ChannelActivity,
+  type ChannelGroup,
+  type ChannelGroupEntry,
   type ChannelInvitation,
+  type ChannelListItem,
   type ChannelMembership,
+  type ChannelNavigation,
   type DatagramStore,
   type DomainChange,
   type JsonValue,
@@ -106,6 +110,35 @@ interface ActivityRow {
   operation_id: string;
 }
 
+interface NavigationRow {
+  archived_at: string | null;
+  channel_id: string;
+  last_read_activity_id: string | null;
+  muted: number;
+  person_id: string;
+  pinned: number;
+  position: number;
+}
+
+interface ChannelGroupRow {
+  created_at: string;
+  id: string;
+  name: string;
+  person_id: string;
+  position: number;
+}
+
+interface ChannelGroupEntryRow {
+  channel_id: string;
+  group_id: string;
+  pinned: number;
+  position: number;
+}
+
+interface ChannelListRow extends ChannelRow, NavigationRow {
+  unread_count: number;
+}
+
 const personFromRow = (row: PersonRow): Person => ({
   createdAt: row.created_at,
   ...(row.deactivated_at === null ? {} : { deactivatedAt: row.deactivated_at }),
@@ -193,6 +226,33 @@ const activityFromRow = (row: ActivityRow): ChannelActivity => ({
   operationId: row.operation_id,
 });
 
+const navigationFromRow = (row: NavigationRow): ChannelNavigation => ({
+  ...(row.archived_at === null ? {} : { archivedAt: row.archived_at }),
+  channelId: row.channel_id,
+  ...(row.last_read_activity_id === null
+    ? {}
+    : { lastReadActivityId: row.last_read_activity_id }),
+  muted: row.muted === 1,
+  personId: row.person_id,
+  pinned: row.pinned === 1,
+  position: row.position,
+});
+
+const groupFromRow = (row: ChannelGroupRow): ChannelGroup => ({
+  createdAt: row.created_at,
+  id: row.id,
+  name: row.name,
+  personId: row.person_id,
+  position: row.position,
+});
+
+const groupEntryFromRow = (row: ChannelGroupEntryRow): ChannelGroupEntry => ({
+  channelId: row.channel_id,
+  groupId: row.group_id,
+  pinned: row.pinned === 1,
+  position: row.position,
+});
+
 export class SqliteStore implements DatagramStore {
   readonly #database: Database;
 
@@ -266,6 +326,36 @@ export class SqliteStore implements DatagramStore {
         occurred_at TEXT NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS channel_navigation (
+        channel_id TEXT NOT NULL REFERENCES channels(id),
+        person_id TEXT NOT NULL REFERENCES persons(id),
+        archived_at TEXT,
+        muted INTEGER NOT NULL DEFAULT 0,
+        pinned INTEGER NOT NULL DEFAULT 0,
+        position INTEGER NOT NULL DEFAULT 0,
+        last_read_activity_id TEXT REFERENCES channel_activities(id),
+        PRIMARY KEY (channel_id, person_id),
+        FOREIGN KEY (channel_id, person_id)
+          REFERENCES channel_memberships(channel_id, person_id) ON DELETE CASCADE
+      );
+
+      CREATE TABLE IF NOT EXISTS channel_groups (
+        id TEXT PRIMARY KEY,
+        person_id TEXT NOT NULL REFERENCES persons(id),
+        name TEXT NOT NULL,
+        position INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        UNIQUE (person_id, name)
+      );
+
+      CREATE TABLE IF NOT EXISTS channel_group_entries (
+        group_id TEXT NOT NULL REFERENCES channel_groups(id),
+        channel_id TEXT NOT NULL REFERENCES channels(id),
+        pinned INTEGER NOT NULL DEFAULT 0,
+        position INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (group_id, channel_id)
+      );
+
       CREATE TABLE IF NOT EXISTS table_fields (
         id TEXT PRIMARY KEY,
         channel_id TEXT NOT NULL REFERENCES channels(id),
@@ -299,6 +389,70 @@ export class SqliteStore implements DatagramStore {
         ON channel_memberships(person_id, channel_id);
       CREATE INDEX IF NOT EXISTS channel_activities_channel_sequence
         ON channel_activities(channel_id, sequence);
+      CREATE INDEX IF NOT EXISTS channel_navigation_person
+        ON channel_navigation(person_id, archived_at, pinned, position);
+      CREATE INDEX IF NOT EXISTS channel_groups_person
+        ON channel_groups(person_id, position, id);
+      CREATE INDEX IF NOT EXISTS channel_group_entries_group
+        ON channel_group_entries(group_id, pinned, position, channel_id);
+
+      CREATE TRIGGER IF NOT EXISTS channel_group_entry_requires_membership_insert
+      BEFORE INSERT ON channel_group_entries
+      WHEN NOT EXISTS (
+        SELECT 1
+        FROM channel_groups
+        INNER JOIN channel_memberships
+          ON channel_memberships.person_id = channel_groups.person_id
+        WHERE channel_groups.id = NEW.group_id
+          AND channel_memberships.channel_id = NEW.channel_id
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'Channel Group entry requires membership');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS channel_navigation_read_activity_insert
+      BEFORE INSERT ON channel_navigation
+      WHEN NEW.last_read_activity_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM channel_activities
+        WHERE id = NEW.last_read_activity_id AND channel_id = NEW.channel_id
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'Read Activity must belong to Channel');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS channel_navigation_read_activity_update
+      BEFORE UPDATE ON channel_navigation
+      WHEN NEW.last_read_activity_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM channel_activities
+        WHERE id = NEW.last_read_activity_id AND channel_id = NEW.channel_id
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'Read Activity must belong to Channel');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS channel_group_entry_requires_membership_update
+      BEFORE UPDATE ON channel_group_entries
+      WHEN NOT EXISTS (
+        SELECT 1
+        FROM channel_groups
+        INNER JOIN channel_memberships
+          ON channel_memberships.person_id = channel_groups.person_id
+        WHERE channel_groups.id = NEW.group_id
+          AND channel_memberships.channel_id = NEW.channel_id
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'Channel Group entry requires membership');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS membership_removal_cleans_personal_groups
+      AFTER DELETE ON channel_memberships
+      BEGIN
+        DELETE FROM channel_group_entries
+        WHERE channel_id = OLD.channel_id
+          AND group_id IN (
+            SELECT id FROM channel_groups WHERE person_id = OLD.person_id
+          );
+      END;
       CREATE INDEX IF NOT EXISTS table_records_channel
         ON table_records(channel_id, created_at);
       CREATE INDEX IF NOT EXISTS messages_channel
@@ -378,6 +532,35 @@ export class SqliteStore implements DatagramStore {
     return row ? channelFromRow(row) : null;
   }
 
+  async getActivity(activityId: string): Promise<ChannelActivity | null> {
+    const row = this.#database
+      .query(
+        `SELECT actor_id, channel_id, id, kind, occurred_at, operation_id
+         FROM channel_activities WHERE id = ?`,
+      )
+      .get(activityId) as ActivityRow | null;
+    return row ? activityFromRow(row) : null;
+  }
+
+  async getChannelGroup(groupId: string): Promise<ChannelGroup | null> {
+    const row = this.#database
+      .query('SELECT * FROM channel_groups WHERE id = ?')
+      .get(groupId) as ChannelGroupRow | null;
+    return row ? groupFromRow(row) : null;
+  }
+
+  async getChannelNavigation(
+    channelId: string,
+    personId: string,
+  ): Promise<ChannelNavigation> {
+    const row = this.#database
+      .query('SELECT * FROM channel_navigation WHERE channel_id = ? AND person_id = ?')
+      .get(channelId, personId) as NavigationRow | null;
+    return row
+      ? navigationFromRow(row)
+      : { channelId, muted: false, personId, pinned: false, position: 0 };
+  }
+
   async getInvitation(invitationId: string): Promise<ChannelInvitation | null> {
     const row = this.#database
       .query('SELECT * FROM channel_invitations WHERE id = ?')
@@ -399,8 +582,16 @@ export class SqliteStore implements DatagramStore {
          FROM channels
          INNER JOIN channel_memberships
            ON channel_memberships.channel_id = channels.id
+         LEFT JOIN channel_navigation
+           ON channel_navigation.channel_id = channels.id
+          AND channel_navigation.person_id = channel_memberships.person_id
          WHERE channel_memberships.person_id = ?
-         ORDER BY channels.updated_at DESC, channels.id`,
+           AND channel_navigation.archived_at IS NULL
+         ORDER BY COALESCE(channel_navigation.pinned, 0) DESC,
+                  CASE WHEN channel_navigation.pinned = 1 THEN channel_navigation.position END,
+                  (SELECT MAX(sequence) FROM channel_activities
+                   WHERE channel_id = channels.id) DESC,
+                  channels.id`,
       )
       .all(personId) as ChannelRow[];
     return rows.map(channelFromRow);
@@ -423,6 +614,61 @@ export class SqliteStore implements DatagramStore {
       )
       .all(channelId) as ActivityRow[];
     return rows.map(activityFromRow);
+  }
+
+  async listChannelGroups(personId: string): Promise<readonly ChannelGroup[]> {
+    const rows = this.#database
+      .query('SELECT * FROM channel_groups WHERE person_id = ? ORDER BY position, id')
+      .all(personId) as ChannelGroupRow[];
+    return rows.map(groupFromRow);
+  }
+
+  async listChannelGroupEntries(groupId: string): Promise<readonly ChannelGroupEntry[]> {
+    const rows = this.#database
+      .query(
+        `SELECT * FROM channel_group_entries
+         WHERE group_id = ? ORDER BY pinned DESC, position, channel_id`,
+      )
+      .all(groupId) as ChannelGroupEntryRow[];
+    return rows.map(groupEntryFromRow);
+  }
+
+  async listChannelNavigation(personId: string): Promise<readonly ChannelListItem[]> {
+    const rows = this.#database
+      .query(
+        `SELECT channels.*,
+                channel_memberships.person_id,
+                navigation.archived_at,
+                navigation.last_read_activity_id,
+                COALESCE(navigation.muted, 0) AS muted,
+                COALESCE(navigation.pinned, 0) AS pinned,
+                COALESCE(navigation.position, 0) AS position,
+                COUNT(unread.id) AS unread_count
+         FROM channels
+         INNER JOIN channel_memberships
+           ON channel_memberships.channel_id = channels.id
+          AND channel_memberships.person_id = ?
+         LEFT JOIN channel_navigation AS navigation
+           ON navigation.channel_id = channels.id
+          AND navigation.person_id = channel_memberships.person_id
+         LEFT JOIN channel_activities AS read_activity
+           ON read_activity.id = navigation.last_read_activity_id
+         LEFT JOIN channel_activities AS unread
+           ON unread.channel_id = channels.id
+          AND unread.sequence > COALESCE(read_activity.sequence, 0)
+         GROUP BY channels.id
+         ORDER BY COALESCE(navigation.pinned, 0) DESC,
+                  CASE WHEN navigation.pinned = 1 THEN navigation.position END,
+                  (SELECT MAX(sequence) FROM channel_activities
+                   WHERE channel_id = channels.id) DESC,
+                  channels.id`,
+      )
+      .all(personId) as ChannelListRow[];
+    return rows.map((row) => ({
+      channel: channelFromRow(row),
+      navigation: navigationFromRow(row),
+      unreadCount: row.unread_count,
+    }));
   }
 
   async listTableFields(channelId: string): Promise<readonly TableField[]> {
@@ -448,14 +694,14 @@ export class SqliteStore implements DatagramStore {
 
   async listOperations(channelId: string): Promise<readonly Operation[]> {
     const rows = this.#database
-      .query('SELECT * FROM operations WHERE channel_id = ? ORDER BY occurred_at, id')
+      .query('SELECT * FROM operations WHERE channel_id = ? ORDER BY rowid')
       .all(channelId) as OperationRow[];
     return rows.map(operationFromRow);
   }
 
   async listServiceOperations(): Promise<readonly Operation[]> {
     const rows = this.#database
-      .query('SELECT * FROM operations WHERE channel_id IS NULL ORDER BY occurred_at, id')
+      .query('SELECT * FROM operations WHERE channel_id IS NULL ORDER BY rowid')
       .all() as OperationRow[];
     return rows.map(operationFromRow);
   }
@@ -638,6 +884,73 @@ export class SqliteStore implements DatagramStore {
         if (result.changes !== 1) throw new Error('Invitation is already accepted');
         return;
       }
+      case 'channel-group.created':
+        this.#database.run(
+          `INSERT INTO channel_groups (id, person_id, name, position, created_at)
+           VALUES (?, ?, ?, ?, ?)`,
+          [
+            change.group.id,
+            change.group.personId,
+            change.group.name,
+            change.group.position,
+            change.group.createdAt,
+          ],
+        );
+        return;
+      case 'channel-group.updated': {
+        const result = this.#database.run(
+          `UPDATE channel_groups SET name = ?, position = ?
+           WHERE id = ? AND person_id = ?`,
+          [change.group.name, change.group.position, change.group.id, change.group.personId],
+        );
+        if (result.changes !== 1) throw new Error('Channel Group changed');
+        return;
+      }
+      case 'channel-group.entry-set':
+        this.#database.run(
+          `INSERT INTO channel_group_entries (group_id, channel_id, pinned, position)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(group_id, channel_id) DO UPDATE SET
+             pinned = excluded.pinned,
+             position = excluded.position`,
+          [
+            change.entry.groupId,
+            change.entry.channelId,
+            change.entry.pinned ? 1 : 0,
+            change.entry.position,
+          ],
+        );
+        return;
+      case 'channel-group.entry-removed': {
+        const result = this.#database.run(
+          'DELETE FROM channel_group_entries WHERE group_id = ? AND channel_id = ?',
+          [change.groupId, change.channelId],
+        );
+        if (result.changes !== 1) throw new Error('Channel is not in Channel Group');
+        return;
+      }
+      case 'channel-navigation.updated':
+        this.#database.run(
+          `INSERT INTO channel_navigation
+            (channel_id, person_id, archived_at, muted, pinned, position, last_read_activity_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(channel_id, person_id) DO UPDATE SET
+             archived_at = excluded.archived_at,
+             muted = excluded.muted,
+             pinned = excluded.pinned,
+             position = excluded.position,
+             last_read_activity_id = excluded.last_read_activity_id`,
+          [
+            change.navigation.channelId,
+            change.navigation.personId,
+            change.navigation.archivedAt ?? null,
+            change.navigation.muted ? 1 : 0,
+            change.navigation.pinned ? 1 : 0,
+            change.navigation.position,
+            change.navigation.lastReadActivityId ?? null,
+          ],
+        );
+        return;
       case 'table.field-added':
         this.#database.run(
           `INSERT INTO table_fields
@@ -702,6 +1015,11 @@ export class SqliteStore implements DatagramStore {
         this.#database.run(
           'UPDATE channels SET updated_at = ? WHERE id = ?',
           [change.activity.occurredAt, change.activity.channelId],
+        );
+        this.#database.run(
+          `UPDATE channel_navigation SET archived_at = NULL
+           WHERE channel_id = ? AND archived_at IS NOT NULL AND muted = 0`,
+          [change.activity.channelId],
         );
         return;
     }
