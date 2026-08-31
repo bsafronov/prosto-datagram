@@ -60,12 +60,14 @@ MCP mutation tools return only Action receipts. MCP Query tools return actor- an
 ## Structure
 
 ```text
-src/domain       Channel vocabulary, types, errors, Channel Type Registry
-src/application  shared Action/Query contracts, permissions, Result Handles
-src/store        Store port and SQLite adapter
-src/http.ts      HTTP adapter
-src/cli.ts       human and operational CLI
-src/mcp.ts       zero-data agent gateway
+src/packages/domain        Channel vocabulary, types, errors, Channel Type Registry
+src/packages/application   shared Action/Query contracts, Store port, permissions, Result Handles
+src/packages/sqlite-store  SQLite Store adapter
+src/packages/http          HTTP adapter
+src/packages/cli           human and operational CLI
+src/packages/mcp           zero-data agent gateway
+src/cli.ts                 CLI executable shim
+src/mcp.ts                 MCP executable shim
 skills/          Codex operation skill
 docs/adr/        accepted product and architecture decisions
 ```

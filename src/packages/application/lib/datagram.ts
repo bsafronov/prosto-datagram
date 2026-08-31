@@ -1,14 +1,14 @@
 import * as z from 'zod/v4';
 
-import { ChannelTypeRegistry } from '../domain/channel-types';
-import { DatagramError, invariant } from '../domain/errors';
+import { ChannelTypeRegistry } from '../../domain/channel-types';
+import { DatagramError, invariant } from '../../domain/errors';
 import {
   channelRoleSchema,
   jsonValueSchema,
   newId,
   nowIso,
   tableFieldTypeSchema,
-} from '../domain/model';
+} from '../../domain/model';
 import type {
   ActionReceipt,
   Channel,
@@ -21,8 +21,8 @@ import type {
   Person,
   QueryResult,
   TableField,
-} from '../domain/model';
-import type { DatagramStore } from '../store/store';
+} from '../../domain/model';
+import type { DatagramStore } from './store';
 import {
   ActionRegistry,
   QueryRegistry,

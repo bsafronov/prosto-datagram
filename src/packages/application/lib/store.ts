@@ -6,7 +6,7 @@ import type {
   Person,
   TableField,
   TableRecord,
-} from '../domain/model';
+} from '../../domain/model';
 
 export interface DatagramStore {
   close(): Promise<void>;

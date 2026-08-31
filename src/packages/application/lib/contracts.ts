@@ -1,7 +1,7 @@
 import * as z from 'zod/v4';
 
-import { DatagramError } from '../domain/errors';
-import type { ActionReceipt, OperationOrigin, QueryResult } from '../domain/model';
+import { DatagramError } from '../../domain/errors';
+import type { ActionReceipt, OperationOrigin, QueryResult } from '../../domain/model';
 
 export interface ExecutionContext {
   readonly actorId: string;

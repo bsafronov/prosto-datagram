@@ -1,18 +1,19 @@
 import { Database } from 'bun:sqlite';
 
-import type {
-  Channel,
-  ChannelMembership,
-  DomainChange,
-  JsonValue,
-  Message,
-  Operation,
-  Person,
-  TableField,
-  TableRecord,
-} from '../domain/model';
-import { newId, nowIso } from '../domain/model';
-import type { DatagramStore } from './store';
+import {
+  newId,
+  nowIso,
+  type Channel,
+  type ChannelMembership,
+  type DatagramStore,
+  type DomainChange,
+  type JsonValue,
+  type Message,
+  type Operation,
+  type Person,
+  type TableField,
+  type TableRecord,
+} from '../../application/store';
 
 interface PersonRow {
   created_at: string;

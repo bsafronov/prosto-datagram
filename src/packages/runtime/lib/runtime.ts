@@ -1,10 +1,10 @@
-import { DatagramApplication } from './application/datagram';
-import { bundledChannelTypes, ChannelTypeRegistry } from './domain/channel-types';
-import type { Person } from './domain/model';
-import { SqliteStore } from './store/sqlite-store';
+import { createDatagramApplication } from '../../application';
+import type { DatagramApplicationPort } from '../../application/port';
+import type { Person } from '../../application/store';
+import { SqliteStore } from '../../sqlite-store';
 
 export interface DatagramRuntime {
-  readonly app: DatagramApplication;
+  readonly app: DatagramApplicationPort;
   readonly owner: Person;
   readonly store: SqliteStore;
   close(): Promise<void>;
@@ -21,9 +21,6 @@ export async function createRuntime(options: RuntimeOptions = {}): Promise<Datag
   );
   await store.initialize();
   const owner = await store.ensureLocalOwner(options.ownerDisplayName);
-  const app = new DatagramApplication(
-    store,
-    new ChannelTypeRegistry(bundledChannelTypes),
-  );
+  const app = createDatagramApplication(store);
   return { app, close: () => store.close(), owner, store };
 }

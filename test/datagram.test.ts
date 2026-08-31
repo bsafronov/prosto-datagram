@@ -3,9 +3,9 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { DatagramError } from '../src/domain/errors';
-import { viewDefinitionSchema } from '../src/domain/model';
-import { createRuntime, type DatagramRuntime } from '../src/runtime';
+import { DatagramError } from '../src/packages/application/errors';
+import { viewDefinitionSchema } from '../src/packages/domain/model';
+import { createRuntime, type DatagramRuntime } from '../src/packages/runtime';
 
 const openRuntimes: DatagramRuntime[] = [];
 

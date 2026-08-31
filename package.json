@@ -10,7 +10,7 @@
   "scripts": {
     "check": "bun run typecheck && bun run lint:boundaries && bun test",
     "cli": "bun src/cli.ts",
-    "lint:boundaries": "depcruise src/packages",
+    "lint:boundaries": "bun --bun node_modules/.bin/depcruise src/packages",
     "mcp": "bun src/mcp.ts",
     "serve": "bun src/server.ts",
     "test": "bun test",

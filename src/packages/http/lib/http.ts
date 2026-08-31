@@ -1,10 +1,10 @@
 import { ZodError } from 'zod';
 
-import type { DatagramApplication } from './application/datagram';
-import { DatagramError } from './domain/errors';
+import { DatagramError } from '../../application/errors';
+import type { DatagramApplicationPort } from '../../application/port';
 
 export interface HttpHandlerOptions {
-  readonly app: DatagramApplication;
+  readonly app: DatagramApplicationPort;
   readonly defaultActorId: string;
 }
 

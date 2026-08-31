@@ -71,6 +71,14 @@ module.exports = {
       from: {},
       to: { circular: true },
     },
+    {
+      name: 'adapters-use-application-interface',
+      comment:
+        'Adapters and composition packages depend on application entry points, never domain internals or domain entry points.',
+      severity: 'error',
+      from: { path: `^${R}/(cli|http|mcp|runtime|server|sqlite-store)/` },
+      to: { path: `^${R}/domain/` },
+    },
 
     // Layering is a separate concern. Add project-specific rules here when
     // package dependency direction becomes explicit.

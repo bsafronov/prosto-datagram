@@ -1,7 +1,7 @@
 import { afterEach, expect, test } from 'bun:test';
 
-import { createHttpHandler } from '../src/http';
-import { createRuntime, type DatagramRuntime } from '../src/runtime';
+import { createHttpHandler } from '../src/packages/http';
+import { createRuntime, type DatagramRuntime } from '../src/packages/runtime';
 
 let runtime: DatagramRuntime | undefined;
 

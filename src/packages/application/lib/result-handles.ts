@@ -1,6 +1,6 @@
-import { DatagramError } from '../domain/errors';
-import type { QueryResult } from '../domain/model';
-import { newId } from '../domain/model';
+import { DatagramError } from '../../domain/errors';
+import type { QueryResult } from '../../domain/model';
+import { newId } from '../../domain/model';
 
 interface HandleEntry {
   readonly actorId: string;
