@@ -68,6 +68,18 @@ export interface ChannelInvitation {
   readonly proposedRole: Exclude<ChannelRole, 'owner'>;
 }
 
+export interface DictionaryEntry {
+  readonly channelId: string;
+  readonly createdAt: string;
+  readonly createdBy: string;
+  readonly id: string;
+  readonly label: string;
+  readonly normalizedLabel: string;
+  readonly retiredAt?: string;
+  readonly retiredBy?: string;
+  readonly updatedAt?: string;
+}
+
 export interface TableField {
   readonly channelId: string;
   readonly defaultValue?: JsonValue;
@@ -230,6 +242,25 @@ export type DomainChange =
       readonly kind: 'channel-group.entry-removed';
     }
   | { readonly kind: 'channel-navigation.updated'; readonly navigation: ChannelNavigation }
+  | { readonly entry: DictionaryEntry; readonly kind: 'dictionary.entry-created' }
+  | {
+      readonly entryId: string;
+      readonly kind: 'dictionary.entry-renamed';
+      readonly label: string;
+      readonly normalizedLabel: string;
+      readonly updatedAt: string;
+    }
+  | {
+      readonly actorId: string;
+      readonly entryId: string;
+      readonly kind: 'dictionary.entry-retired';
+      readonly retiredAt: string;
+    }
+  | {
+      readonly entryId: string;
+      readonly kind: 'dictionary.entry-restored';
+      readonly restoredAt: string;
+    }
   | { readonly field: TableField; readonly kind: 'table.field-added' }
   | {
       readonly channelId: string;
@@ -282,6 +313,7 @@ export interface ActionReceipt {
     readonly kind:
       | 'channel'
       | 'channel-group'
+      | 'dictionary-entry'
       | 'field'
       | 'invitation'
       | 'message'

@@ -12,6 +12,7 @@ import {
   type ChannelMembership,
   type ChannelNavigation,
   type DatagramStore,
+  type DictionaryEntry,
   type DomainChange,
   type JsonValue,
   type Message,
@@ -67,6 +68,18 @@ interface TableFieldRow {
   required: number;
   type: TableField['type'];
   unique_value: number;
+}
+
+interface DictionaryEntryRow {
+  channel_id: string;
+  created_at: string;
+  created_by: string;
+  id: string;
+  label: string;
+  normalized_label: string;
+  retired_at: string | null;
+  retired_by: string | null;
+  updated_at: string | null;
 }
 
 interface TableRecordRow {
@@ -211,6 +224,18 @@ const tableFieldFromRow = (row: TableFieldRow): TableField => ({
   required: row.required === 1,
   type: row.type,
   unique: row.unique_value === 1,
+});
+
+const dictionaryEntryFromRow = (row: DictionaryEntryRow): DictionaryEntry => ({
+  channelId: row.channel_id,
+  createdAt: row.created_at,
+  createdBy: row.created_by,
+  id: row.id,
+  label: row.label,
+  normalizedLabel: row.normalized_label,
+  ...(row.retired_at === null ? {} : { retiredAt: row.retired_at }),
+  ...(row.retired_by === null ? {} : { retiredBy: row.retired_by }),
+  ...(row.updated_at === null ? {} : { updatedAt: row.updated_at }),
 });
 
 const tableRecordFromRow = (row: TableRecordRow): TableRecord => ({
@@ -429,6 +454,19 @@ export class SqliteStore implements DatagramStore {
         UNIQUE (channel_id, key)
       );
 
+      CREATE TABLE IF NOT EXISTS dictionary_entries (
+        id TEXT PRIMARY KEY,
+        channel_id TEXT NOT NULL REFERENCES channels(id),
+        label TEXT NOT NULL,
+        normalized_label TEXT NOT NULL,
+        created_by TEXT NOT NULL REFERENCES persons(id),
+        created_at TEXT NOT NULL,
+        updated_at TEXT,
+        retired_at TEXT,
+        retired_by TEXT REFERENCES persons(id),
+        UNIQUE (channel_id, normalized_label)
+      );
+
       CREATE TABLE IF NOT EXISTS table_records (
         id TEXT PRIMARY KEY,
         channel_id TEXT NOT NULL REFERENCES channels(id),
@@ -545,6 +583,8 @@ export class SqliteStore implements DatagramStore {
       END;
       CREATE INDEX IF NOT EXISTS table_records_channel
         ON table_records(channel_id, created_at);
+      CREATE INDEX IF NOT EXISTS dictionary_entries_channel
+        ON dictionary_entries(channel_id, created_at, id);
       CREATE INDEX IF NOT EXISTS messages_channel
         ON messages(channel_id, created_at);
       CREATE INDEX IF NOT EXISTS message_revisions_message
@@ -706,6 +746,13 @@ export class SqliteStore implements DatagramStore {
     return row ? messageFromRow(row, this.#listMessageRevisions(messageId)) : null;
   }
 
+  async getDictionaryEntry(entryId: string): Promise<DictionaryEntry | null> {
+    const row = this.#database
+      .query('SELECT * FROM dictionary_entries WHERE id = ?')
+      .get(entryId) as DictionaryEntryRow | null;
+    return row ? dictionaryEntryFromRow(row) : null;
+  }
+
   async getMembership(channelId: string, personId: string): Promise<ChannelMembership | null> {
     const row = this.#database
       .query('SELECT * FROM channel_memberships WHERE channel_id = ? AND person_id = ?')
@@ -828,6 +875,13 @@ export class SqliteStore implements DatagramStore {
       .query('SELECT * FROM table_fields WHERE channel_id = ? ORDER BY rowid')
       .all(channelId) as TableFieldRow[];
     return rows.map(tableFieldFromRow);
+  }
+
+  async listDictionaryEntries(channelId: string): Promise<readonly DictionaryEntry[]> {
+    const rows = this.#database
+      .query('SELECT * FROM dictionary_entries WHERE channel_id = ? ORDER BY created_at, id')
+      .all(channelId) as DictionaryEntryRow[];
+    return rows.map(dictionaryEntryFromRow);
   }
 
   async listTableRecords(channelId: string): Promise<readonly TableRecord[]> {
@@ -1125,6 +1179,51 @@ export class SqliteStore implements DatagramStore {
           ],
         );
         return;
+      case 'dictionary.entry-created':
+        this.#database.run(
+          `INSERT INTO dictionary_entries
+            (id, channel_id, label, normalized_label, created_by, created_at)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+          [
+            change.entry.id,
+            change.entry.channelId,
+            change.entry.label,
+            change.entry.normalizedLabel,
+            change.entry.createdBy,
+            change.entry.createdAt,
+          ],
+        );
+        return;
+      case 'dictionary.entry-renamed': {
+        const result = this.#database.run(
+          `UPDATE dictionary_entries
+           SET label = ?, normalized_label = ?, updated_at = ?
+           WHERE id = ?`,
+          [change.label, change.normalizedLabel, change.updatedAt, change.entryId],
+        );
+        if (result.changes !== 1) throw new Error('Dictionary Entry is unavailable');
+        return;
+      }
+      case 'dictionary.entry-retired': {
+        const result = this.#database.run(
+          `UPDATE dictionary_entries
+           SET retired_at = ?, retired_by = ?, updated_at = ?
+           WHERE id = ? AND retired_at IS NULL`,
+          [change.retiredAt, change.actorId, change.retiredAt, change.entryId],
+        );
+        if (result.changes !== 1) throw new Error('Dictionary Entry is already retired');
+        return;
+      }
+      case 'dictionary.entry-restored': {
+        const result = this.#database.run(
+          `UPDATE dictionary_entries
+           SET retired_at = NULL, retired_by = NULL, updated_at = ?
+           WHERE id = ? AND retired_at IS NOT NULL`,
+          [change.restoredAt, change.entryId],
+        );
+        if (result.changes !== 1) throw new Error('Dictionary Entry is not retired');
+        return;
+      }
       case 'table.field-added':
         this.#database.run(
           `INSERT INTO table_fields

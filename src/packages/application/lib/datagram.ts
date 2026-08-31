@@ -17,6 +17,7 @@ import type {
   ChannelNavigation,
   ChannelInvitation,
   ChannelRole,
+  DictionaryEntry,
   DomainChange,
   JsonValue,
   Message,
@@ -47,6 +48,20 @@ const roleRank: Readonly<Record<ChannelRole, number>> = {
 };
 
 const optionalJsonValueSchema = jsonValueSchema.optional();
+
+const normalizeDictionaryLabel = (value: string): string => value.trim().normalize('NFC');
+
+const dictionaryLabelSchema = z
+  .string()
+  .transform(normalizeDictionaryLabel)
+  .pipe(z.string().min(1).max(160));
+
+const dictionaryLabelKey = (value: string): string =>
+  normalizeDictionaryLabel(value)
+    .normalize('NFKC')
+    .toUpperCase()
+    .toLowerCase()
+    .normalize('NFKC');
 
 const tableViewFilterSchema = z.object({
   fieldId: z.string().min(1),
@@ -866,6 +881,188 @@ export class DatagramApplication {
         },
       }),
       defineAction({
+        description: 'Create a stable Entry in a Dictionary Channel. Contributor role required.',
+        inputSchema: z.object({
+          channelId: z.string().min(1),
+          label: dictionaryLabelSchema,
+        }),
+        name: 'dictionary.entry.create',
+        run: async (context, input) => {
+          await this.#requireChannel(input.channelId, 'dictionary');
+          await this.#requireRole(context.actorId, input.channelId, 'contributor');
+          const normalizedLabel = dictionaryLabelKey(input.label);
+          const entries = await this.store.listDictionaryEntries(input.channelId);
+          invariant(
+            !entries.some((entry) => entry.normalizedLabel === normalizedLabel),
+            'dictionary.entry-label-conflict',
+            'Dictionary Entry label already exists',
+            409,
+          );
+          const entry: DictionaryEntry = {
+            channelId: input.channelId,
+            createdAt: nowIso(),
+            createdBy: context.actorId,
+            id: newId('dictionary_entry'),
+            label: input.label,
+            normalizedLabel,
+          };
+          return this.#commit(
+            context,
+            'dictionary.entry.create',
+            input.channelId,
+            (operationId, occurredAt) => [
+              { entry, kind: 'dictionary.entry-created' },
+              {
+                activity: this.#activity(
+                  context.actorId,
+                  input.channelId,
+                  'dictionary.entry-created',
+                  operationId,
+                  occurredAt,
+                ),
+                kind: 'activity.appended',
+              },
+            ],
+            { id: entry.id, kind: 'dictionary-entry' },
+          );
+        },
+      }),
+      defineAction({
+        description: 'Rename a Dictionary Entry without changing identity. Contributor role required.',
+        inputSchema: z.object({
+          channelId: z.string().min(1),
+          entryId: z.string().min(1),
+          label: dictionaryLabelSchema,
+        }),
+        name: 'dictionary.entry.rename',
+        run: async (context, input) => {
+          await this.#requireChannel(input.channelId, 'dictionary');
+          await this.#requireRole(context.actorId, input.channelId, 'contributor');
+          const entry = await this.#requireDictionaryEntry(input.channelId, input.entryId);
+          const normalizedLabel = dictionaryLabelKey(input.label);
+          const entries = await this.store.listDictionaryEntries(input.channelId);
+          invariant(
+            !entries.some(
+              (candidate) =>
+                candidate.id !== entry.id && candidate.normalizedLabel === normalizedLabel,
+            ),
+            'dictionary.entry-label-conflict',
+            'Dictionary Entry label already exists',
+            409,
+          );
+          return this.#commit(
+            context,
+            'dictionary.entry.rename',
+            input.channelId,
+            (operationId, occurredAt) => [
+              {
+                entryId: entry.id,
+                kind: 'dictionary.entry-renamed',
+                label: input.label,
+                normalizedLabel,
+                updatedAt: occurredAt,
+              },
+              {
+                activity: this.#activity(
+                  context.actorId,
+                  input.channelId,
+                  'dictionary.entry-renamed',
+                  operationId,
+                  occurredAt,
+                ),
+                kind: 'activity.appended',
+              },
+            ],
+            { id: entry.id, kind: 'dictionary-entry' },
+          );
+        },
+      }),
+      defineAction({
+        description: 'Retire a Dictionary Entry from new selection. Contributor role required.',
+        inputSchema: z.object({
+          channelId: z.string().min(1),
+          entryId: z.string().min(1),
+        }),
+        name: 'dictionary.entry.retire',
+        run: async (context, input) => {
+          await this.#requireChannel(input.channelId, 'dictionary');
+          await this.#requireRole(context.actorId, input.channelId, 'contributor');
+          const entry = await this.#requireDictionaryEntry(input.channelId, input.entryId);
+          invariant(
+            entry.retiredAt === undefined,
+            'dictionary.entry-retired',
+            'Dictionary Entry is already retired',
+            409,
+          );
+          return this.#commit(
+            context,
+            'dictionary.entry.retire',
+            input.channelId,
+            (operationId, occurredAt) => [
+              {
+                actorId: context.actorId,
+                entryId: entry.id,
+                kind: 'dictionary.entry-retired',
+                retiredAt: occurredAt,
+              },
+              {
+                activity: this.#activity(
+                  context.actorId,
+                  input.channelId,
+                  'dictionary.entry-retired',
+                  operationId,
+                  occurredAt,
+                ),
+                kind: 'activity.appended',
+              },
+            ],
+            { id: entry.id, kind: 'dictionary-entry' },
+          );
+        },
+      }),
+      defineAction({
+        description: 'Restore a retired Dictionary Entry. Contributor role required.',
+        inputSchema: z.object({
+          channelId: z.string().min(1),
+          entryId: z.string().min(1),
+        }),
+        name: 'dictionary.entry.restore',
+        run: async (context, input) => {
+          await this.#requireChannel(input.channelId, 'dictionary');
+          await this.#requireRole(context.actorId, input.channelId, 'contributor');
+          const entry = await this.#requireDictionaryEntry(input.channelId, input.entryId);
+          invariant(
+            entry.retiredAt !== undefined,
+            'dictionary.entry-active',
+            'Dictionary Entry is not retired',
+            409,
+          );
+          return this.#commit(
+            context,
+            'dictionary.entry.restore',
+            input.channelId,
+            (operationId, occurredAt) => [
+              {
+                entryId: entry.id,
+                kind: 'dictionary.entry-restored',
+                restoredAt: occurredAt,
+              },
+              {
+                activity: this.#activity(
+                  context.actorId,
+                  input.channelId,
+                  'dictionary.entry-restored',
+                  operationId,
+                  occurredAt,
+                ),
+                kind: 'activity.appended',
+              },
+            ],
+            { id: entry.id, kind: 'dictionary-entry' },
+          );
+        },
+      }),
+      defineAction({
         description: 'Add a typed Field to a Table Channel. Admin role required.',
         inputSchema: z.object({
           channelId: z.string().min(1),
@@ -1585,6 +1782,40 @@ export class DatagramApplication {
         },
       }),
       defineQuery({
+        description: 'List selectable or all Entries in a Dictionary Channel.',
+        inputSchema: z.object({
+          channelId: z.string().min(1),
+          includeRetired: z.boolean().default(false),
+        }),
+        name: 'dictionary.entries.list',
+        run: async (context, input): Promise<QueryResult> => {
+          await this.#requireChannel(input.channelId, 'dictionary');
+          await this.#requireRole(context.actorId, input.channelId, 'viewer');
+          const entries = (await this.store.listDictionaryEntries(input.channelId)).filter(
+            (entry) => input.includeRetired || entry.retiredAt === undefined,
+          );
+          return {
+            data: entries.map((entry) => ({
+              id: entry.id,
+              label: entry.label,
+              ...(entry.retiredAt === undefined ? {} : { retiredAt: entry.retiredAt }),
+            })),
+            view: {
+              bindings: { entries: '$result' },
+              commands: [
+                'dictionary.entry.create',
+                'dictionary.entry.rename',
+                'dictionary.entry.retire',
+                'dictionary.entry.restore',
+              ],
+              kind: 'table',
+              schemaVersion: 'datagram/view@1',
+              title: 'Dictionary Entries',
+            },
+          };
+        },
+      }),
+      defineQuery({
         description: 'Describe the active Fields in a Table Channel.',
         inputSchema: z.object({ channelId: z.string().min(1) }),
         name: 'table.describe',
@@ -1781,6 +2012,20 @@ export class DatagramApplication {
       404,
     );
     return record;
+  }
+
+  async #requireDictionaryEntry(
+    channelId: string,
+    entryId: string,
+  ): Promise<DictionaryEntry> {
+    const entry = await this.store.getDictionaryEntry(entryId);
+    invariant(
+      entry?.channelId === channelId,
+      'dictionary.entry-not-found',
+      'Dictionary Entry does not exist',
+      404,
+    );
+    return entry;
   }
 
   #validatedRecordValues(

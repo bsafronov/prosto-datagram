@@ -7,6 +7,7 @@ export type {
   ChannelListItem,
   ChannelMembership,
   ChannelNavigation,
+  DictionaryEntry,
   DomainChange,
   JsonValue,
   Message,

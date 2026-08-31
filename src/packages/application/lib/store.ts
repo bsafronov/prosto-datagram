@@ -7,6 +7,7 @@ import type {
   ChannelListItem,
   ChannelMembership,
   ChannelNavigation,
+  DictionaryEntry,
   Message,
   Operation,
   Person,
@@ -23,6 +24,7 @@ export interface DatagramStore {
   getChannel(channelId: string): Promise<Channel | null>;
   getChannelGroup(groupId: string): Promise<ChannelGroup | null>;
   getChannelNavigation(channelId: string, personId: string): Promise<ChannelNavigation>;
+  getDictionaryEntry(entryId: string): Promise<DictionaryEntry | null>;
   getInvitation(invitationId: string): Promise<ChannelInvitation | null>;
   getMessage(messageId: string): Promise<Message | null>;
   getMembership(channelId: string, personId: string): Promise<ChannelMembership | null>;
@@ -36,6 +38,7 @@ export interface DatagramStore {
   listChannelGroupEntries(groupId: string): Promise<readonly ChannelGroupEntry[]>;
   listChannelGroups(personId: string): Promise<readonly ChannelGroup[]>;
   listChannelNavigation(personId: string): Promise<readonly ChannelListItem[]>;
+  listDictionaryEntries(channelId: string): Promise<readonly DictionaryEntry[]>;
   listMessages(channelId: string): Promise<readonly Message[]>;
   listOperations(channelId: string): Promise<readonly Operation[]>;
   listServiceOperations(): Promise<readonly Operation[]>;
