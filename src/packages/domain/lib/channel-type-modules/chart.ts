@@ -2,7 +2,7 @@ import * as z from 'zod/v4';
 
 import type { ChannelTypeDefinition } from '../channel-types';
 import { jsonValueSchema } from '../model';
-import { channelIdSchema, contract, stateRule } from './contract';
+import { channelIdSchema, contract, produceOwnedView, stateRule } from './contract';
 import { invariant } from '../errors';
 import {
   discussionActions,
@@ -34,6 +34,7 @@ export const chartChannelType = {
       handleId: z.string().min(1),
       presentation: chartPresentationSchema,
       title: z.string().trim().min(1).max(160),
+      typeVersion: z.string().regex(/^\d+\.\d+\.\d+$/).optional(),
     })),
     contract('chart.definition.update', z.object({
       aggregations: z.array(chartAggregationSchema).min(1),
@@ -90,9 +91,15 @@ export const chartChannelType = {
     {
       commands: ['chart.definition.update', 'chart.event.record'],
       kind: 'chart',
+      produce: produceOwnedView,
       query: 'chart.open',
     },
     discussionView,
-    { commands: [], kind: 'table', query: 'discussion.message.revisions' },
+    {
+      commands: [],
+      kind: 'table',
+      produce: produceOwnedView,
+      query: 'discussion.message.revisions',
+    },
   ],
 } as const satisfies ChannelTypeDefinition;

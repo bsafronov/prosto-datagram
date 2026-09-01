@@ -123,11 +123,27 @@ export class DatagramApplication {
       new Set(actions.map((definition) => definition.name)),
       new Set(queries.map((definition) => definition.name)),
     );
-    this.actions = new ActionRegistry(actions, (selector, name) =>
-      this.channelTypes.requireAction(selector.typeId, selector.typeVersion, name),
+    const channelActionNames = new Set(
+      this.channelTypes.list().flatMap((definition) =>
+        definition.actions.map((contract) => contract.name),
+      ),
     );
-    this.queries = new QueryRegistry(queries, (selector, name) =>
-      this.channelTypes.requireQuery(selector.typeId, selector.typeVersion, name),
+    const channelQueryNames = new Set(
+      this.channelTypes.list().flatMap((definition) =>
+        definition.queries.map((contract) => contract.name),
+      ),
+    );
+    this.actions = new ActionRegistry(
+      actions,
+      (selector, name) =>
+        this.channelTypes.requireAction(selector.typeId, selector.typeVersion, name),
+      channelActionNames,
+    );
+    this.queries = new QueryRegistry(
+      queries,
+      (selector, name) =>
+        this.channelTypes.requireQuery(selector.typeId, selector.typeVersion, name),
+      channelQueryNames,
     );
   }
 
@@ -143,11 +159,20 @@ export class DatagramApplication {
     input: unknown,
   ): Promise<ActionReceipt> {
     await this.#requirePerson(actorId);
+    const contract = await this.#channelContract('action', name, input);
+    if (contract) {
+      return this.channelTypes.executeAction(
+        contract.typeId,
+        contract.typeVersion,
+        name,
+        input,
+        (parsed) => this.actions.execute(name, { actorId, origin }, parsed, z.any()),
+      );
+    }
     return this.actions.execute(
       name,
       { actorId, origin },
       input,
-      await this.#channelContractSchema('action', name, input),
     );
   }
 
@@ -158,11 +183,20 @@ export class DatagramApplication {
     input: unknown,
   ): Promise<QueryResult> {
     await this.#requirePerson(actorId);
+    const contract = await this.#channelContract('query', name, input);
     const result = await this.queries.execute(
       name,
       { actorId, origin },
       input,
-      await this.#channelContractSchema('query', name, input),
+      contract?.schema.transform((parsed) => {
+        this.channelTypes.validateState(
+          contract.typeId,
+          contract.typeVersion,
+          name,
+          parsed,
+        );
+        return parsed;
+      }),
     );
     if (input !== null && !Array.isArray(input) && typeof input === 'object') {
       const channelId = (input as Record<string, unknown>).channelId;
@@ -187,11 +221,14 @@ export class DatagramApplication {
     return result;
   }
 
-  async #channelContractSchema(
+  async #channelContract(
     kind: 'action' | 'query',
     name: string,
     rawInput: unknown,
-  ): Promise<z.ZodType | undefined> {
+  ): Promise<
+    | { readonly schema: z.ZodType; readonly typeId: string; readonly typeVersion: string }
+    | undefined
+  > {
     if (rawInput === null || Array.isArray(rawInput) || typeof rawInput !== 'object') {
       return undefined;
     }
@@ -205,11 +242,17 @@ export class DatagramApplication {
         typeVersion = channel.typeVersion;
       }
     } else if (name === 'channel.create' && typeof input.typeId === 'string') {
-      const type = this.channelTypes.requireCurrent(input.typeId);
+      const type =
+        typeof input.typeVersion === 'string'
+          ? this.channelTypes.require(input.typeId, input.typeVersion)
+          : this.channelTypes.requireCurrent(input.typeId);
       typeId = type.id;
       typeVersion = type.version;
     } else if (name === 'chart.create') {
-      const type = this.channelTypes.requireCurrent('chart');
+      const type =
+        typeof input.typeVersion === 'string'
+          ? this.channelTypes.require('chart', input.typeVersion)
+          : this.channelTypes.requireCurrent('chart');
       typeId = type.id;
       typeVersion = type.version;
     }
@@ -218,10 +261,7 @@ export class DatagramApplication {
       kind === 'action'
         ? this.channelTypes.requireAction(typeId, typeVersion, name)
         : this.channelTypes.requireQuery(typeId, typeVersion, name);
-    return schema?.transform((input) => {
-      this.channelTypes.validateState(typeId, typeVersion, name, input);
-      return input;
-    });
+    return schema ? { schema, typeId, typeVersion } : undefined;
   }
 
   async prepareQuery(
@@ -546,11 +586,14 @@ export class DatagramApplication {
         inputSchema: z.object({
           title: z.string().trim().min(1).max(160),
           typeId: z.string().min(1),
+          typeVersion: z.string().regex(/^\d+\.\d+\.\d+$/).optional(),
         }),
         name: 'channel.create',
         run: async (context, input) => {
           await this.#requirePerson(context.actorId);
-          const type = this.channelTypes.requireCurrent(input.typeId);
+          const type = input.typeVersion
+            ? this.channelTypes.require(input.typeId, input.typeVersion)
+            : this.channelTypes.requireCurrent(input.typeId);
           invariant(
             type.id !== 'chart',
             'chart.definition-required',
@@ -2704,6 +2747,7 @@ export class DatagramApplication {
           handleId: z.string().min(1),
           presentation: chartPresentationSchema,
           title: z.string().trim().min(1).max(160),
+          typeVersion: z.string().regex(/^\d+\.\d+\.\d+$/).optional(),
         }),
         name: 'chart.create',
         run: async (context, input) => {
@@ -2727,7 +2771,9 @@ export class DatagramApplication {
             },
             1,
           );
-          const type = this.channelTypes.requireCurrent('chart');
+          const type = input.typeVersion
+            ? this.channelTypes.require('chart', input.typeVersion)
+            : this.channelTypes.requireCurrent('chart');
           const occurredAt = nowIso();
           const channel: Channel = {
             createdAt: occurredAt,
@@ -4235,13 +4281,26 @@ export class DatagramApplication {
 
   async #resolveChannelRecordId(actorId: string, recordId: string): Promise<JsonValue> {
     const tableRecord = await this.store.getTableRecord(recordId);
-    if (tableRecord) return this.#resolveReference(actorId, tableRecord.channelId, recordId);
+    if (tableRecord) {
+      if (!(await this.store.getMembership(tableRecord.channelId, actorId))) {
+        return { recordId, status: 'unresolved' };
+      }
+      return this.#resolveReference(actorId, tableRecord.channelId, recordId);
+    }
     const dictionaryEntry = await this.store.getDictionaryEntry(recordId);
     if (dictionaryEntry) {
+      if (!(await this.store.getMembership(dictionaryEntry.channelId, actorId))) {
+        return { recordId, status: 'unresolved' };
+      }
       return this.#resolveReference(actorId, dictionaryEntry.channelId, recordId);
     }
     const message = await this.store.getMessage(recordId);
-    if (message) return this.#resolveReference(actorId, message.channelId, recordId);
+    if (message) {
+      if (!(await this.store.getMembership(message.channelId, actorId))) {
+        return { recordId, status: 'unresolved' };
+      }
+      return this.#resolveReference(actorId, message.channelId, recordId);
+    }
     return { recordId, status: 'unresolved' };
   }
 

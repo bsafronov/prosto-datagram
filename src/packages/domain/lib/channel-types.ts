@@ -9,7 +9,15 @@ import { viewDefinitionSchema, type Operation, type ViewDefinition } from './mod
 export { dictionaryLabelKey, normalizeDictionaryLabel } from './channel-type-modules/dictionary';
 export { validateTableFieldValue } from './channel-type-modules/table';
 
+const defaultContractHandler = (
+  input: any,
+  next: (input: any) => Promise<any>,
+): Promise<any> => next(input);
+
 const channelContractSchema = z.object({
+  execute: z.custom<(input: any, next: (input: any) => Promise<any>) => Promise<any>>(
+    (value) => typeof value === 'function',
+  ).default(defaultContractHandler),
   inputSchema: z.custom<z.ZodType>(
     (value) => typeof (value as { parse?: unknown } | null)?.parse === 'function',
   ),
@@ -89,16 +97,17 @@ const snapshotSchema = (root: z.ZodType): z.ZodType => {
 const publicContract = (
   name: string,
   schema: z.ZodType,
-): { readonly inputSchema: z.ZodType; readonly name: string } =>
+  execute: (input: unknown, next: (input: unknown) => Promise<unknown>) => Promise<unknown>,
+): { readonly execute: typeof execute; readonly inputSchema: z.ZodType; readonly name: string } =>
   Object.defineProperties(
-    { name },
+    { execute, name },
     {
       inputSchema: {
         enumerable: true,
         get: () => snapshotSchema(schema),
       },
     },
-  ) as { readonly inputSchema: z.ZodType; readonly name: string };
+  ) as { readonly execute: typeof execute; readonly inputSchema: z.ZodType; readonly name: string };
 
 export const channelTypeDefinitionSchema = z.object({
   actions: z.array(channelContractSchema),
@@ -129,6 +138,10 @@ export const bundledChannelTypes: readonly ChannelTypeDefinition[] = [
 
 export class ChannelTypeRegistry {
   readonly #definitions = new Map<string, ChannelTypeDefinition>();
+  readonly #handlers = new Map<string, (
+    input: unknown,
+    next: (input: unknown) => Promise<unknown>,
+  ) => Promise<unknown>>();
   readonly #schemas = new Map<string, z.ZodType>();
   readonly #versions = new Map<string, ChannelTypeDefinition[]>();
 
@@ -143,7 +156,11 @@ export class ChannelTypeRegistry {
             `action:${ChannelTypeRegistry.key(parsed.id, parsed.version)}:${contract.name}`,
             schema,
           );
-          return publicContract(contract.name, schema);
+          this.#handlers.set(
+            `action:${ChannelTypeRegistry.key(parsed.id, parsed.version)}:${contract.name}`,
+            contract.execute,
+          );
+          return publicContract(contract.name, schema, contract.execute);
         }),
         queries: parsed.queries.map((contract) => {
           const schema = snapshotSchema(contract.inputSchema);
@@ -151,7 +168,7 @@ export class ChannelTypeRegistry {
             `query:${ChannelTypeRegistry.key(parsed.id, parsed.version)}:${contract.name}`,
             schema,
           );
-          return publicContract(contract.name, schema);
+          return publicContract(contract.name, schema, contract.execute);
         }),
       } satisfies ChannelTypeDefinition;
       const key = ChannelTypeRegistry.key(definition.id, definition.version);
@@ -206,6 +223,23 @@ export class ChannelTypeRegistry {
     this.require(id, version);
     const schema = this.#schemas.get(`query:${ChannelTypeRegistry.key(id, version)}:${name}`);
     return schema ? snapshotSchema(schema) : undefined;
+  }
+
+  async executeAction<T>(
+    id: string,
+    version: string,
+    name: string,
+    input: unknown,
+    next: (input: unknown) => Promise<T>,
+  ): Promise<T> {
+    const schema = this.requireAction(id, version, name);
+    if (!schema) return next(input);
+    const parsed = schema.parse(input);
+    this.validateState(id, version, name, parsed);
+    const handler = this.#handlers.get(
+      `action:${ChannelTypeRegistry.key(id, version)}:${name}`,
+    );
+    return (handler ? handler(parsed, next) : next(parsed)) as Promise<T>;
   }
 
   assertImplementations(

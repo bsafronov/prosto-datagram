@@ -9,7 +9,13 @@ import {
   type TableField,
 } from '../model';
 import { DatagramError, invariant } from '../errors';
-import { channelCreateContract, channelIdSchema, contract, stateRule } from './contract';
+import {
+  channelCreateContract,
+  channelIdSchema,
+  contract,
+  produceOwnedView,
+  stateRule,
+} from './contract';
 import {
   discussionActions,
   discussionActivityKinds,
@@ -260,16 +266,19 @@ export const tableChannelType = {
         'table.record.create',
       ],
       kind: 'table-schema',
+      produce: produceOwnedView,
       query: 'table.describe',
     },
     {
       commands: ['table.field.convert'],
       kind: 'table',
+      produce: produceOwnedView,
       query: 'table.field.conversion.preview',
     },
     {
       commands: ['table.display-field.set'],
       kind: 'value',
+      produce: produceOwnedView,
       query: 'table.configuration',
     },
     {
@@ -280,6 +289,7 @@ export const tableChannelType = {
         'table.record.restore',
       ],
       kind: 'table-records',
+      produce: produceOwnedView,
       query: 'table.records.list',
     },
     {
@@ -290,10 +300,21 @@ export const tableChannelType = {
         'table.record.restore',
       ],
       kind: 'table-records',
+      produce: produceOwnedView,
       query: 'table.view.open',
     },
-    { commands: ['table.view.create'], kind: 'table-views', query: 'table.views.list' },
+    {
+      commands: ['table.view.create'],
+      kind: 'table-views',
+      produce: produceOwnedView,
+      query: 'table.views.list',
+    },
     discussionView,
-    { commands: [], kind: 'table', query: 'discussion.message.revisions' },
+    {
+      commands: [],
+      kind: 'table',
+      produce: produceOwnedView,
+      query: 'discussion.message.revisions',
+    },
   ],
 } as const satisfies ChannelTypeDefinition;

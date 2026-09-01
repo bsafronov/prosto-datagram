@@ -2,6 +2,7 @@ import { McpServer } from '@modelcontextprotocol/server';
 
 import { resultHandleCompositionSchema } from '../../application';
 import type { IssuedResultHandle } from '../../application';
+import type { ChannelTypeContractSelector } from '../../application/contracts';
 import { DatagramError } from '../../application/errors';
 import type { DatagramApplicationPort } from '../../application/port';
 
@@ -17,6 +18,7 @@ export type McpIdentityAuthenticator = () =>
 export interface McpGatewayOptions {
   readonly app: DatagramApplicationPort;
   readonly authenticateIdentity: McpIdentityAuthenticator;
+  readonly channelType?: ChannelTypeContractSelector;
 }
 
 interface SafeToolError {
@@ -64,6 +66,7 @@ const toolResult = (output: ActionReceipt | IssuedResultHandle | SafeToolError, 
 export async function createMcpGateway({
   app,
   authenticateIdentity,
+  channelType,
 }: McpGatewayOptions): Promise<McpServer> {
   const authenticated = await authenticateIdentity();
   if (!authenticated) {
@@ -80,7 +83,7 @@ export async function createMcpGateway({
     },
   );
 
-  for (const definition of app.actions.list()) {
+  for (const definition of app.actions.list(channelType)) {
     server.registerTool(
       definition.name,
       {
@@ -99,7 +102,7 @@ export async function createMcpGateway({
     );
   }
 
-  for (const definition of app.queries.list()) {
+  for (const definition of app.queries.list(channelType)) {
     server.registerTool(
       definition.name,
       {

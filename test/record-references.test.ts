@@ -120,6 +120,24 @@ describe('Record Reference Fields', () => {
       { channelId: targetChannelId, recordId: entry.subject!.id, status: 'resolved' },
       { channelId: targetChannelId, recordId: message.subject!.id, status: 'resolved' },
     ]);
+    const sourceOnlyReader = await createPerson(value, 'Source-only reader');
+    await value.app.executeAction(value.owner.id, 'cli', 'channel.member.grant', {
+      channelId: sourceChannelId,
+      personId: sourceOnlyReader,
+      role: 'viewer',
+    });
+    const hiddenReferences = (
+      (
+        await value.app.executeQuery(sourceOnlyReader, 'cli', 'discussion.messages.list', {
+          channelId: sourceChannelId,
+        })
+      ).data as Array<{ id: string; recordReferences: unknown[] }>
+    ).find((candidate) => candidate.id === linkedMessage.subject!.id)!.recordReferences;
+    expect(hiddenReferences).toEqual([
+      { recordId: entry.subject!.id, status: 'unresolved' },
+      { recordId: message.subject!.id, status: 'unresolved' },
+    ]);
+    expect(JSON.stringify(hiddenReferences)).not.toContain(targetChannelId);
 
     await value.app.executeAction(value.owner.id, 'cli', 'dictionary.entry.retire', {
       channelId: targetChannelId,

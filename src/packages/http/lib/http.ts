@@ -1,4 +1,5 @@
 import { resultHandleCompositionSchema } from '../../application';
+import type { ChannelTypeContractSelector } from '../../application/contracts';
 import { DatagramError, toPublicError } from '../../application/errors';
 import type { DatagramApplicationPort } from '../../application/port';
 
@@ -40,6 +41,19 @@ async function body(request: Request): Promise<unknown> {
 function failure(error: unknown): Response {
   const result = toPublicError(error);
   return json(result.body, result.status);
+}
+
+function channelTypeSelector(url: URL): ChannelTypeContractSelector | undefined {
+  const typeId = url.searchParams.get('typeId');
+  const typeVersion = url.searchParams.get('typeVersion');
+  if ((typeId === null) !== (typeVersion === null)) {
+    throw new DatagramError(
+      'input.invalid',
+      'typeId and typeVersion must be provided together',
+      400,
+    );
+  }
+  return typeId === null || typeVersion === null ? undefined : { typeId, typeVersion };
 }
 
 function eventStream(
@@ -102,10 +116,7 @@ function handler(
         throw new DatagramError('identity.unauthenticated', 'Authentication required', 401);
       }
       const actorId = identity.actorId;
-      const typeId = url.searchParams.get('typeId');
-      const typeVersion = url.searchParams.get('typeVersion');
-      const selector =
-        typeId && typeVersion ? { typeId, typeVersion } : undefined;
+      const selector = channelTypeSelector(url);
       if (request.method === 'GET' && url.pathname === '/v1/actions') {
         return json({ actions: app.actions.catalog(selector) });
       }
@@ -132,26 +143,38 @@ function handler(
 
       const action = url.pathname.match(/^\/v1\/actions\/([^/]+)$/);
       if (request.method === 'POST' && action?.[1]) {
+        const name = decodeURIComponent(action[1]);
+        if (selector && !app.actions.list(selector).some((value) => value.name === name)) {
+          throw new DatagramError('action.unknown', `Unknown definition: ${name}`, 404);
+        }
         return json(
-          await app.executeAction(actorId, 'http', decodeURIComponent(action[1]), await body(request)),
+          await app.executeAction(actorId, 'http', name, await body(request)),
           201,
         );
       }
 
       const query = url.pathname.match(/^\/v1\/queries\/([^/]+)$/);
       if (request.method === 'POST' && query?.[1]) {
+        const name = decodeURIComponent(query[1]);
+        if (selector && !app.queries.list(selector).some((value) => value.name === name)) {
+          throw new DatagramError('query.unknown', `Unknown definition: ${name}`, 404);
+        }
         return json(
-          await app.executeQuery(actorId, 'http', decodeURIComponent(query[1]), await body(request)),
+          await app.executeQuery(actorId, 'http', name, await body(request)),
         );
       }
 
       const agentQuery = url.pathname.match(/^\/v1\/agent\/queries\/([^/]+)$/);
       if (request.method === 'POST' && agentQuery?.[1]) {
+        const name = decodeURIComponent(agentQuery[1]);
+        if (selector && !app.queries.list(selector).some((value) => value.name === name)) {
+          throw new DatagramError('query.unknown', `Unknown definition: ${name}`, 404);
+        }
         return json(
           await app.prepareQuery(
             actorId,
             'agent',
-            decodeURIComponent(agentQuery[1]),
+            name,
             await body(request),
           ),
           201,

@@ -1179,62 +1179,7 @@ export class SqliteStore implements DatagramStore {
     const apply = this.#database.transaction((candidate: Operation) => {
       const state = this.#transitionState();
       applyOperation(state, candidate);
-
-      for (const change of candidate.changes) {
-        if (change.kind !== 'activity.appended') this.#projectReducedChange(change, state);
-      }
-
-      this.#database.run(
-        `INSERT INTO operations
-          (id, actor_id, origin, action, channel_id, status, changes_json, intent_json,
-           result_json, occurred_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [
-          candidate.id,
-          candidate.actorId,
-          candidate.origin,
-          candidate.action,
-          candidate.channelId ?? null,
-          candidate.status,
-          JSON.stringify(candidate.changes),
-          JSON.stringify(candidate.intent),
-          JSON.stringify(candidate.result),
-          candidate.occurredAt,
-        ],
-      );
-
-      for (const change of candidate.changes) {
-        if (change.kind === 'activity.appended') this.#projectReducedChange(change, state);
-      }
-
-      for (const change of candidate.changes) {
-        if (change.kind !== 'activity.appended') continue;
-        this.#database.run(
-          `INSERT INTO subscription_events
-            (id, event_type, operation_id, activity_id, channel_id, actor_id, occurred_at)
-           VALUES (?, 'activity', ?, ?, ?, ?, ?)`,
-          [
-            change.activity.id,
-            candidate.id,
-            change.activity.id,
-            change.activity.channelId,
-            change.activity.actorId,
-            change.activity.occurredAt,
-          ],
-        );
-      }
-      this.#database.run(
-        `INSERT INTO subscription_events
-          (id, event_type, operation_id, activity_id, channel_id, actor_id, occurred_at)
-         VALUES (?, 'operation-result', ?, NULL, ?, ?, ?)`,
-        [
-          `operation-result:${candidate.id}`,
-          candidate.id,
-          candidate.channelId ?? null,
-          candidate.actorId,
-          candidate.occurredAt,
-        ],
-      );
+      this.#persistReducedState(state);
     });
     apply.immediate(operation);
   }
@@ -1322,683 +1267,357 @@ export class SqliteStore implements DatagramStore {
     };
   }
 
-  #projectReducedChange(change: DomainChange, reduced: StoreState): void {
-    switch (change.kind) {
-      case 'person.created':
+  #persistReducedState(state: StoreState): void {
+    this.#database.exec('PRAGMA defer_foreign_keys = ON;');
+    this.#database.exec(`
+      DELETE FROM subscription_events;
+      DELETE FROM channel_navigation;
+      DELETE FROM channel_group_entries;
+      DELETE FROM message_revisions;
+      DELETE FROM table_settings;
+      DELETE FROM table_views;
+      DELETE FROM chart_definitions;
+      DELETE FROM dictionary_entries;
+      DELETE FROM table_records;
+      DELETE FROM table_fields;
+      DELETE FROM messages;
+      DELETE FROM channel_activities;
+      DELETE FROM operations;
+      DELETE FROM channel_invitations;
+      DELETE FROM channel_memberships;
+      DELETE FROM channel_groups;
+      DELETE FROM channels;
+      DELETE FROM persons;
+    `);
+
+    for (const person of state.persons) {
+      this.#database.run(
+        `INSERT INTO persons
+          (id, display_name, is_operator, created_at, deactivated_at)
+         VALUES (?, ?, ?, ?, ?)`,
+        [
+          person.id,
+          person.displayName,
+          person.isOperator ? 1 : 0,
+          person.createdAt,
+          person.deactivatedAt ?? null,
+        ],
+      );
+    }
+
+    for (const channel of state.channels) {
+      this.#database.run(
+        `INSERT INTO channels
+          (id, type_id, type_version, title, owner_id, created_at, updated_at,
+           deleted_at, deleted_by, purged_at, purged_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          channel.id,
+          channel.typeId,
+          channel.typeVersion,
+          channel.title,
+          channel.ownerId,
+          channel.createdAt,
+          channel.updatedAt,
+          channel.deletedAt ?? null,
+          channel.deletedBy ?? null,
+          channel.purgedAt ?? null,
+          channel.purgedBy ?? null,
+        ],
+      );
+    }
+
+    for (const membership of state.memberships) {
+      this.#database.run(
+        `INSERT INTO channel_memberships (channel_id, person_id, role)
+         VALUES (?, ?, ?)`,
+        [membership.channelId, membership.personId, membership.role],
+      );
+    }
+
+    for (const invitation of state.invitations) {
+      this.#database.run(
+        `INSERT INTO channel_invitations
+          (id, channel_id, proposed_role, expires_at, created_by, created_at,
+           accepted_by, accepted_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          invitation.id,
+          invitation.channelId,
+          invitation.proposedRole,
+          invitation.expiresAt,
+          invitation.createdBy,
+          invitation.createdAt,
+          invitation.acceptedBy ?? null,
+          invitation.acceptedAt ?? null,
+        ],
+      );
+    }
+
+    for (const operation of state.operations) {
+      this.#database.run(
+        `INSERT INTO operations
+          (id, actor_id, origin, action, channel_id, status, changes_json, intent_json,
+           result_json, occurred_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          operation.id,
+          operation.actorId,
+          operation.origin,
+          operation.action,
+          operation.channelId ?? null,
+          operation.status,
+          JSON.stringify(operation.changes),
+          JSON.stringify(operation.intent),
+          JSON.stringify(operation.result),
+          operation.occurredAt,
+        ],
+      );
+    }
+
+    for (const activity of state.activities) {
+      this.#database.run(
+        `INSERT INTO channel_activities
+          (sequence, id, channel_id, operation_id, kind, actor_id, occurred_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [
+          activity.position,
+          activity.id,
+          activity.channelId,
+          activity.operationId,
+          activity.kind,
+          activity.actorId,
+          activity.occurredAt,
+        ],
+      );
+    }
+
+    for (const event of state.events) {
+      if (event.type === 'activity') {
         this.#database.run(
-          `INSERT INTO persons (id, display_name, is_operator, created_at)
-           VALUES (?, ?, ?, ?)`,
+          `INSERT INTO subscription_events
+            (position, id, event_type, operation_id, activity_id, channel_id, actor_id, occurred_at)
+           VALUES (?, ?, 'activity', ?, ?, ?, ?, ?)`,
           [
-            change.person.id,
-            change.person.displayName,
-            change.person.isOperator ? 1 : 0,
-            change.person.createdAt,
+            event.position,
+            event.id,
+            event.activity.operationId,
+            event.activity.id,
+            event.activity.channelId,
+            event.activity.actorId,
+            event.activity.occurredAt,
           ],
         );
-        return;
-      case 'person.deactivated': {
-        const ownedChannel = this.#database
-          .query('SELECT id FROM channels WHERE owner_id = ? AND purged_at IS NULL LIMIT 1')
-          .get(change.personId);
-        if (ownedChannel) {
-          throw new Error('Channel ownership must be transferred before deactivation');
-        }
-        const result = this.#database.run(
-          `UPDATE persons SET deactivated_at = ?
-           WHERE id = ? AND deactivated_at IS NULL`,
-          [change.deactivatedAt, change.personId],
-        );
-        if (result.changes !== 1) throw new Error('Person is already deactivated');
-        return;
+        continue;
       }
-      case 'channel.created':
-        this.#database.run(
-          `INSERT INTO channels
-           (id, type_id, type_version, title, owner_id, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)`,
-          [
-            change.channel.id,
-            change.channel.typeId,
-            change.channel.typeVersion,
-            change.channel.title,
-            change.channel.ownerId,
-            change.channel.createdAt,
-            change.channel.updatedAt,
-          ],
-        );
-        return;
-      case 'channel.deleted': {
-        const result = this.#database.run(
-          `UPDATE channels SET deleted_at = ?, deleted_by = ?, updated_at = ?
-           WHERE id = ? AND owner_id = ? AND deleted_at IS NULL AND purged_at IS NULL`,
-          [
-            change.deletedAt,
-            change.actorId,
-            change.deletedAt,
-            change.channelId,
-            change.actorId,
-          ],
-        );
-        if (result.changes !== 1) throw new Error('Channel cannot be deleted');
-        return;
-      }
-      case 'channel.restored': {
-        const result = this.#database.run(
-          `UPDATE channels
-           SET deleted_at = NULL, deleted_by = NULL, updated_at = ?
-           WHERE id = ? AND owner_id = ? AND deleted_at IS NOT NULL AND purged_at IS NULL`,
-          [change.restoredAt, change.channelId, change.actorId],
-        );
-        if (result.changes !== 1) throw new Error('Channel cannot be restored');
-        return;
-      }
-      case 'channel.purged': {
-        const channel = this.#database
-          .query(
-            `SELECT owner_id FROM channels
-             WHERE id = ? AND deleted_at IS NOT NULL AND purged_at IS NULL`,
-          )
-          .get(change.channelId) as { owner_id: string } | null;
-        if (channel?.owner_id !== change.actorId) throw new Error('Channel cannot be purged');
-        this.#database.run('DELETE FROM channel_group_entries WHERE channel_id = ?', [
-          change.channelId,
-        ]);
-        this.#database.run('DELETE FROM channel_navigation WHERE channel_id = ?', [
-          change.channelId,
-        ]);
-        this.#database.run('DELETE FROM table_settings WHERE channel_id = ?', [
-          change.channelId,
-        ]);
-        this.#database.run('DELETE FROM table_views WHERE channel_id = ?', [change.channelId]);
-        this.#database.run('DELETE FROM chart_definitions WHERE channel_id = ?', [
-          change.channelId,
-        ]);
-        this.#database.run('DELETE FROM dictionary_entries WHERE channel_id = ?', [
-          change.channelId,
-        ]);
-        this.#database.run('DELETE FROM table_records WHERE channel_id = ?', [
-          change.channelId,
-        ]);
-        this.#database.run('DELETE FROM table_fields WHERE channel_id = ?', [change.channelId]);
-        this.#database.run(
-          `DELETE FROM message_revisions
-           WHERE message_id IN (SELECT id FROM messages WHERE channel_id = ?)`,
-          [change.channelId],
-        );
-        this.#database.run('DELETE FROM messages WHERE channel_id = ?', [change.channelId]);
-        this.#database.run('DELETE FROM channel_invitations WHERE channel_id = ?', [
-          change.channelId,
-        ]);
-        this.#database.run('DELETE FROM subscription_events WHERE channel_id = ?', [
-          change.channelId,
-        ]);
-        this.#database.run('DELETE FROM channel_activities WHERE channel_id = ?', [
-          change.channelId,
-        ]);
-        this.#database.run('DELETE FROM operations WHERE channel_id = ?', [change.channelId]);
-        this.#database.run('DELETE FROM channel_memberships WHERE channel_id = ?', [
-          change.channelId,
-        ]);
-        this.#database.run(
-          `UPDATE channels
-           SET title = '[purged]', purged_at = ?, purged_by = ?, updated_at = ?
-           WHERE id = ?`,
-          [change.purgedAt, change.actorId, change.purgedAt, change.channelId],
-        );
-        return;
-      }
-      case 'membership.granted':
-        if (change.membership.role === 'owner') {
-          const channel = this.#database
-            .query('SELECT owner_id FROM channels WHERE id = ?')
-            .get(change.membership.channelId) as { owner_id: string } | null;
-          if (channel?.owner_id !== change.membership.personId) {
-            throw new Error('Ownership requires an ownership transfer');
-          }
-        } else {
-          const channel = this.#database
-            .query('SELECT owner_id FROM channels WHERE id = ?')
-            .get(change.membership.channelId) as { owner_id: string } | null;
-          if (channel?.owner_id === change.membership.personId) {
-            throw new Error('Channel Owner cannot receive a non-owner role');
-          }
-        }
-        this.#database.run(
-          `INSERT INTO channel_memberships (channel_id, person_id, role)
-           VALUES (?, ?, ?)
-           ON CONFLICT(channel_id, person_id) DO UPDATE SET role = excluded.role`,
-          [change.membership.channelId, change.membership.personId, change.membership.role],
-        );
-        return;
-      case 'membership.reverted': {
-        if (change.expectedRole === 'owner') {
-          throw new Error('Channel Owner membership cannot be reverted');
-        }
-        const result = change.restoredRole
-          ? this.#database.run(
-              `UPDATE channel_memberships
-               SET role = ?
-               WHERE channel_id = ? AND person_id = ? AND role = ?`,
-              [change.restoredRole, change.channelId, change.personId, change.expectedRole],
-            )
-          : this.#database.run(
-              `DELETE FROM channel_memberships
-               WHERE channel_id = ? AND person_id = ? AND role = ?`,
-              [change.channelId, change.personId, change.expectedRole],
-            );
-        if (result.changes !== 1) throw new Error('Membership changed after original Operation');
-        return;
-      }
-      case 'membership.left': {
-        const result = this.#database.run(
-          `DELETE FROM channel_memberships
-           WHERE channel_id = ? AND person_id = ? AND role <> 'owner'`,
-          [change.channelId, change.personId],
-        );
-        if (result.changes !== 1) throw new Error('Channel Owner cannot leave');
-        return;
-      }
-      case 'channel.ownership-transferred': {
-        const channelUpdate = this.#database.run(
-          'UPDATE channels SET owner_id = ? WHERE id = ? AND owner_id = ?',
-          [change.nextOwnerId, change.channelId, change.previousOwnerId],
-        );
-        if (channelUpdate.changes !== 1) throw new Error('Channel ownership changed');
-        const oldOwnerUpdate = this.#database.run(
-          `UPDATE channel_memberships SET role = 'admin'
-           WHERE channel_id = ? AND person_id = ? AND role = 'owner'`,
-          [change.channelId, change.previousOwnerId],
-        );
-        if (oldOwnerUpdate.changes !== 1) throw new Error('Previous Owner membership changed');
-        this.#database.run(
-          `INSERT INTO channel_memberships (channel_id, person_id, role)
-           VALUES (?, ?, 'owner')
-           ON CONFLICT(channel_id, person_id) DO UPDATE SET role = 'owner'`,
-          [change.channelId, change.nextOwnerId],
-        );
-        return;
-      }
-      case 'invitation.created':
-        this.#database.run(
-          `INSERT INTO channel_invitations
-            (id, channel_id, proposed_role, expires_at, created_by, created_at)
-           VALUES (?, ?, ?, ?, ?, ?)`,
-          [
-            change.invitation.id,
-            change.invitation.channelId,
-            change.invitation.proposedRole,
-            change.invitation.expiresAt,
-            change.invitation.createdBy,
-            change.invitation.createdAt,
-          ],
-        );
-        return;
-      case 'invitation.accepted': {
-        const result = this.#database.run(
-          `UPDATE channel_invitations SET accepted_by = ?, accepted_at = ?
-           WHERE id = ? AND accepted_at IS NULL`,
-          [change.acceptedBy, change.acceptedAt, change.invitationId],
-        );
-        if (result.changes !== 1) throw new Error('Invitation is already accepted');
-        return;
-      }
-      case 'channel-group.created':
-        this.#database.run(
-          `INSERT INTO channel_groups (id, person_id, name, position, created_at)
-           VALUES (?, ?, ?, ?, ?)`,
-          [
-            change.group.id,
-            change.group.personId,
-            change.group.name,
-            change.group.position,
-            change.group.createdAt,
-          ],
-        );
-        return;
-      case 'channel-group.updated': {
-        const result = this.#database.run(
-          `UPDATE channel_groups SET name = ?, position = ?
-           WHERE id = ? AND person_id = ?`,
-          [change.group.name, change.group.position, change.group.id, change.group.personId],
-        );
-        if (result.changes !== 1) throw new Error('Channel Group changed');
-        return;
-      }
-      case 'channel-group.entry-set':
-        this.#database.run(
-          `INSERT INTO channel_group_entries (group_id, channel_id, pinned, position)
-           VALUES (?, ?, ?, ?)
-           ON CONFLICT(group_id, channel_id) DO UPDATE SET
-             pinned = excluded.pinned,
-             position = excluded.position`,
-          [
-            change.entry.groupId,
-            change.entry.channelId,
-            change.entry.pinned ? 1 : 0,
-            change.entry.position,
-          ],
-        );
-        return;
-      case 'channel-group.entry-removed': {
-        const result = this.#database.run(
-          'DELETE FROM channel_group_entries WHERE group_id = ? AND channel_id = ?',
-          [change.groupId, change.channelId],
-        );
-        if (result.changes !== 1) throw new Error('Channel is not in Channel Group');
-        return;
-      }
-      case 'channel-navigation.updated':
-        this.#database.run(
-          `INSERT INTO channel_navigation
-            (channel_id, person_id, archived_at, muted, pinned, position, last_read_activity_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT(channel_id, person_id) DO UPDATE SET
-             archived_at = excluded.archived_at,
-             muted = excluded.muted,
-             pinned = excluded.pinned,
-             position = excluded.position,
-             last_read_activity_id = excluded.last_read_activity_id`,
-          [
-            change.navigation.channelId,
-            change.navigation.personId,
-            change.navigation.archivedAt ?? null,
-            change.navigation.muted ? 1 : 0,
-            change.navigation.pinned ? 1 : 0,
-            change.navigation.position,
-            change.navigation.lastReadActivityId ?? null,
-          ],
-        );
-        return;
-      case 'dictionary.entry-created':
-        this.#database.run(
-          `INSERT INTO dictionary_entries
-            (id, channel_id, label, normalized_label, created_by, created_at)
-           VALUES (?, ?, ?, ?, ?, ?)`,
-          [
-            change.entry.id,
-            change.entry.channelId,
-            change.entry.label,
-            change.entry.normalizedLabel,
-            change.entry.createdBy,
-            change.entry.createdAt,
-          ],
-        );
-        return;
-      case 'dictionary.entry-renamed': {
-        const result = this.#database.run(
-          `UPDATE dictionary_entries
-           SET label = ?, normalized_label = ?, updated_at = ?
-           WHERE id = ?`,
-          [change.label, change.normalizedLabel, change.updatedAt, change.entryId],
-        );
-        if (result.changes !== 1) throw new Error('Dictionary Entry is unavailable');
-        return;
-      }
-      case 'dictionary.entry-retired': {
-        const result = this.#database.run(
-          `UPDATE dictionary_entries
-           SET retired_at = ?, retired_by = ?, updated_at = ?
-           WHERE id = ? AND retired_at IS NULL`,
-          [change.retiredAt, change.actorId, change.retiredAt, change.entryId],
-        );
-        if (result.changes !== 1) throw new Error('Dictionary Entry is already retired');
-        return;
-      }
-      case 'dictionary.entry-restored': {
-        const result = this.#database.run(
-          `UPDATE dictionary_entries
-           SET retired_at = NULL, retired_by = NULL, updated_at = ?
-           WHERE id = ? AND retired_at IS NOT NULL`,
-          [change.restoredAt, change.entryId],
-        );
-        if (result.changes !== 1) throw new Error('Dictionary Entry is not retired');
-        return;
-      }
-      case 'table.field-added':
-        this.#database.run(
-          `INSERT INTO table_fields
-             (id, channel_id, key, label, type, required, unique_value, default_json, version,
-              tombstoned_at, tombstoned_by, target_channel_id, cardinality)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          [
-            change.field.id,
-            change.field.channelId,
-            change.field.key,
-            change.field.label,
-            change.field.type,
-            change.field.required ? 1 : 0,
-            change.field.unique ? 1 : 0,
-            change.field.defaultValue === undefined
-              ? null
-              : JSON.stringify(change.field.defaultValue),
-            change.field.version,
-            change.field.tombstonedAt ?? null,
-            change.field.tombstonedBy ?? null,
-            change.field.targetChannelId ?? null,
-            change.field.cardinality ?? null,
-          ],
-        );
-        return;
-      case 'table.field-updated': {
-        const result = this.#database.run(
-           `UPDATE table_fields
-           SET label = ?, type = ?, required = ?, unique_value = ?, default_json = ?,
-               version = ?, tombstoned_at = ?, tombstoned_by = ?, target_channel_id = ?,
-               cardinality = ?
-           WHERE id = ? AND version = ?`,
-          [
-            change.field.label,
-            change.field.type,
-            change.field.required ? 1 : 0,
-            change.field.unique ? 1 : 0,
-            change.field.defaultValue === undefined
-              ? null
-              : JSON.stringify(change.field.defaultValue),
-            change.field.version,
-            change.field.tombstonedAt ?? null,
-            change.field.tombstonedBy ?? null,
-            change.field.targetChannelId ?? null,
-            change.field.cardinality ?? null,
-            change.field.id,
-            change.expectedVersion,
-          ],
-        );
-        if (result.changes !== 1) throw new Error('Table Field changed after observation');
-        return;
-      }
-      case 'table.field-purged': {
-        const result = this.#database.run(
-          `DELETE FROM table_fields
-           WHERE id = ? AND channel_id = ? AND version = ? AND tombstoned_at IS NOT NULL`,
-          [change.fieldId, change.channelId, change.expectedVersion],
-        );
-        if (result.changes !== 1) throw new Error('Table Field changed after observation');
-        const rows = this.#database
-          .query(
-            'SELECT id, values_json, field_versions_json FROM table_records WHERE channel_id = ?',
-          )
-          .all(change.channelId) as Array<{
-          field_versions_json: string;
-          id: string;
-          values_json: string;
-        }>;
-        const update = this.#database.prepare(
-          'UPDATE table_records SET values_json = ?, field_versions_json = ? WHERE id = ?',
-        );
-        for (const row of rows) {
-          const values = JSON.parse(row.values_json) as Record<string, JsonValue>;
-          const versions = JSON.parse(row.field_versions_json) as Record<string, number>;
-          delete values[change.fieldKey];
-          delete versions[change.fieldKey];
-          update.run(JSON.stringify(values), JSON.stringify(versions), row.id);
-        }
-        const operationRows = this.#database
-          .query('SELECT id, changes_json FROM operations WHERE channel_id = ?')
-          .all(change.channelId) as Array<{ changes_json: string; id: string }>;
-        const updateOperation = this.#database.prepare(
-          'UPDATE operations SET changes_json = ? WHERE id = ?',
-        );
-        for (const operationRow of operationRows) {
-          const changes = JSON.parse(operationRow.changes_json) as Array<Record<string, unknown>>;
-          for (const historical of changes) {
-            if (historical.kind === 'table.record-created') {
-              const record = historical.record as {
-                fieldVersions?: Record<string, number>;
-                values: Record<string, JsonValue>;
-              };
-              delete record.values[change.fieldKey];
-              if (record.fieldVersions) delete record.fieldVersions[change.fieldKey];
-            }
-            if (historical.kind === 'table.record-updated') {
-              const values = historical.values as Record<string, JsonValue>;
-              delete values[change.fieldKey];
-              if (Array.isArray(historical.previousValues)) {
-                historical.previousValues = historical.previousValues.filter(
-                  (entry) => (entry as { key?: unknown }).key !== change.fieldKey,
-                );
-              }
-            }
-          }
-          updateOperation.run(JSON.stringify(changes), operationRow.id);
-        }
-        return;
-      }
-      case 'table.display-field-set':
-        this.#database.run(
-          `INSERT INTO table_settings (channel_id, display_field_id) VALUES (?, ?)
-           ON CONFLICT(channel_id) DO UPDATE SET display_field_id = excluded.display_field_id`,
-          [change.channelId, change.displayFieldId ?? null],
-        );
-        return;
-      case 'table.record-created':
-        this.#database.run(
-          `INSERT INTO table_records
-            (id, channel_id, values_json, field_versions_json, created_by, created_at)
-           VALUES (?, ?, ?, ?, ?, ?)`,
-          [
-            change.record.id,
-            change.record.channelId,
-            JSON.stringify(change.record.values),
-            JSON.stringify(change.record.fieldVersions),
-            change.record.createdBy,
-            change.record.createdAt,
-          ],
-        );
-        return;
-      case 'table.record-updated': {
-        const next = reduced.tableRecords.find((record) => record.id === change.recordId)!;
-        const result = this.#database.run(
-          `UPDATE table_records
-           SET values_json = ?, field_versions_json = ?, updated_at = ? WHERE id = ?`,
-          [
-            JSON.stringify(next.values),
-            JSON.stringify(next.fieldVersions),
-            change.updatedAt,
-            change.recordId,
-          ],
-        );
-        if (result.changes !== 1) throw new Error('Table Record is unavailable');
-        return;
-      }
-      case 'table.record-tombstoned': {
-        const result =
-          change.expectedUpdatedAt === undefined
-            ? this.#database.run(
-                `UPDATE table_records SET tombstoned_at = ?, tombstoned_by = ?, updated_at = ?
-                 WHERE id = ? AND tombstoned_at IS NULL`,
-                [change.tombstonedAt, change.actorId, change.tombstonedAt, change.recordId],
-              )
-            : change.expectedUpdatedAt === null
-              ? this.#database.run(
-                  `UPDATE table_records SET tombstoned_at = ?, tombstoned_by = ?, updated_at = ?
-                   WHERE id = ? AND tombstoned_at IS NULL AND updated_at IS NULL`,
-                  [change.tombstonedAt, change.actorId, change.tombstonedAt, change.recordId],
-                )
-              : this.#database.run(
-                  `UPDATE table_records SET tombstoned_at = ?, tombstoned_by = ?, updated_at = ?
-                   WHERE id = ? AND tombstoned_at IS NULL AND updated_at = ?`,
-                  [
-                    change.tombstonedAt,
-                    change.actorId,
-                    change.tombstonedAt,
-                    change.recordId,
-                    change.expectedUpdatedAt,
-                  ],
-                );
-        if (result.changes !== 1) throw new Error('Table Record is already tombstoned');
-        return;
-      }
-      case 'table.record-restored': {
-        const result =
-          change.expectedTombstonedAt === undefined
-            ? this.#database.run(
-                `UPDATE table_records
-               SET tombstoned_at = NULL, tombstoned_by = NULL, updated_at = ?
-               WHERE id = ? AND tombstoned_at IS NOT NULL`,
-                [change.restoredAt, change.recordId],
-              )
-            : this.#database.run(
-                `UPDATE table_records
-               SET tombstoned_at = NULL, tombstoned_by = NULL, updated_at = ?
-               WHERE id = ? AND tombstoned_at = ?`,
-                [change.restoredAt, change.recordId, change.expectedTombstonedAt],
-              );
-        if (result.changes !== 1) throw new Error('Table Record is not tombstoned');
-        return;
-      }
-      case 'table.view-saved':
-        this.#database.run(
-          `INSERT INTO table_views
-            (id, channel_id, name, visibility, owner_id, definition_json, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT(id) DO UPDATE SET
-             name = excluded.name,
-             visibility = excluded.visibility,
-             definition_json = excluded.definition_json`,
-          [
-            change.view.id,
-            change.view.channelId,
-            change.view.name,
-            change.view.visibility,
-            change.view.ownerId,
-            JSON.stringify({
-              filters: change.view.filters,
-              grouping: change.view.grouping,
-              sorting: change.view.sorting,
-              visibleFieldIds: change.view.visibleFieldIds,
-            }),
-            change.view.createdAt,
-          ],
-        );
-        return;
-      case 'chart.definition-set': {
-        const serialized = JSON.stringify({
-          aggregations: change.definition.aggregations,
-          filters: change.definition.filters,
-          grouping: change.definition.grouping,
-          presentation: change.definition.presentation,
-        });
-        if (change.expectedVersion === undefined) {
-          this.#database.run(
-            `INSERT INTO chart_definitions
-              (channel_id, source_channel_id, definition_json, version)
-             VALUES (?, ?, ?, ?)`,
-            [
-              change.definition.channelId,
-              change.definition.sourceChannelId,
-              serialized,
-              change.definition.version,
-            ],
-          );
-          return;
-        }
-        const result = this.#database.run(
-          `UPDATE chart_definitions
-           SET source_channel_id = ?, definition_json = ?, version = ?
-           WHERE channel_id = ? AND version = ?`,
-          [
-            change.definition.sourceChannelId,
-            serialized,
-            change.definition.version,
-            change.definition.channelId,
-            change.expectedVersion,
-          ],
-        );
-        if (result.changes !== 1) throw new Error('Chart definition changed after observation');
-        return;
-      }
-      case 'discussion.message-posted':
-        this.#database.run(
-          `INSERT INTO messages
-            (id, channel_id, author_id, text, record_references_json, reply_to_message_id,
-             created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)`,
-          [
-            change.message.id,
-            change.message.channelId,
-            change.message.authorId,
-            change.message.text,
-            JSON.stringify(change.message.recordReferences),
-            change.message.replyToMessageId ?? null,
-            change.message.createdAt,
-          ],
-        );
+      this.#database.run(
+        `INSERT INTO subscription_events
+          (position, id, event_type, operation_id, activity_id, channel_id, actor_id, occurred_at)
+         VALUES (?, ?, 'operation-result', ?, NULL, ?, ?, ?)`,
+        [
+          event.position,
+          event.id,
+          event.operationId,
+          event.channelId ?? null,
+          event.actorId,
+          event.occurredAt,
+        ],
+      );
+    }
+
+    for (const navigation of state.navigation) {
+      this.#database.run(
+        `INSERT INTO channel_navigation
+          (channel_id, person_id, archived_at, muted, pinned, position, last_read_activity_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [
+          navigation.channelId,
+          navigation.personId,
+          navigation.archivedAt ?? null,
+          navigation.muted ? 1 : 0,
+          navigation.pinned ? 1 : 0,
+          navigation.position,
+          navigation.lastReadActivityId ?? null,
+        ],
+      );
+    }
+
+    for (const group of state.channelGroups) {
+      this.#database.run(
+        `INSERT INTO channel_groups (id, person_id, name, position, created_at)
+         VALUES (?, ?, ?, ?, ?)`,
+        [group.id, group.personId, group.name, group.position, group.createdAt],
+      );
+    }
+
+    for (const entry of state.channelGroupEntries) {
+      this.#database.run(
+        `INSERT INTO channel_group_entries (group_id, channel_id, pinned, position)
+         VALUES (?, ?, ?, ?)`,
+        [entry.groupId, entry.channelId, entry.pinned ? 1 : 0, entry.position],
+      );
+    }
+
+    for (const field of state.tableFields) {
+      this.#database.run(
+        `INSERT INTO table_fields
+          (id, channel_id, key, label, type, required, unique_value, default_json,
+           target_channel_id, cardinality, version, tombstoned_at, tombstoned_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          field.id,
+          field.channelId,
+          field.key,
+          field.label,
+          field.type,
+          field.required ? 1 : 0,
+          field.unique ? 1 : 0,
+          field.defaultValue === undefined
+            ? null
+            : JSON.stringify(field.defaultValue),
+          field.targetChannelId ?? null,
+          field.cardinality ?? null,
+          field.version,
+          field.tombstonedAt ?? null,
+          field.tombstonedBy ?? null,
+        ],
+      );
+    }
+
+    for (const entry of state.dictionaryEntries) {
+      this.#database.run(
+        `INSERT INTO dictionary_entries
+          (id, channel_id, label, normalized_label, created_by, created_at,
+           updated_at, retired_at, retired_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          entry.id,
+          entry.channelId,
+          entry.label,
+          entry.normalizedLabel,
+          entry.createdBy,
+          entry.createdAt,
+          entry.updatedAt ?? null,
+          entry.retiredAt ?? null,
+          entry.retiredBy ?? null,
+        ],
+      );
+    }
+
+    for (const record of state.tableRecords) {
+      this.#database.run(
+        `INSERT INTO table_records
+          (id, channel_id, values_json, field_versions_json, created_by, created_at,
+           updated_at, tombstoned_at, tombstoned_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          record.id,
+          record.channelId,
+          JSON.stringify(record.values),
+          JSON.stringify(record.fieldVersions),
+          record.createdBy,
+          record.createdAt,
+          record.updatedAt ?? null,
+          record.tombstonedAt ?? null,
+          record.tombstonedBy ?? null,
+        ],
+      );
+    }
+
+    for (const setting of state.tableDisplayFields) {
+      this.#database.run(
+        `INSERT INTO table_settings (channel_id, display_field_id) VALUES (?, ?)`,
+        [setting.channelId, setting.displayFieldId ?? null],
+      );
+    }
+
+    for (const view of state.tableViews) {
+      this.#database.run(
+        `INSERT INTO table_views
+          (id, channel_id, name, visibility, owner_id, definition_json, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [
+          view.id,
+          view.channelId,
+          view.name,
+          view.visibility,
+          view.ownerId,
+          JSON.stringify({
+            filters: view.filters,
+            grouping: view.grouping,
+            sorting: view.sorting,
+            visibleFieldIds: view.visibleFieldIds,
+          }),
+          view.createdAt,
+        ],
+      );
+    }
+
+    for (const definition of state.chartDefinitions) {
+      this.#database.run(
+        `INSERT INTO chart_definitions
+          (channel_id, source_channel_id, definition_json, version)
+         VALUES (?, ?, ?, ?)`,
+        [
+          definition.channelId,
+          definition.sourceChannelId,
+          JSON.stringify({
+            aggregations: definition.aggregations,
+            filters: definition.filters,
+            grouping: definition.grouping,
+            presentation: definition.presentation,
+          }),
+          definition.version,
+        ],
+      );
+    }
+
+    const pendingMessages = [...state.messages];
+    const persistedMessageIds = new Set<string>();
+    while (pendingMessages.length > 0) {
+      const index = pendingMessages.findIndex(
+        (message) =>
+          message.replyToMessageId === undefined ||
+          persistedMessageIds.has(message.replyToMessageId),
+      );
+      if (index === -1) throw new Error('Message reply target is unavailable');
+      const [message] = pendingMessages.splice(index, 1);
+      this.#database.run(
+        `INSERT INTO messages
+          (id, channel_id, author_id, text, record_references_json, reply_to_message_id,
+           created_at, tombstoned_at, tombstoned_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          message!.id,
+          message!.channelId,
+          message!.authorId,
+          message!.text,
+          JSON.stringify(message!.recordReferences),
+          message!.replyToMessageId ?? null,
+          message!.createdAt,
+          message!.tombstonedAt ?? null,
+          message!.tombstonedBy ?? null,
+        ],
+      );
+      persistedMessageIds.add(message!.id);
+    }
+
+    for (const message of state.messages) {
+      for (const revision of message.revisions) {
         this.#database.run(
           `INSERT INTO message_revisions (id, message_id, editor_id, text, created_at)
            VALUES (?, ?, ?, ?, ?)`,
           [
-            change.message.revisions[0]!.id,
-            change.message.id,
-            change.message.revisions[0]!.editorId,
-            change.message.revisions[0]!.text,
-            change.message.revisions[0]!.createdAt,
+            revision.id,
+            message.id,
+            revision.editorId,
+            revision.text,
+            revision.createdAt,
           ],
         );
-        return;
-      case 'discussion.message-edited': {
-        const result = this.#database.run(
-          'UPDATE messages SET text = ? WHERE id = ? AND tombstoned_at IS NULL',
-          [change.revision.text, change.messageId],
-        );
-        if (result.changes !== 1) throw new Error('Message cannot be edited');
-        this.#database.run(
-          `INSERT INTO message_revisions (id, message_id, editor_id, text, created_at)
-           VALUES (?, ?, ?, ?, ?)`,
-          [
-            change.revision.id,
-            change.messageId,
-            change.revision.editorId,
-            change.revision.text,
-            change.revision.createdAt,
-          ],
-        );
-        return;
       }
-      case 'discussion.message-tombstoned': {
-        const result = this.#database.run(
-          `UPDATE messages SET tombstoned_at = ?, tombstoned_by = ?
-           WHERE id = ? AND tombstoned_at IS NULL`,
-          [change.tombstonedAt, change.actorId, change.messageId],
-        );
-        if (result.changes !== 1) throw new Error('Message is already tombstoned');
-        return;
-      }
-      case 'discussion.message-restored': {
-        const result = this.#database.run(
-          `UPDATE messages SET tombstoned_at = NULL, tombstoned_by = NULL
-           WHERE id = ? AND tombstoned_at IS NOT NULL`,
-          [change.messageId],
-        );
-        if (result.changes !== 1) throw new Error('Message is not tombstoned');
-        return;
-      }
-      case 'activity.appended':
-        this.#database.run(
-          `INSERT INTO channel_activities
-            (id, channel_id, operation_id, kind, actor_id, occurred_at)
-           VALUES (?, ?, ?, ?, ?, ?)`,
-          [
-            change.activity.id,
-            change.activity.channelId,
-            change.activity.operationId,
-            change.activity.kind,
-            change.activity.actorId,
-            change.activity.occurredAt,
-          ],
-        );
-        this.#database.run('UPDATE channels SET updated_at = ? WHERE id = ?', [
-          change.activity.occurredAt,
-          change.activity.channelId,
-        ]);
-        this.#database.run(
-          `UPDATE channel_navigation SET archived_at = NULL
-           WHERE channel_id = ? AND archived_at IS NOT NULL AND muted = 0`,
-          [change.activity.channelId],
-        );
-        return;
     }
   }
-
   async close(): Promise<void> {
     this.#database.close(false);
   }

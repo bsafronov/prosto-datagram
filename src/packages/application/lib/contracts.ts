@@ -77,14 +77,20 @@ class DefinitionRegistry<
     }
   }
 
-  list(): readonly TDefinition[] {
-    return [...this.#definitions.values()];
+  list(resolveSchema?: (name: string) => z.ZodType | null | undefined): readonly TDefinition[] {
+    return [...this.#definitions.values()].flatMap((definition) => {
+      const inputSchema = resolveSchema?.(definition.name);
+      if (inputSchema === null) return [];
+      return inputSchema === undefined ? [definition] : [{ ...definition, inputSchema }];
+    });
   }
 
-  catalog(resolveSchema?: (name: string) => z.ZodType | undefined): readonly ContractDefinition[] {
-    return this.list().map(({ description, inputSchema, name }) => ({
+  catalog(
+    resolveSchema?: (name: string) => z.ZodType | null | undefined,
+  ): readonly ContractDefinition[] {
+    return this.list(resolveSchema).map(({ description, inputSchema, name }) => ({
       description,
-      inputSchema: z.toJSONSchema(resolveSchema?.(name) ?? inputSchema, { unrepresentable: 'any' }),
+      inputSchema: z.toJSONSchema(inputSchema, { unrepresentable: 'any' }),
       name,
     }));
   }
@@ -99,22 +105,33 @@ class DefinitionRegistry<
 export class ActionRegistry {
   readonly #registry: DefinitionRegistry<ActionDefinition>;
   readonly #schemaResolver: ContractSchemaResolver | undefined;
+  readonly #channelContractNames: ReadonlySet<string>;
 
-  constructor(definitions: readonly ActionDefinition[], schemaResolver?: ContractSchemaResolver) {
+  constructor(
+    definitions: readonly ActionDefinition[],
+    schemaResolver?: ContractSchemaResolver,
+    channelContractNames: ReadonlySet<string> = new Set(),
+  ) {
     this.#registry = new DefinitionRegistry(definitions, 'action.duplicate');
     this.#schemaResolver = schemaResolver;
+    this.#channelContractNames = channelContractNames;
   }
 
-  list(): readonly ActionDefinition[] {
-    return this.#registry.list();
+  list(selector?: ChannelTypeContractSelector): readonly ActionDefinition[] {
+    return this.#registry.list(this.#selectedSchemaResolver(selector));
   }
 
   catalog(selector?: ChannelTypeContractSelector): readonly ContractDefinition[] {
-    return this.#registry.catalog(
-      selector && this.#schemaResolver
-        ? (name) => this.#schemaResolver!(selector, name)
-        : undefined,
-    );
+    return this.#registry.catalog(this.#selectedSchemaResolver(selector));
+  }
+
+  #selectedSchemaResolver(
+    selector?: ChannelTypeContractSelector,
+  ): ((name: string) => z.ZodType | null | undefined) | undefined {
+    if (!selector || !this.#schemaResolver) return undefined;
+    return (name) =>
+      this.#schemaResolver!(selector, name) ??
+      (this.#channelContractNames.has(name) ? null : undefined);
   }
 
   async execute(
@@ -131,22 +148,33 @@ export class ActionRegistry {
 export class QueryRegistry {
   readonly #registry: DefinitionRegistry<QueryDefinition>;
   readonly #schemaResolver: ContractSchemaResolver | undefined;
+  readonly #channelContractNames: ReadonlySet<string>;
 
-  constructor(definitions: readonly QueryDefinition[], schemaResolver?: ContractSchemaResolver) {
+  constructor(
+    definitions: readonly QueryDefinition[],
+    schemaResolver?: ContractSchemaResolver,
+    channelContractNames: ReadonlySet<string> = new Set(),
+  ) {
     this.#registry = new DefinitionRegistry(definitions, 'query.duplicate');
     this.#schemaResolver = schemaResolver;
+    this.#channelContractNames = channelContractNames;
   }
 
-  list(): readonly QueryDefinition[] {
-    return this.#registry.list();
+  list(selector?: ChannelTypeContractSelector): readonly QueryDefinition[] {
+    return this.#registry.list(this.#selectedSchemaResolver(selector));
   }
 
   catalog(selector?: ChannelTypeContractSelector): readonly ContractDefinition[] {
-    return this.#registry.catalog(
-      selector && this.#schemaResolver
-        ? (name) => this.#schemaResolver!(selector, name)
-        : undefined,
-    );
+    return this.#registry.catalog(this.#selectedSchemaResolver(selector));
+  }
+
+  #selectedSchemaResolver(
+    selector?: ChannelTypeContractSelector,
+  ): ((name: string) => z.ZodType | null | undefined) | undefined {
+    if (!selector || !this.#schemaResolver) return undefined;
+    return (name) =>
+      this.#schemaResolver!(selector, name) ??
+      (this.#channelContractNames.has(name) ? null : undefined);
   }
 
   async execute(

@@ -1,6 +1,6 @@
 import * as z from 'zod/v4';
 
-import { channelIdSchema, contract } from './contract';
+import { channelIdSchema, contract, produceOwnedView } from './contract';
 
 export const discussionActions = [
   contract('discussion.message.post', z.object({
@@ -45,5 +45,6 @@ export const discussionQueries = [
 export const discussionView = {
   commands: discussionActions.map((candidate) => candidate.name),
   kind: 'discussion',
+  produce: produceOwnedView,
   query: 'discussion.messages.list',
 };

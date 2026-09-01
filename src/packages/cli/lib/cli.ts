@@ -1,13 +1,14 @@
 import { DatagramError, toPublicError } from '../../application/errors';
+import type { ChannelTypeContractSelector } from '../../application/contracts';
 import { createRuntime } from '../../runtime';
 import { startHttpServer } from '../../server';
 
 export const cliUsage = `Usage:
   datagram init [--db PATH]
-  datagram actions|queries [--db PATH]
-  datagram action NAME [--input JSON] [--actor ID] [--db PATH]
-  datagram query NAME [--input JSON] [--actor ID] [--db PATH]
-  datagram agent-query NAME [--input JSON] [--actor ID] [--db PATH]
+  datagram actions|queries [--type-id ID --type-version VERSION] [--db PATH]
+  datagram action NAME [--type-id ID --type-version VERSION] [--input JSON] [--actor ID] [--db PATH]
+  datagram query NAME [--type-id ID --type-version VERSION] [--input JSON] [--actor ID] [--db PATH]
+  datagram agent-query NAME [--type-id ID --type-version VERSION] [--input JSON] [--actor ID] [--db PATH]
   datagram serve [--port NUMBER] [--db PATH]
 `;
 
@@ -29,6 +30,19 @@ function input(args: readonly string[]): unknown {
   } catch {
     throw new DatagramError('json.invalid', 'Invalid JSON input', 400);
   }
+}
+
+function channelType(args: readonly string[]): ChannelTypeContractSelector | undefined {
+  const typeId = option(args, '--type-id');
+  const typeVersion = option(args, '--type-version');
+  if ((typeId === undefined) !== (typeVersion === undefined)) {
+    throw new DatagramError(
+      'input.invalid',
+      '--type-id and --type-version must be provided together',
+      400,
+    );
+  }
+  return typeId === undefined || typeVersion === undefined ? undefined : { typeId, typeVersion };
 }
 
 function output(value: unknown): void {
@@ -73,6 +87,7 @@ export async function runCli(args: readonly string[]): Promise<void> {
   });
   try {
     const actorId = option(args, '--actor') ?? process.env.DATAGRAM_ACTOR_ID ?? runtime.owner.id;
+    const selector = channelType(args);
     switch (command) {
       case 'init':
         output({
@@ -81,41 +96,41 @@ export async function runCli(args: readonly string[]): Promise<void> {
         });
         break;
       case 'actions':
-        output(runtime.app.actions.catalog());
+        output(runtime.app.actions.catalog(selector));
         break;
       case 'queries':
-        output(runtime.app.queries.catalog());
+        output(runtime.app.queries.catalog(selector));
         break;
-      case 'action':
+      case 'action': {
+        const name = required(args[1], 'Action name is required');
+        if (selector && !runtime.app.actions.list(selector).some((value) => value.name === name)) {
+          throw new DatagramError('action.unknown', `Unknown definition: ${name}`, 404);
+        }
         output(
-          await runtime.app.executeAction(
-            actorId,
-            'cli',
-            required(args[1], 'Action name is required'),
-            input(args),
-          ),
+          await runtime.app.executeAction(actorId, 'cli', name, input(args)),
         );
         break;
-      case 'query':
+      }
+      case 'query': {
+        const name = required(args[1], 'Query name is required');
+        if (selector && !runtime.app.queries.list(selector).some((value) => value.name === name)) {
+          throw new DatagramError('query.unknown', `Unknown definition: ${name}`, 404);
+        }
         output(
-          await runtime.app.executeQuery(
-            actorId,
-            'cli',
-            required(args[1], 'Query name is required'),
-            input(args),
-          ),
+          await runtime.app.executeQuery(actorId, 'cli', name, input(args)),
         );
         break;
-      case 'agent-query':
+      }
+      case 'agent-query': {
+        const name = required(args[1], 'Query name is required');
+        if (selector && !runtime.app.queries.list(selector).some((value) => value.name === name)) {
+          throw new DatagramError('query.unknown', `Unknown definition: ${name}`, 404);
+        }
         output(
-          await runtime.app.prepareQuery(
-            actorId,
-            'agent',
-            required(args[1], 'Query name is required'),
-            input(args),
-          ),
+          await runtime.app.prepareQuery(actorId, 'agent', name, input(args)),
         );
         break;
+      }
       default:
         throw new DatagramError('cli.command-unknown', 'Unknown command', 400);
     }

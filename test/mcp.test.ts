@@ -69,11 +69,12 @@ class McpTestClient {
   }
 }
 
-async function connect() {
+async function connect(channelType?: { typeId: string; typeVersion: string }) {
   runtime = await createRuntime({ databasePath: ':memory:' });
   server = await createMcpGateway({
     app: runtime.app,
     authenticateIdentity: () => ({ actorId: runtime!.owner.id }),
+    ...(channelType ? { channelType } : {}),
   });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new McpTestClient(clientTransport);
@@ -81,6 +82,20 @@ async function connect() {
   await server.connect(serverTransport);
   return { client, runtime };
 }
+
+test('MCP exposes only core and one exact Channel Type contract set', async () => {
+  const value = await connect({ typeId: 'table', typeVersion: '1.0.0' });
+  await value.client.initialize();
+  const listed = (await value.client.request('tools/list')) as {
+    tools: { name: string }[];
+  };
+  const names = listed.tools.map(({ name }) => name);
+  expect(names).toContain('channel.list');
+  expect(names).toContain('table.record.create');
+  expect(names).toContain('discussion.message.post');
+  expect(names).not.toContain('dictionary.entry.create');
+  expect(names).not.toContain('chart.open');
+});
 
 const call = (client: McpTestClient, name: string, args: Record<string, unknown>) =>
   client.request('tools/call', { arguments: args, name });

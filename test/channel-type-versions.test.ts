@@ -45,6 +45,7 @@ describe('Channel Type version pinning', () => {
       for (const query of definition.queries) {
         expect(definition.views.some((view) => view.query === query.name)).toBeTrue();
       }
+      for (const view of definition.views) expect(typeof view.produce).toBe('function');
     }
   });
 
@@ -66,7 +67,11 @@ describe('Channel Type version pinning', () => {
     const source = z.object({ channelId: z.string(), value: z.string() });
     const registry = new ChannelTypeRegistry([
       {
-        actions: [{ inputSchema: source, name: 'custom.write' }],
+        actions: [{
+          execute: (input, next) => next(input),
+          inputSchema: source,
+          name: 'custom.write',
+        }],
         activityKinds: [],
         id: 'custom',
         queries: [],
@@ -105,6 +110,17 @@ describe('Channel Type version pinning', () => {
                 values: z.record(z.string(), z.unknown()),
               }),
             }
+          : action.name === 'table.display-field.set'
+            ? {
+                ...action,
+                execute: async (
+                  input: { channelId: string; fieldId: string | null },
+                  next: (input: { channelId: string; fieldId: string | null }) => Promise<unknown>,
+                ) => next({
+                  ...input,
+                  fieldId: input.fieldId === 'v2-default' ? null : input.fieldId,
+                }),
+              }
           : action,
       ),
       queries: table.queries.map((query) =>
@@ -129,15 +145,6 @@ describe('Channel Type version pinning', () => {
               contract === 'table.record.create' &&
               (input as { mode?: unknown }).mode !== 'v2'
             ) throw new Error('Table v2 record mode is required');
-          },
-          validateTransition: (operation: Operation) => {
-            if (
-              operation.action === 'table.display-field.set' &&
-              operation.changes.some(
-                (change) =>
-                  change.kind === 'table.display-field-set' && change.displayFieldId === undefined,
-              )
-            ) throw new Error('Table v2 requires a display field');
           },
         },
       ],
@@ -197,6 +204,11 @@ describe('Channel Type version pinning', () => {
     const v2Catalog = app.queries.catalog({ typeId: 'table', typeVersion: '2.0.0' });
     const configuration = (catalog: typeof v1Catalog) =>
       catalog.find((definition) => definition.name === 'table.configuration')!.inputSchema;
+    const v1Names = v1Catalog.map((definition) => definition.name);
+    expect(v1Names).toContain('channel.list');
+    expect(v1Names).toContain('table.records.list');
+    expect(v1Names).not.toContain('dictionary.entries.list');
+    expect(v1Names).not.toContain('chart.open');
     expect(configuration(v1Catalog).required).toEqual(['channelId']);
     expect(configuration(v2Catalog).required).toEqual(['channelId', 'edition']);
     await app.executeQuery(owner.id, 'cli', 'table.configuration', { channelId: 'table-v1' });
@@ -227,16 +239,17 @@ describe('Channel Type version pinning', () => {
       mode: 'v2',
       values: {},
     });
-    await app.executeAction(owner.id, 'cli', 'table.display-field.set', {
-      channelId: 'table-v1',
-      fieldId: null,
-    });
     await expect(
       app.executeAction(owner.id, 'cli', 'table.display-field.set', {
-        channelId: 'table-v2',
-        fieldId: null,
+        channelId: 'table-v1',
+        fieldId: 'v2-default',
       }),
-    ).rejects.toThrow('Table v2 requires a display field');
+    ).rejects.toThrow('Display Field does not exist');
+    await app.executeAction(owner.id, 'cli', 'table.display-field.set', {
+      channelId: 'table-v2',
+      fieldId: 'v2-default',
+    });
+    expect(await store.getTableDisplayFieldId('table-v2')).toBeNull();
   });
 
   test('rejects reads and actions for a Channel pinned to an unavailable version', async () => {

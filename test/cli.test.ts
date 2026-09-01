@@ -40,6 +40,19 @@ test('CLI discovers and invokes shared contracts with trusted Query results', as
   const queries = await cli(['queries', '--db', databasePath]);
   expect(queries.exitCode).toBe(0);
   expect(JSON.parse(queries.stdout)).toEqual(runtime.app.queries.catalog());
+  const pinnedQueries = await cli([
+    'queries',
+    '--type-id',
+    'table',
+    '--type-version',
+    '1.0.0',
+    '--db',
+    databasePath,
+  ]);
+  expect(pinnedQueries.exitCode).toBe(0);
+  expect(JSON.parse(pinnedQueries.stdout)).toEqual(
+    runtime.app.queries.catalog({ typeId: 'table', typeVersion: '1.0.0' }),
+  );
 
   const created = await cli([
     'action',

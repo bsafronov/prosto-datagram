@@ -1,7 +1,13 @@
 import * as z from 'zod/v4';
 
 import type { ChannelTypeDefinition } from '../channel-types';
-import { channelCreateContract, channelIdSchema, contract, stateRule } from './contract';
+import {
+  channelCreateContract,
+  channelIdSchema,
+  contract,
+  produceOwnedView,
+  stateRule,
+} from './contract';
 import { invariant } from '../errors';
 import {
   discussionActions,
@@ -96,9 +102,15 @@ export const dictionaryChannelType = {
         'dictionary.entry.restore',
       ],
       kind: 'dictionary',
+      produce: produceOwnedView,
       query: 'dictionary.entries.list',
     },
     discussionView,
-    { commands: [], kind: 'table', query: 'discussion.message.revisions' },
+    {
+      commands: [],
+      kind: 'table',
+      produce: produceOwnedView,
+      query: 'discussion.message.revisions',
+    },
   ],
 } as const satisfies ChannelTypeDefinition;
