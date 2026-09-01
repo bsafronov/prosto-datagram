@@ -7,6 +7,7 @@ export * from './packages/domain/channel-types';
 export * from './packages/domain/errors';
 export * from './packages/domain/model';
 export * from './packages/http';
+export * from './packages/postgres-store';
 export * from './packages/runtime';
 export * from './packages/server';
 export * from './packages/sqlite-store';
