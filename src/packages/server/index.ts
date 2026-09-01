@@ -1,1 +1,5 @@
-export { startHttpServer, type ServerOptions } from './lib/server';
+export {
+  startHttpServer,
+  type ServerIdentityMode,
+  type ServerOptions,
+} from './lib/server';

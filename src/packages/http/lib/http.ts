@@ -1,13 +1,24 @@
-import { ZodError } from 'zod';
-
 import { resultHandleCompositionSchema } from '../../application';
-import { DatagramError } from '../../application/errors';
+import { DatagramError, toPublicError } from '../../application/errors';
 import type { DatagramApplicationPort } from '../../application/port';
 
 export interface HttpHandlerOptions {
   readonly app: DatagramApplicationPort;
+  readonly verifyIdentity: HttpIdentityVerifier;
+}
+
+export interface DevelopmentHttpHandlerOptions {
+  readonly app: DatagramApplicationPort;
   readonly defaultActorId: string;
 }
+
+export interface VerifiedServiceIdentity {
+  readonly actorId: string;
+}
+
+export type HttpIdentityVerifier = (
+  request: Request,
+) => Promise<VerifiedServiceIdentity | undefined> | VerifiedServiceIdentity | undefined;
 
 function json(value: unknown, status = 200): Response {
   return Response.json(value, {
@@ -18,23 +29,17 @@ function json(value: unknown, status = 200): Response {
 
 async function body(request: Request): Promise<unknown> {
   const text = await request.text();
-  return text === '' ? {} : JSON.parse(text);
+  if (text === '') return {};
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new DatagramError('json.invalid', 'Invalid JSON input', 400);
+  }
 }
 
 function failure(error: unknown): Response {
-  if (error instanceof DatagramError) {
-    return json({ error: { code: error.code, message: error.message } }, error.status);
-  }
-  if (error instanceof ZodError) {
-    return json(
-      { error: { code: 'input.invalid', issues: error.issues, message: 'Invalid input' } },
-      400,
-    );
-  }
-  if (error instanceof SyntaxError) {
-    return json({ error: { code: 'json.invalid', message: 'Invalid JSON body' } }, 400);
-  }
-  return json({ error: { code: 'internal', message: 'Internal server error' } }, 500);
+  const result = toPublicError(error);
+  return json(result.body, result.status);
 }
 
 function eventStream(
@@ -80,23 +85,28 @@ function eventStream(
   );
 }
 
-export function createHttpHandler({ app, defaultActorId }: HttpHandlerOptions) {
-  const catalog = (definitions: readonly { description: string; name: string }[]) =>
-    definitions.map(({ description, name }) => ({ description, name }));
-
-  return async (request: Request): Promise<Response> => {
+function handler(
+  app: DatagramApplicationPort,
+  identityMode: 'development' | 'production',
+  verifyIdentity: HttpIdentityVerifier,
+) {
+  const handle = async (request: Request): Promise<Response> => {
     const url = new URL(request.url);
-    const actorId = request.headers.get('x-datagram-actor') ?? defaultActorId;
 
     try {
       if (request.method === 'GET' && url.pathname === '/health') {
         return json({ status: 'ok' });
       }
+      const identity = await verifyIdentity(request);
+      if (!identity) {
+        throw new DatagramError('identity.unauthenticated', 'Authentication required', 401);
+      }
+      const actorId = identity.actorId;
       if (request.method === 'GET' && url.pathname === '/v1/actions') {
-        return json({ actions: catalog(app.actions.list()) });
+        return json({ actions: app.actions.catalog() });
       }
       if (request.method === 'GET' && url.pathname === '/v1/queries') {
-        return json({ queries: catalog(app.queries.list()) });
+        return json({ queries: app.queries.catalog() });
       }
       if (request.method === 'GET' && url.pathname === '/v1/events') {
         const rawPosition =
@@ -177,4 +187,23 @@ export function createHttpHandler({ app, defaultActorId }: HttpHandlerOptions) {
       return failure(error);
     }
   };
+
+  return async (request: Request): Promise<Response> => {
+    const response = await handle(request);
+    response.headers.set('x-datagram-identity-mode', identityMode);
+    return response;
+  };
+}
+
+export function createHttpHandler({ app, verifyIdentity }: HttpHandlerOptions) {
+  return handler(app, 'production', verifyIdentity);
+}
+
+export function createDevelopmentHttpHandler({
+  app,
+  defaultActorId,
+}: DevelopmentHttpHandlerOptions) {
+  return handler(app, 'development', (request) => ({
+    actorId: request.headers.get('x-datagram-development-actor') ?? defaultActorId,
+  }));
 }

@@ -27,6 +27,12 @@ export interface QueryDefinition {
   readonly run: (context: ExecutionContext, input: unknown) => Promise<QueryResult>;
 }
 
+export interface ContractDefinition {
+  readonly description: string;
+  readonly inputSchema: z.core.JSONSchema.BaseSchema;
+  readonly name: string;
+}
+
 export const defineAction = <TInput>(definition: {
   readonly description: string;
   readonly inputSchema: z.ZodType<TInput>;
@@ -47,7 +53,9 @@ export const defineQuery = <TInput>(definition: {
   run: (context, input) => definition.run(context, input as TInput),
 });
 
-class DefinitionRegistry<TDefinition extends { inputSchema: z.ZodType; name: string }> {
+class DefinitionRegistry<
+  TDefinition extends { description: string; inputSchema: z.ZodType; name: string },
+> {
   readonly #definitions = new Map<string, TDefinition>();
 
   constructor(definitions: readonly TDefinition[], duplicateCode: string) {
@@ -61,6 +69,14 @@ class DefinitionRegistry<TDefinition extends { inputSchema: z.ZodType; name: str
 
   list(): readonly TDefinition[] {
     return [...this.#definitions.values()];
+  }
+
+  catalog(): readonly ContractDefinition[] {
+    return this.list().map(({ description, inputSchema, name }) => ({
+      description,
+      inputSchema: z.toJSONSchema(inputSchema, { unrepresentable: 'any' }),
+      name,
+    }));
   }
 
   require(name: string, missingCode: string): TDefinition {
@@ -79,6 +95,10 @@ export class ActionRegistry {
 
   list(): readonly ActionDefinition[] {
     return this.#registry.list();
+  }
+
+  catalog(): readonly ContractDefinition[] {
+    return this.#registry.catalog();
   }
 
   async execute(
@@ -100,6 +120,10 @@ export class QueryRegistry {
 
   list(): readonly QueryDefinition[] {
     return this.#registry.list();
+  }
+
+  catalog(): readonly ContractDefinition[] {
+    return this.#registry.catalog();
   }
 
   async execute(

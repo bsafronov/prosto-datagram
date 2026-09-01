@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 
-import { createHttpHandler } from '../src/packages/http';
+import { createDevelopmentHttpHandler } from '../src/packages/http';
 import { createRuntime, type DatagramRuntime } from '../src/packages/runtime';
 import type { SubscriptionEvent } from '../src/packages/domain/model';
 
@@ -171,7 +171,10 @@ describe('authorized realtime Activity', () => {
       'channel.navigation.mute',
       { channelId: channel.subject!.id, muted: true },
     );
-    const fetch = createHttpHandler({ app: value.app, defaultActorId: value.owner.id });
+    const fetch = createDevelopmentHttpHandler({
+      app: value.app,
+      defaultActorId: value.owner.id,
+    });
     const response = await fetch(
       new Request('http://datagram.test/v1/events', {
         headers: { 'last-event-id': String(after) },
