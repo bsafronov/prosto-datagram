@@ -19,7 +19,11 @@ import {
 } from './model';
 
 export { dictionaryLabelKey, normalizeDictionaryLabel } from './channel-type-modules/dictionary';
-export { validateTableFieldValue } from './channel-type-modules/table';
+export {
+  consumeTableFieldConversionPlan,
+  planTableFieldConversion,
+  validateTableFieldValue,
+} from './channel-type-modules/table';
 export type { ChannelViewDeclaration, ChannelViewInput } from './channel-type-modules/contract';
 
 const channelContractSchema = z.object({

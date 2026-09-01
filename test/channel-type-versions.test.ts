@@ -23,10 +23,25 @@ describe('Channel Type version pinning', () => {
     const applicationSource = await Bun.file(
       new URL('../src/packages/application/lib/datagram.ts', import.meta.url),
     ).text();
+    const tableSource = await Bun.file(
+      new URL('../src/packages/domain/lib/channel-type-modules/table.ts', import.meta.url),
+    ).text();
     expect(applicationSource).not.toContain('#typeActions');
     expect(applicationSource).not.toContain('#typeQueries');
     expect(applicationSource).not.toMatch(/name:\s*'(?:chart|dictionary|discussion|table)\./);
     expect(applicationSource).not.toContain('operationBuilders');
+    const fieldUpdatePort = applicationSource.slice(
+      applicationSource.indexOf('updateTableField: async'),
+      applicationSource.indexOf('updateTableRecord: queueTableRecordUpdate'),
+    );
+    for (const conversionRule of [
+      'table.field-reference-configuration',
+      'table.field-dictionary-configuration',
+      'table.field-conversion-default-unresolved',
+      'table.field-conversion-resolution-invalid',
+      'table.field-conversion-unresolved',
+    ]) expect(fieldUpdatePort).not.toContain(conversionRule);
+    expect(tableSource.match(/capabilities\.state!\.planTableFieldConversion/g)).toHaveLength(2);
     for (const definition of bundledChannelTypes) {
       for (const contract of [...definition.actions, ...definition.queries]) {
         expect(typeof contract.execute).toBe('function');
@@ -296,7 +311,12 @@ describe('Channel Type version pinning', () => {
         allowedOperations: ['updateTableField' as const],
         authorization: { kind: 'channel-role' as const, minimumRole: 'owner' as const },
         execute: async (_input: unknown, capabilities: any) => {
-          await capabilities.changes.updateTableField({ fieldId: keepFieldId, kind: 'convert', observedVersion: 1, recordUpdates: [], targetType: 'number' });
+          const previewPlan = await capabilities.state.planTableFieldConversion({
+            fieldId: keepFieldId,
+            observedVersion: 1,
+            targetType: 'number',
+          });
+          await capabilities.changes.updateTableField({ kind: 'convert', plan: previewPlan });
           return capabilities.commit();
         },
         inputSchema: z.object({ channelId: z.string() }),
@@ -327,7 +347,7 @@ describe('Channel Type version pinning', () => {
     for (const [action, code] of [
       ['table.attack.field-version', 'table.field-conflict'],
       ['table.attack.field-undo', 'table.field-not-tombstoned'],
-      ['table.attack.field-schema', 'table.field-conversion-unresolved'],
+      ['table.attack.field-schema', 'channel-type.capability-denied'],
     ] as const) {
       await expect(app.executeAction(owner.id, 'cli', action, { channelId })).rejects.toMatchObject({ code });
     }

@@ -17,6 +17,7 @@ import {
   contract,
   produceOwnedView,
   stateRule,
+  type ChannelTypeStatePort,
 } from './contract';
 import {
   discussionActions,
@@ -47,6 +48,157 @@ const defaultConversionResolutionSchema = z.object({
 });
 
 const pendingView = (title = 'Channel Type View') => ({ bindings: {}, commands: [], kind: 'pending', schemaVersion: 'datagram/view@1' as const, title });
+
+type ConversionResolution = {
+  readonly kind: 'correct' | 'map' | 'null';
+  readonly recordId?: string;
+  readonly value?: JsonValue;
+};
+
+export interface TableFieldConversionInput {
+  readonly cardinality?: 'many' | 'one';
+  readonly defaultResolution?: Omit<ConversionResolution, 'recordId'>;
+  readonly fieldId: string;
+  readonly observedVersion: number;
+  readonly resolutions?: readonly ConversionResolution[];
+  readonly targetChannelId?: string;
+  readonly targetType: TableField['type'];
+}
+
+export interface TrustedTableFieldConversionPlan {
+  readonly binding: {
+    readonly actorId: string;
+    readonly channelId: string;
+    readonly fieldId: string;
+    readonly observedVersion: number;
+    readonly serviceId: string;
+  };
+  readonly field: TableField;
+  readonly previousField: TableField;
+  readonly purpose: 'execute' | 'preview';
+  readonly preview: {
+    readonly defaultFailure: JsonValue | null;
+    readonly failures: readonly { readonly originalValue: JsonValue; readonly recordId: string }[];
+    readonly fieldId: string;
+    readonly observedVersion: number;
+    readonly targetType: TableField['type'];
+  };
+  readonly recordUpdates: readonly {
+    readonly observedVersion: number;
+    readonly previousValue?: JsonValue;
+    readonly recordId: string;
+    readonly value: JsonValue;
+  }[];
+}
+
+const issuedConversionPlans = new WeakSet<object>();
+
+const freezeConversionPlan = <T>(value: T): T => {
+  if (value === null || typeof value !== 'object' || Object.isFrozen(value)) return value;
+  for (const child of Object.values(value)) freezeConversionPlan(child);
+  return Object.freeze(value);
+};
+
+const issueConversionPlan = (plan: TrustedTableFieldConversionPlan): TrustedTableFieldConversionPlan => {
+  const sealed = freezeConversionPlan(structuredClone(plan));
+  issuedConversionPlans.add(sealed);
+  return sealed;
+};
+
+export function consumeTableFieldConversionPlan(
+  value: TrustedTableFieldConversionPlan,
+  binding: Omit<TrustedTableFieldConversionPlan['binding'], 'fieldId' | 'observedVersion'>,
+): TrustedTableFieldConversionPlan {
+  invariant(value !== null && typeof value === 'object' && issuedConversionPlans.delete(value), 'channel-type.capability-denied', 'Field conversion plan was not issued by the selected Channel Type', 403);
+  invariant(value.purpose === 'execute', 'channel-type.capability-denied', 'Preview plans cannot emit Field transitions', 403);
+  invariant(
+    value.binding.actorId === binding.actorId &&
+      value.binding.channelId === binding.channelId &&
+      value.binding.serviceId === binding.serviceId,
+    'channel-type.capability-denied',
+    'Field conversion plan belongs to another execution scope',
+    403,
+  );
+  return value;
+}
+
+export async function planTableFieldConversion(
+  binding: Omit<TrustedTableFieldConversionPlan['binding'], 'fieldId' | 'observedVersion'>,
+  input: TableFieldConversionInput,
+  state: ChannelTypeStatePort,
+): Promise<TrustedTableFieldConversionPlan> {
+  const field = (await state.tableFields()).find((candidate) => candidate.id === input.fieldId);
+  invariant(field, 'table.field-not-found', 'Table Field not found', 404);
+  invariant(field.channelId === binding.channelId, 'table.field-not-found', 'Table Field does not belong to the selected Channel', 404);
+  invariant(field.tombstonedAt === undefined, 'table.field-tombstoned', 'Table Field is tombstoned', 409);
+  invariant(field.version === input.observedVersion, 'table.field-conflict', 'Table Field changed after observation', 409);
+  invariant(field.type !== input.targetType, 'table.field-type-unchanged', 'Target Field type must differ', 409);
+  const isDictionary = input.targetType === 'dictionary';
+  const isReference = input.targetType === 'record-reference';
+  invariant(isReference ? input.targetChannelId !== undefined && input.cardinality !== undefined : input.cardinality === undefined, 'table.field-reference-configuration', 'Record Reference Field requires one target Channel and cardinality');
+  invariant(isDictionary ? input.targetChannelId !== undefined : isReference || input.targetChannelId === undefined, 'table.field-dictionary-configuration', 'Dictionary Field requires one target Dictionary Channel');
+  const { cardinality: _oldCardinality, defaultValue: _oldDefault, targetChannelId: _oldTarget, ...base } = field;
+  let nextField: TableField = {
+    ...base,
+    ...(input.cardinality === undefined ? {} : { cardinality: input.cardinality }),
+    ...(input.targetChannelId === undefined ? {} : { targetChannelId: input.targetChannelId }),
+    type: input.targetType,
+    version: field.version + 1,
+  };
+  await state.validateTableFieldTarget(nextField);
+  const resolveValue = async (resolution: ConversionResolution): Promise<JsonValue> => {
+    if (resolution.kind === 'null') {
+      invariant(!field.required, 'table.field-conversion-null-required', 'Required Field cannot be explicitly nulled');
+      invariant(resolution.value === undefined, 'table.field-conversion-resolution-invalid', 'Null resolution cannot include a value');
+      return null;
+    }
+    invariant(resolution.value !== undefined && resolution.value !== null, 'table.field-conversion-resolution-required', 'Correction or mapping needs a replacement value');
+    invariant(await state.acceptsTableFieldValue(nextField, resolution.value), 'table.field-conversion-resolution-invalid', 'Replacement value is incompatible with target Field');
+    return resolution.value;
+  };
+  const defaultFailure = field.defaultValue !== undefined && field.defaultValue !== null && !(await state.acceptsTableFieldValue(nextField, field.defaultValue))
+    ? field.defaultValue
+    : null;
+  const records = await state.tableRecords();
+  const possibleFailures = await Promise.all(records.map(async (record) => {
+    const value = record.values[field.key];
+    return value !== undefined && value !== null && !(await state.acceptsTableFieldValue(nextField, value))
+      ? { originalValue: value, recordId: record.id }
+      : null;
+  }));
+  const failures: { originalValue: JsonValue; recordId: string }[] = [];
+  for (const failure of possibleFailures) if (failure !== null) failures.push(failure);
+  const preview = { defaultFailure, failures, fieldId: field.id, observedVersion: field.version, targetType: input.targetType };
+  const requestedResolutions = input.resolutions;
+  if (requestedResolutions === undefined && input.defaultResolution === undefined) {
+    const plan = { binding: { ...binding, fieldId: field.id, observedVersion: field.version }, field: nextField, previousField: field, preview, purpose: 'preview', recordUpdates: [] } satisfies TrustedTableFieldConversionPlan;
+    return issueConversionPlan(plan);
+  }
+  invariant((defaultFailure !== null) === (input.defaultResolution !== undefined), 'table.field-conversion-default-unresolved', defaultFailure !== null ? 'Incompatible default value needs one explicit resolution' : 'Default resolution does not match an incompatible default', 409);
+  const nextDefault = input.defaultResolution ? await resolveValue(input.defaultResolution) : field.defaultValue;
+  nextField = { ...nextField, ...(nextDefault === undefined ? {} : { defaultValue: nextDefault }) };
+  const resolutionList = requestedResolutions ?? [];
+  const resolutions = new Map(resolutionList.map((resolution) => [resolution.recordId, resolution]));
+  invariant(resolutions.size === resolutionList.length, 'table.field-conversion-resolution-duplicate', 'Each Record may have one conversion resolution');
+  invariant(failures.length === resolutions.size && failures.every((failure) => resolutions.has(failure.recordId)), 'table.field-conversion-unresolved', 'Every incompatible value needs one explicit resolution', 409);
+  const updates = new Map(await Promise.all(failures.map(async (failure) => [failure.recordId, await resolveValue(resolutions.get(failure.recordId)!)] as const)));
+  const nextRecords = records.map((record) => updates.has(record.id) ? { ...record, values: { ...record.values, [field.key]: updates.get(record.id)! } } : record);
+  const fields = (await state.tableFields()).map((candidate) => candidate.id === field.id ? nextField : candidate);
+  for (const record of nextRecords.filter((candidate) => candidate.tombstonedAt === undefined)) {
+    await state.validateTableRecordValues(fields, nextRecords, record.values, record.id, true, [field.key]);
+  }
+  const recordUpdates = failures.map((failure) => {
+    const record = records.find((candidate) => candidate.id === failure.recordId)!;
+    return {
+      observedVersion: record.fieldVersions[field.key] ?? 0,
+      ...(Object.hasOwn(record.values, field.key) ? { previousValue: record.values[field.key] } : {}),
+      recordId: record.id,
+      value: updates.get(record.id)!,
+    };
+  });
+  const plan = { binding: { ...binding, fieldId: field.id, observedVersion: field.version }, field: nextField, previousField: field, preview, purpose: 'execute', recordUpdates } satisfies TrustedTableFieldConversionPlan;
+  return issueConversionPlan(plan);
+}
 
 export function validateTableFieldValue(field: TableField, rawValue: unknown): JsonValue {
   const value = jsonValueSchema.parse(rawValue);
@@ -192,7 +344,7 @@ export const tableChannelType = {
         invariant(input.resolutions.length === 0 && input.defaultResolution === undefined, 'table.field-conversion-cancelled', 'Cancelled conversion cannot include resolutions');
         return capabilities.cancel!({ id: field.id, kind: 'field' });
       }
-      await capabilities.changes.updateTableField!({
+      const plan = await capabilities.state!.planTableFieldConversion({
         ...(input.cardinality === undefined ? {} : { cardinality: input.cardinality }),
         ...(input.defaultResolution === undefined ? {} : {
           defaultResolution: {
@@ -200,16 +352,19 @@ export const tableChannelType = {
             ...(input.defaultResolution.value === undefined ? {} : { value: input.defaultResolution.value }),
           },
         }),
-        ...(input.targetChannelId === undefined ? {} : { targetChannelId: input.targetChannelId }),
         fieldId: field.id,
-        kind: 'convert',
         observedVersion: input.observedVersion,
         resolutions: input.resolutions.map((resolution) => ({
           kind: resolution.kind,
           recordId: resolution.recordId,
           ...(resolution.value === undefined ? {} : { value: resolution.value }),
         })),
+        ...(input.targetChannelId === undefined ? {} : { targetChannelId: input.targetChannelId }),
         targetType: input.targetType,
+      });
+      await capabilities.changes.updateTableField!({
+        kind: 'convert',
+        plan,
       });
       return capabilities.commit();
     }, { kind: 'channel-role', minimumRole: 'admin' }, ['cancel', 'updateTableField']),
@@ -368,33 +523,15 @@ export const tableChannelType = {
       targetChannelId: z.string().min(1).optional(),
       targetType: tableFieldTypeSchema,
     }), async (input, capabilities) => {
-      const field = (await capabilities.state!.tableFields()).find((candidate) => candidate.id === input.fieldId);
-      invariant(field, 'table.field-not-found', 'Table Field not found', 404);
-      invariant(field.tombstonedAt === undefined, 'table.field-tombstoned', 'Table Field is tombstoned', 409);
-      const isDictionary = input.targetType === 'dictionary';
-      const isRecordReference = input.targetType === 'record-reference';
-      invariant(isRecordReference ? input.targetChannelId !== undefined && input.cardinality !== undefined : input.cardinality === undefined, 'table.field-reference-configuration', 'Record Reference Field requires one target Channel and cardinality');
-      invariant(isDictionary ? input.targetChannelId !== undefined : isRecordReference || input.targetChannelId === undefined, 'table.field-dictionary-configuration', 'Dictionary Field requires one target Dictionary Channel');
-      const { cardinality: _oldCardinality, targetChannelId: _oldTarget, ...fieldBase } = field;
-      const convertedField: TableField = {
-        ...fieldBase,
+      const plan = await capabilities.state!.planTableFieldConversion({
         ...(input.cardinality === undefined ? {} : { cardinality: input.cardinality }),
+        fieldId: input.fieldId,
+        observedVersion: (await capabilities.state!.tableFields()).find((candidate) => candidate.id === input.fieldId)?.version ?? 0,
         ...(input.targetChannelId === undefined ? {} : { targetChannelId: input.targetChannelId }),
-        type: input.targetType,
-      };
-      await capabilities.state!.validateTableFieldTarget(convertedField);
-      const records = await capabilities.state!.tableRecords();
+        targetType: input.targetType,
+      });
       return {
-        data: {
-          defaultFailure: field.defaultValue !== undefined && field.defaultValue !== null && !(await capabilities.state!.acceptsTableFieldValue(convertedField, field.defaultValue)) ? field.defaultValue : null,
-          failures: (await Promise.all(records.map(async (record) => {
-            const value = record.values[field.key];
-            return value !== undefined && value !== null && !(await capabilities.state!.acceptsTableFieldValue(convertedField, value)) ? { originalValue: value, recordId: record.id } : null;
-          }))).filter((failure) => failure !== null),
-          fieldId: field.id,
-          observedVersion: field.version,
-          targetType: input.targetType,
-        },
+        data: plan.preview,
         view: pendingView(),
       };
     }, { kind: 'channel-role', minimumRole: 'admin' }),

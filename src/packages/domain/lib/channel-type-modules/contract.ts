@@ -14,6 +14,7 @@ import type {
   TableView,
   ViewDefinition,
 } from '../model';
+import type { TableFieldConversionInput, TrustedTableFieldConversionPlan } from './table';
 
 export type ChannelContractAuthorization =
   | { readonly kind: 'authenticated' }
@@ -55,6 +56,7 @@ export interface ChannelTypeStatePort {
   readonly displayFieldId: () => Promise<string | null>;
   readonly message: (messageId: string) => Promise<Message | null>;
   readonly messages: () => Promise<readonly Message[]>;
+  readonly planTableFieldConversion: (input: TableFieldConversionInput) => Promise<TrustedTableFieldConversionPlan>;
   readonly resolveRecordReference: (recordId: string) => Promise<JsonValue>;
   readonly resolveTableValues: (
     fields: readonly TableField[],
@@ -111,14 +113,8 @@ export interface ChannelActionCapabilities {
       | { readonly fieldId: string; readonly kind: 'restore'; readonly observedVersion: number }
       | { readonly fieldId: string; readonly kind: 'tombstone'; readonly observedVersion: number }
       | {
-          readonly cardinality?: 'many' | 'one';
-          readonly defaultResolution?: { readonly kind: 'correct' | 'map' | 'null'; readonly value?: JsonValue };
-          readonly fieldId: string;
           readonly kind: 'convert';
-          readonly observedVersion: number;
-          readonly resolutions: readonly { readonly kind: 'correct' | 'map' | 'null'; readonly recordId: string; readonly value?: JsonValue }[];
-          readonly targetChannelId?: string;
-          readonly targetType: TableField['type'];
+          readonly plan: TrustedTableFieldConversionPlan;
         }
     ) => Promise<void>;
     readonly updateTableRecord?: (input: {

@@ -2,8 +2,10 @@ import * as z from 'zod/v4';
 
 import {
   ChannelTypeRegistry,
+  consumeTableFieldConversionPlan,
   dictionaryLabelKey,
   normalizeDictionaryLabel,
+  planTableFieldConversion,
   validateTableFieldValue,
 } from '../../domain/channel-types';
 import { DatagramError, invariant } from '../../domain/errors';
@@ -593,9 +595,18 @@ export class DatagramApplication {
             updateTableField: async (intent) => {
               invariant(contract.typeId === 'table' && selectedChannelId, 'channel-type.capability-denied', 'This Channel Type cannot emit Table transitions', 403);
               await requireSelectedChannel();
-              const stored = (await this.store.listTableFields(selectedChannelId)).find((candidate) => candidate.id === intent.fieldId);
+              const conversionPlan = intent.kind === 'convert'
+                ? consumeTableFieldConversionPlan(intent.plan, {
+                    actorId,
+                    channelId: selectedChannelId,
+                    serviceId: this.handles.serviceId,
+                  })
+                : undefined;
+              const fieldId = intent.kind === 'convert' ? conversionPlan!.binding.fieldId : intent.fieldId;
+              const observedVersion = intent.kind === 'convert' ? conversionPlan!.binding.observedVersion : intent.observedVersion;
+              const stored = (await this.store.listTableFields(selectedChannelId)).find((candidate) => candidate.id === fieldId);
               invariant(stored?.channelId === selectedChannelId, 'table.field-not-found', 'Table Field does not belong to the selected Channel', 404);
-              invariant(stored.version === intent.observedVersion, 'table.field-conflict', 'Table Field changed after observation', 409);
+              invariant(stored.version === observedVersion, 'table.field-conflict', 'Table Field changed after observation', 409);
               let field: TableField;
               if (intent.kind === 'tombstone') {
                 invariant(stored.tombstonedAt === undefined, 'table.field-already-tombstoned', 'Table Field is already tombstoned', 409);
@@ -610,62 +621,23 @@ export class DatagramApplication {
                   await this.#validatedRecordValues(actorId, fields, records, record.values, record.id, true, new Set());
                 }
               } else {
-                invariant(stored.tombstonedAt === undefined, 'table.field-tombstoned', 'Table Field is tombstoned', 409);
-                invariant(stored.type !== intent.targetType, 'table.field-type-unchanged', 'Target Field type must differ', 409);
-                const isDictionary = intent.targetType === 'dictionary';
-                const isReference = intent.targetType === 'record-reference';
-                invariant(isReference ? intent.targetChannelId !== undefined && intent.cardinality !== undefined : intent.cardinality === undefined, 'table.field-reference-configuration', 'Record Reference Field requires one target Channel and cardinality');
-                invariant(isDictionary ? intent.targetChannelId !== undefined : isReference || intent.targetChannelId === undefined, 'table.field-dictionary-configuration', 'Dictionary Field requires one target Dictionary Channel');
-                const { cardinality: _oldCardinality, defaultValue: _oldDefault, targetChannelId: _oldTarget, ...base } = stored;
-                field = {
-                  ...base,
-                  ...(intent.cardinality === undefined ? {} : { cardinality: intent.cardinality }),
-                  ...(intent.targetChannelId === undefined ? {} : { targetChannelId: intent.targetChannelId }),
-                  type: intent.targetType,
-                  version: stored.version + 1,
-                };
-                await this.#channelTypeState(actorId, selectedChannelId, { typeId: contract.typeId, typeVersion: contract.typeVersion })
-                  .then((state) => state.validateTableFieldTarget(field));
-                const resolveValue = async (resolution: { readonly kind: 'correct' | 'map' | 'null'; readonly value?: JsonValue }): Promise<JsonValue> => {
-                  if (resolution.kind === 'null') {
-                    invariant(!stored.required, 'table.field-conversion-null-required', 'Required Field cannot be explicitly nulled');
-                    invariant(resolution.value === undefined, 'table.field-conversion-resolution-invalid', 'Null resolution cannot include a value');
-                    return null;
-                  }
-                  invariant(resolution.value !== undefined && resolution.value !== null, 'table.field-conversion-resolution-required', 'Correction or mapping needs a replacement value');
-                  invariant(await this.#fieldAccepts(actorId, field, resolution.value), 'table.field-conversion-resolution-invalid', 'Replacement value is incompatible with target Field');
-                  return resolution.value;
-                };
-                const defaultFails = stored.defaultValue !== undefined && stored.defaultValue !== null &&
-                  !(await this.#fieldAccepts(actorId, field, stored.defaultValue));
-                invariant(
-                  defaultFails === (intent.defaultResolution !== undefined),
-                  'table.field-conversion-default-unresolved',
-                  defaultFails ? 'Incompatible default value needs one explicit resolution' : 'Default resolution does not match an incompatible default',
-                  409,
-                );
-                const nextDefault = intent.defaultResolution
-                  ? await resolveValue(intent.defaultResolution)
-                  : stored.defaultValue;
-                field = { ...field, ...(nextDefault === undefined ? {} : { defaultValue: nextDefault }) };
-                const records = await this.store.listTableRecords(selectedChannelId);
-                const failures = (await Promise.all(records.map(async (record) => {
-                  const value = record.values[stored.key];
-                  return value !== undefined && value !== null && !(await this.#fieldAccepts(actorId, field, value)) ? record : null;
-                }))).filter((record): record is TableRecord => record !== null);
-                const requestedResolutions = intent.resolutions ?? [];
-                const resolutions = new Map(requestedResolutions.map((resolution) => [resolution.recordId, resolution]));
-                invariant(resolutions.size === requestedResolutions.length, 'table.field-conversion-resolution-duplicate', 'Each Record may have one conversion resolution');
-                invariant(failures.length === resolutions.size && failures.every((record) => resolutions.has(record.id)), 'table.field-conversion-unresolved', 'Every incompatible value needs one explicit resolution', 409);
-                const updates = new Map(await Promise.all(failures.map(async (record) => [record.id, await resolveValue(resolutions.get(record.id)!)] as const)));
-                const nextRecords = records.map((record) => updates.has(record.id) ? { ...record, values: { ...record.values, [stored.key]: updates.get(record.id)! } } : record);
-                const fields = (await this.store.listTableFields(selectedChannelId)).map((candidate) => candidate.id === stored.id ? field : candidate);
-                for (const record of nextRecords.filter((candidate) => candidate.tombstonedAt === undefined)) {
-                  await this.#validatedRecordValues(actorId, fields, nextRecords, record.values, record.id, true, new Set([stored.key]));
-                }
+                invariant(conversionPlan !== undefined, 'channel-type.capability-denied', 'Field conversion requires a trusted Channel Type plan', 403);
+                invariant(conversionPlan.field.channelId === selectedChannelId && conversionPlan.previousField.channelId === selectedChannelId, 'channel-type.capability-denied', 'Field conversion plan crossed Channel scope', 403);
+                invariant(JSON.stringify(conversionPlan.previousField) === JSON.stringify(stored), 'table.field-conflict', 'Table Field changed after planning', 409);
+                field = conversionPlan.field;
                 pendingChanges.push({ expectedVersion: stored.version, field, kind: 'table.field-updated', previousField: stored });
-                for (const record of failures) {
-                  await queueTableRecordUpdate({ observedVersions: { [stored.key]: record.fieldVersions[stored.key] ?? 0 }, recordId: record.id, values: { [stored.key]: updates.get(record.id)! } });
+                for (const update of conversionPlan.recordUpdates) {
+                  const record = await requireOwned(await this.store.getTableRecord(update.recordId), 'table.record-not-found');
+                  invariant((record.fieldVersions[stored.key] ?? 0) === update.observedVersion, 'table.record-edit-conflict', `Table Field value changed after planning: ${stored.key}`, 409);
+                  invariant(JSON.stringify(record.values[stored.key]) === JSON.stringify(update.previousValue), 'table.record-edit-conflict', `Table Field value changed after planning: ${stored.key}`, 409);
+                  pendingChanges.push({
+                    expectedVersions: { [stored.key]: update.observedVersion },
+                    kind: 'table.record-updated',
+                    previousValues: [{ existed: update.previousValue !== undefined, key: stored.key, ...(update.previousValue === undefined ? {} : { value: update.previousValue }) }],
+                    recordId: record.id,
+                    updatedAt: nowIso(),
+                    values: { [stored.key]: update.value },
+                  });
                 }
                 pendingSubject = { id: field.id, kind: 'field' };
                 return;
@@ -954,7 +926,7 @@ export class DatagramApplication {
     );
     const scoped = <T extends { readonly channelId: string }>(value: T | null): T | null =>
       value?.channelId === channelId ? value : null;
-    return {
+    const state: ChannelTypeStatePort = {
       acceptsTableFieldValue: (field, value) => this.#fieldAccepts(actorId, field, value),
       channel,
       chartDefinition: () => this.store.getChartDefinition(channelId),
@@ -967,6 +939,11 @@ export class DatagramApplication {
       displayFieldId: () => this.store.getTableDisplayFieldId(channelId),
       message: async (messageId) => scoped(await this.store.getMessage(messageId)),
       messages: () => this.store.listMessages(channelId),
+      planTableFieldConversion: (input) => planTableFieldConversion(
+        { actorId, channelId, serviceId: this.handles.serviceId },
+        input,
+        state,
+      ),
       resolveRecordReference: (recordId) => this.#resolveChannelRecordId(actorId, recordId),
       resolveTableValues: (fields, values) => this.#resolveTableValues(actorId, fields, values),
       validateTableFieldTarget: async (field) => {
@@ -1004,6 +981,7 @@ export class DatagramApplication {
       tableRecords: () => this.store.listTableRecords(channelId),
       tableViews: () => this.store.listTableViews(channelId, actorId),
     };
+    return state;
   }
 
   async #channelContract(
