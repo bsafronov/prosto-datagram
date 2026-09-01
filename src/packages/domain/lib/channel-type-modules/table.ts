@@ -140,8 +140,8 @@ export const tableChannelType = {
       }
       invariant(!(input.required && input.defaultValue === undefined && activeRecords.length > 0), 'table.field-required-existing-records', 'Required Field needs a default while Records exist', 409);
       invariant(!(input.unique && input.defaultValue != null && activeRecords.length > 1), 'table.field-unique-default-conflict', 'Unique Field default cannot be applied to multiple Records', 409);
-      if (input.defaultValue !== undefined) for (const record of allRecords) await capabilities.changes.updateTableRecord!({ expectedVersions: { [input.key]: 0 }, recordId: record.id, values: { [input.key]: input.defaultValue } });
       await capabilities.changes.addTableField!(field);
+      if (input.defaultValue !== undefined) for (const record of allRecords) await capabilities.changes.updateTableRecord!({ observedVersions: { [input.key]: 0 }, recordId: record.id, values: { [input.key]: input.defaultValue } });
       return capabilities.commit();
     }, { kind: 'channel-role', minimumRole: 'admin' }, ['addTableField', 'updateTableRecord']),
     contract('table.field.tombstone', z.object({
@@ -247,8 +247,8 @@ export const tableChannelType = {
         return update ? { ...record, values: { ...record.values, [field.key]: update.value } } : record;
       });
       for (const record of nextRecords.filter((candidate) => candidate.tombstonedAt === undefined)) await capabilities.state!.validateTableRecordValues(nextFields, nextRecords, record.values, record.id, true, [field.key]);
-      for (const { record, value } of updates) await capabilities.changes.updateTableRecord!({ expectedVersions: { [field.key]: record.fieldVersions[field.key] ?? 0 }, previousValues: [{ existed: true, key: field.key, value: record.values[field.key]! }], recordId: record.id, values: { [field.key]: value } });
       await capabilities.changes.updateTableField!(next, field);
+      for (const { record, value } of updates) await capabilities.changes.updateTableRecord!({ observedVersions: { [field.key]: record.fieldVersions[field.key] ?? 0 }, recordId: record.id, values: { [field.key]: value } });
       return capabilities.commit();
     }, { kind: 'channel-role', minimumRole: 'admin' }, ['cancel', 'updateTableField', 'updateTableRecord']),
     contract('table.field.purge', z.object({
@@ -261,7 +261,7 @@ export const tableChannelType = {
       invariant(field, 'table.field-not-found', 'Table Field not found', 404);
       invariant(field.tombstonedAt !== undefined, 'table.field-not-tombstoned', 'Table Field must be tombstoned before purge', 409);
       invariant(field.version === input.observedVersion, 'table.field-conflict', 'Table Field changed after observation', 409);
-      await capabilities.changes.purgeTableField!(field);
+      await capabilities.changes.purgeTableField!(field.id);
       return capabilities.commit();
     }, { kind: 'channel-role', minimumRole: 'admin' }, ['purgeTableField']),
     contract('table.record.create', z.object({
@@ -296,12 +296,11 @@ export const tableChannelType = {
       for (const key of changedKeys) invariant((record.fieldVersions[key] ?? 0) === input.observedVersions[key], 'table.record-edit-conflict', `Table Field value changed after observation: ${key}`, 409);
       const fields = await capabilities.state!.tableFields();
       const records = await capabilities.state!.tableRecords();
-      const values = await capabilities.state!.validateTableRecordValues(fields, records, { ...record.values, ...input.values }, record.id, true, changedKeys);
+      await capabilities.state!.validateTableRecordValues(fields, records, { ...record.values, ...input.values }, record.id, true, changedKeys);
       await capabilities.changes.updateTableRecord!({
-        expectedVersions: Object.fromEntries(changedKeys.map((key) => [key, input.observedVersions[key]!])),
-        previousValues: changedKeys.map((key) => ({ existed: Object.hasOwn(record.values, key), key, ...(Object.hasOwn(record.values, key) ? { value: record.values[key] } : {}) })),
+        observedVersions: input.observedVersions,
         recordId: record.id,
-        values: Object.fromEntries(changedKeys.map((key) => [key, values[key]!])),
+        values: input.values,
       });
       return capabilities.commit();
     }, { kind: 'channel-role', minimumRole: 'contributor' }, ['updateTableRecord']),

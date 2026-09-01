@@ -153,7 +153,7 @@ describe('Channel Type version pinning', () => {
             return capabilities.commit();
           }),
           malicious('table.attack.record', ['updateTableRecord'], async (_input: unknown, capabilities: any) => {
-            await capabilities.changes.updateTableRecord({ recordId: foreignRecord.id, values: {} });
+            await capabilities.changes.updateTableRecord({ observedVersions: {}, recordId: foreignRecord.id, values: {} });
             return capabilities.commit();
           }),
           malicious('table.attack.view', ['createTableView'], async (_input: unknown, capabilities: any) => {
@@ -217,6 +217,93 @@ describe('Channel Type version pinning', () => {
     expect(await store.listTableViews(tableB, owner.id)).toHaveLength(0);
   });
 
+  test('re-authorizes actual Message targets selected by a type handler', async () => {
+    let victimMessageId = '';
+    const attack = (name: string, operation: string, execute: (capabilities: any) => Promise<void>) => ({
+      allowedOperations: [operation as any],
+      authorization: { kind: 'message-author-or-admin' as const },
+      execute: async (_input: unknown, capabilities: any) => {
+        await execute(capabilities);
+        return capabilities.commit();
+      },
+      inputSchema: z.object({ channelId: z.string(), messageId: z.string() }),
+      name,
+    });
+    const definitions = bundledChannelTypes.map((definition) => definition.id === 'dictionary' ? {
+      ...definition,
+      actions: [...definition.actions,
+        attack('discussion.attack.edit', 'editDiscussionMessage', (capabilities) => capabilities.changes.editDiscussionMessage(victimMessageId, 'forged')),
+        attack('discussion.attack.tombstone', 'tombstoneDiscussionMessage', (capabilities) => capabilities.changes.tombstoneDiscussionMessage(victimMessageId)),
+        attack('discussion.attack.restore', 'restoreDiscussionMessage', (capabilities) => capabilities.changes.restoreDiscussionMessage(victimMessageId)),
+      ],
+    } : definition);
+    const store = new SqliteStore(':memory:');
+    stores.push(store);
+    await store.initialize();
+    const owner = await store.ensureLocalOwner();
+    const app = new DatagramApplication(store, new ChannelTypeRegistry(definitions));
+    const attacker = (await app.executeAction(owner.id, 'cli', 'service.person.create', { displayName: 'Attacker' })).subject!.id;
+    const channelId = (await app.executeAction(owner.id, 'cli', 'channel.create', { title: 'Messages', typeId: 'dictionary' })).subject!.id;
+    await app.executeAction(owner.id, 'cli', 'channel.member.grant', { channelId, personId: attacker, role: 'contributor' });
+    victimMessageId = (await app.executeAction(owner.id, 'cli', 'discussion.message.post', { channelId, text: 'Victim' })).subject!.id;
+    const ownMessageId = (await app.executeAction(attacker, 'cli', 'discussion.message.post', { channelId, text: 'Own' })).subject!.id;
+    for (const name of ['discussion.attack.edit', 'discussion.attack.tombstone']) {
+      await expect(app.executeAction(attacker, 'cli', name, { channelId, messageId: ownMessageId }))
+        .rejects.toMatchObject({ code: 'permission.denied' });
+    }
+    expect(await store.getMessage(victimMessageId)).toMatchObject({ text: 'Victim' });
+    expect((await store.getMessage(victimMessageId))?.tombstonedAt).toBeUndefined();
+    await app.executeAction(owner.id, 'cli', 'discussion.message.tombstone', { channelId, messageId: victimMessageId });
+    await expect(app.executeAction(attacker, 'cli', 'discussion.attack.restore', { channelId, messageId: ownMessageId }))
+      .rejects.toMatchObject({ code: 'permission.denied' });
+    expect((await store.getMessage(victimMessageId))?.tombstonedAt).toBeDefined();
+  });
+
+  test('derives Field purge and Record update transitions from canonical state', async () => {
+    let fieldId = '';
+    let recordId = '';
+    const definitions = bundledChannelTypes.map((definition) => definition.id === 'table' ? {
+      ...definition,
+      actions: [...definition.actions, {
+        allowedOperations: ['updateTableRecord' as const],
+        authorization: { kind: 'channel-role' as const, minimumRole: 'owner' as const },
+        execute: async (_input: unknown, capabilities: any) => {
+          await capabilities.changes.updateTableRecord({ observedVersions: { score: 1 }, recordId, values: { score: 'invalid' } });
+          return capabilities.commit();
+        },
+        inputSchema: z.object({ channelId: z.string() }),
+        name: 'table.attack.invalid-record',
+      }, {
+        allowedOperations: ['purgeTableField' as const],
+        authorization: { kind: 'channel-role' as const, minimumRole: 'owner' as const },
+        execute: async (_input: unknown, capabilities: any) => {
+          await capabilities.changes.purgeTableField(fieldId, { fieldKey: 'keep', version: -1 });
+          return capabilities.commit();
+        },
+        inputSchema: z.object({ channelId: z.string() }),
+        name: 'table.attack.purge',
+      }],
+    } : definition);
+    const store = new SqliteStore(':memory:');
+    stores.push(store);
+    await store.initialize();
+    const owner = await store.ensureLocalOwner();
+    const app = new DatagramApplication(store, new ChannelTypeRegistry(definitions));
+    const channelId = (await app.executeAction(owner.id, 'cli', 'channel.create', { title: 'Table', typeId: 'table' })).subject!.id;
+    fieldId = (await app.executeAction(owner.id, 'cli', 'table.field.add', { channelId, key: 'score', label: 'Score', required: false, type: 'number', unique: false })).subject!.id;
+    await app.executeAction(owner.id, 'cli', 'table.field.add', { channelId, key: 'keep', label: 'Keep', required: false, type: 'text', unique: false });
+    recordId = (await app.executeAction(owner.id, 'cli', 'table.record.create', { channelId, values: { keep: 'safe', score: 5 } })).subject!.id;
+    const before = (await store.listOperations(channelId)).length;
+    await expect(app.executeAction(owner.id, 'cli', 'table.attack.invalid-record', { channelId }))
+      .rejects.toMatchObject({ code: 'table.field-type' });
+    expect(await store.listOperations(channelId)).toHaveLength(before);
+    expect((await store.getTableRecord(recordId))?.values).toEqual({ keep: 'safe', score: 5 });
+    await app.executeAction(owner.id, 'cli', 'table.field.tombstone', { channelId, fieldId, observedVersion: 1 });
+    await app.executeAction(owner.id, 'cli', 'table.attack.purge', { channelId });
+    expect((await store.getTableRecord(recordId))?.values).toEqual({ keep: 'safe' });
+    expect((await store.listTableFields(channelId)).some((field) => field.id === fieldId)).toBeFalse();
+  });
+
   test('discovers and executes exact contracts for pinned versions', async () => {
     const table = bundledChannelTypes.find((definition) => definition.id === 'table')!;
     const chart = bundledChannelTypes.find((definition) => definition.id === 'chart')!;
@@ -241,6 +328,13 @@ describe('Channel Type version pinning', () => {
           return capabilities.commit();
         },
       } : action),
+      queries: chart.queries.map((query) => query.name === 'chart.open' ? {
+        ...query,
+        execute: async (_input: unknown, capabilities: Parameters<typeof query.execute>[1]) => {
+          if (!('read' in capabilities) || !capabilities.readSourceTable) throw new Error('Chart source capability required');
+          return (capabilities.readSourceTable as (...args: unknown[]) => Promise<QueryResult>)('table-v2');
+        },
+      } : query),
     };
     const chartV2 = { ...chart, title: 'Chart v2', version: '2.0.0' };
     const v2 = {
@@ -372,16 +466,20 @@ describe('Channel Type version pinning', () => {
       }, {
         allowedOperations: [],
         authorization: { kind: 'operator' as const },
-        execute: async () => ({
-          data: { status: 'ready' },
-          view: {
-            bindings: { status: '$result' },
-            commands: [],
-            kind: 'operator-status',
-            schemaVersion: 'datagram/view@1' as const,
-            title: 'Operator Status',
-          },
-        }),
+        execute: async (_input: unknown, capabilities: Parameters<(typeof table.queries)[number]['execute']>[1]) => {
+          if (!('read' in capabilities)) throw new Error('Query capabilities required');
+          expect(capabilities.readSourceTable).toBeUndefined();
+          return {
+            data: { status: 'ready' },
+            view: {
+              bindings: { status: '$result' },
+              commands: [],
+              kind: 'operator-status',
+              schemaVersion: 'datagram/view@1' as const,
+              title: 'Operator Status',
+            },
+          };
+        },
         inputSchema: z.object({}),
         name: 'table.custom.operator-status',
       }],
@@ -480,6 +578,8 @@ describe('Channel Type version pinning', () => {
       });
     }
     const app = new DatagramApplication(store, registry);
+    const v1Record = await app.executeAction(owner.id, 'cli', 'table.record.create', { channelId: 'table-v1', values: {} });
+    const v2Record = await app.executeAction(owner.id, 'cli', 'table.record.create', { channelId: 'table-v2', mode: 'v2', values: {} });
     const selectedCreation = await app.executeAction(
       owner.id,
       'cli',
@@ -542,6 +642,9 @@ describe('Channel Type version pinning', () => {
       typeId: 'chart',
       typeVersion: '1.0.0',
     });
+    const boundedSource = await app.executeQuery(owner.id, 'cli', 'chart.open', { channelId: pinnedChart.subject!.id });
+    expect((boundedSource.data as Array<{ id: string }>).map((record) => record.id)).toContain(v1Record.subject!.id);
+    expect((boundedSource.data as Array<{ id: string }>).map((record) => record.id)).not.toContain(v2Record.subject!.id);
     const v1Catalog = app.queries.catalog({ typeId: 'table', typeVersion: '1.0.0' });
     const v2Catalog = app.queries.catalog({ typeId: 'table', typeVersion: '2.0.0' });
     const defaultNames = app.queries.catalog().map((definition) => definition.name);

@@ -106,13 +106,11 @@ export interface ChannelActionCapabilities {
     ) => Promise<string>;
     readonly setTableDisplayField?: (displayFieldId: string | null) => Promise<void>;
     readonly addTableField?: (field: TableField) => Promise<void>;
-    readonly purgeTableField?: (field: TableField) => Promise<void>;
+    readonly purgeTableField?: (fieldId: string) => Promise<void>;
     readonly updateTableField?: (field: TableField, previousField: TableField) => Promise<void>;
     readonly updateTableRecord?: (input: {
-      readonly expectedVersions?: Readonly<Record<string, number>>;
-      readonly previousValues?: readonly { readonly existed: boolean; readonly key: string; readonly value?: JsonValue }[];
+      readonly observedVersions: Readonly<Record<string, number>>;
       readonly recordId: string;
-      readonly removedKeys?: readonly string[];
       readonly values: Readonly<Record<string, JsonValue>>;
     }) => Promise<void>;
     readonly restoreTableRecord?: (recordId: string, expectedTombstonedAt?: string) => Promise<void>;
@@ -127,7 +125,7 @@ export interface ChannelActionCapabilities {
 export interface ChannelQueryCapabilities {
   readonly actorId: string;
   readonly read: (query: string, input: Readonly<Record<string, JsonValue>>) => Promise<QueryResult>;
-  readonly readSourceTable: (channelId: string) => Promise<QueryResult>;
+  readonly readSourceTable?: () => Promise<QueryResult>;
   readonly role?: ChannelRole;
   readonly state?: ChannelTypeStatePort;
   readonly transform: (result: QueryResult, transform:

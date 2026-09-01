@@ -46,6 +46,7 @@ import type {
   ExecutionContext,
 } from './contracts';
 import { ResultHandleBroker, transformResult } from './result-handles';
+import { applyTableRecordUpdate } from './domain-transitions';
 import type {
   DataViewQueryDefinition,
   DurableResultDefinition,
@@ -98,17 +99,26 @@ export class DatagramApplication {
       for (const definition of installed) {
         versionsByType.set(definition.id, (versionsByType.get(definition.id) ?? 0) + 1);
       }
-      const candidates = installed
-        .filter((definition) => versionsByType.get(definition.id) === 1)
+      const candidates = [...installed]
         .sort((left, right) => `${left.id}@${left.version}`.localeCompare(`${right.id}@${right.version}`))
-        .flatMap((definition) => definition[kind]);
+        .flatMap((definition) => definition[kind].map((contract) => ({
+          contract,
+          owner: `${definition.id}@${definition.version}`,
+        })));
       const grouped = new Map<string, typeof candidates>();
-      for (const contract of candidates) {
-        grouped.set(contract.name, [...(grouped.get(contract.name) ?? []), contract]);
+      for (const candidate of candidates) {
+        grouped.set(candidate.contract.name, [...(grouped.get(candidate.contract.name) ?? []), candidate]);
       }
       return [...grouped.values()].flatMap((overloads) => {
-        const schemas = new Set(overloads.map((contract) => JSON.stringify(z.toJSONSchema(contract.inputSchema))));
-        return schemas.size === 1 ? [overloads[0]!] : [];
+        const owners = new Set(overloads.map((candidate) => candidate.owner));
+        const schemas = new Set(overloads.map((candidate) => JSON.stringify(z.toJSONSchema(candidate.contract.inputSchema))));
+        const implementations = new Set(overloads.map((candidate) => candidate.contract.execute));
+        const typeId = overloads[0]!.owner.split('@', 1)[0]!;
+        const sharedContract = overloads.length > 1 && implementations.size === 1;
+        return schemas.size === 1 && implementations.size === 1 &&
+          (sharedContract || (owners.size === 1 && versionsByType.get(typeId) === 1))
+          ? [overloads[0]!.contract]
+          : [];
       });
     };
     this.actions = new ActionRegistry(
@@ -357,7 +367,9 @@ export class DatagramApplication {
             },
             editDiscussionMessage: async (messageId, text) => {
               invariant(selectedChannelId, 'channel-type.capability-denied', 'Discussion transition requires a Channel', 403);
-              await requireOwned(await this.store.getMessage(messageId), 'discussion.message-not-found');
+              const message = await requireOwned(await this.store.getMessage(messageId), 'discussion.message-not-found');
+              await this.#requireMessageAuthorOrAdmin(actorId, message);
+              invariant(message.tombstonedAt === undefined, 'discussion.message-tombstoned', 'Tombstoned Message cannot be edited', 409);
               pendingChanges.push({
                 kind: 'discussion.message-edited',
                 messageId,
@@ -369,7 +381,8 @@ export class DatagramApplication {
               invariant(selectedChannelId, 'channel-type.capability-denied', 'Discussion transition requires a Channel', 403);
               await requireSelectedChannel();
               if (messageInput.replyToMessageId) {
-                await requireOwned(await this.store.getMessage(messageInput.replyToMessageId), 'discussion.message-not-found');
+                const reply = await requireOwned(await this.store.getMessage(messageInput.replyToMessageId), 'discussion.message-not-found');
+                invariant(reply.tombstonedAt === undefined, 'discussion.message-tombstoned', 'Cannot reply to a tombstoned Message', 409);
               }
               const messageId = newId('message');
               const createdAt = nowIso();
@@ -390,12 +403,16 @@ export class DatagramApplication {
               return messageId;
             },
             restoreDiscussionMessage: async (messageId) => {
-              await requireOwned(await this.store.getMessage(messageId), 'discussion.message-not-found');
+              const message = await requireOwned(await this.store.getMessage(messageId), 'discussion.message-not-found');
+              await this.#requireMessageAuthorOrAdmin(actorId, message);
+              invariant(message.tombstonedAt !== undefined, 'discussion.message-not-tombstoned', 'Message is not tombstoned', 409);
               pendingChanges.push({ kind: 'discussion.message-restored', messageId, restoredBy: actorId });
               pendingSubject = { id: messageId, kind: 'message' };
             },
             tombstoneDiscussionMessage: async (messageId) => {
-              await requireOwned(await this.store.getMessage(messageId), 'discussion.message-not-found');
+              const message = await requireOwned(await this.store.getMessage(messageId), 'discussion.message-not-found');
+              await this.#requireMessageAuthorOrAdmin(actorId, message);
+              invariant(message.tombstonedAt === undefined, 'discussion.message-already-tombstoned', 'Message is already tombstoned', 409);
               pendingChanges.push({ actorId, kind: 'discussion.message-tombstoned', messageId, tombstonedAt: nowIso() });
               pendingSubject = { id: messageId, kind: 'message' };
             },
@@ -514,12 +531,13 @@ export class DatagramApplication {
               pendingChanges.push({ field, kind: 'table.field-added' });
               pendingSubject = { id: field.id, kind: 'field' };
             },
-            purgeTableField: async (field) => {
-              invariant(contract.typeId === 'table' && selectedChannelId === field.channelId, 'channel-type.capability-denied', 'This Channel Type cannot emit Table transitions', 403);
-              const stored = (await requireSelectedChannel(), (await this.store.listTableFields(selectedChannelId)).find((candidate) => candidate.id === field.id));
+            purgeTableField: async (fieldId) => {
+              invariant(contract.typeId === 'table' && selectedChannelId, 'channel-type.capability-denied', 'This Channel Type cannot emit Table transitions', 403);
+              const stored = (await requireSelectedChannel(), (await this.store.listTableFields(selectedChannelId)).find((candidate) => candidate.id === fieldId));
               invariant(stored?.channelId === selectedChannelId, 'table.field-not-found', 'Table Field does not belong to the selected Channel', 404);
-              pendingChanges.push({ channelId: field.channelId, expectedVersion: field.version, fieldId: field.id, fieldKey: field.key, kind: 'table.field-purged' });
-              pendingSubject = { id: field.id, kind: 'field' };
+              invariant(stored.tombstonedAt !== undefined, 'table.field-not-tombstoned', 'Table Field must be tombstoned before purge', 409);
+              pendingChanges.push({ channelId: selectedChannelId, expectedVersion: stored.version, fieldId: stored.id, fieldKey: stored.key, kind: 'table.field-purged' });
+              pendingSubject = { id: stored.id, kind: 'field' };
             },
             updateTableField: async (field, previousField) => {
               invariant(contract.typeId === 'table' && selectedChannelId === field.channelId && previousField.channelId === selectedChannelId, 'channel-type.capability-denied', 'This Channel Type cannot emit Table transitions', 403);
@@ -531,8 +549,54 @@ export class DatagramApplication {
             },
             updateTableRecord: async (recordInput) => {
               invariant(contract.typeId === 'table' && selectedChannelId, 'channel-type.capability-denied', 'This Channel Type cannot emit Table transitions', 403);
-              await requireOwned(await this.store.getTableRecord(recordInput.recordId), 'table.record-not-found');
-              pendingChanges.push({ kind: 'table.record-updated', recordId: recordInput.recordId, updatedAt: nowIso(), values: recordInput.values, ...(recordInput.expectedVersions ? { expectedVersions: recordInput.expectedVersions } : {}), ...(recordInput.previousValues ? { previousValues: recordInput.previousValues } : {}), ...(recordInput.removedKeys ? { removedKeys: recordInput.removedKeys } : {}) });
+              const storedRecord = await requireOwned(await this.store.getTableRecord(recordInput.recordId), 'table.record-not-found');
+              const storedRecords = await this.store.listTableRecords(selectedChannelId);
+              const records = pendingChanges.reduce<TableRecord[]>((current, change) =>
+                change.kind === 'table.record-updated'
+                  ? current.map((record) => record.id === change.recordId ? applyTableRecordUpdate(record, change) : record)
+                  : current,
+              [...storedRecords]);
+              const record = records.find((candidate) => candidate.id === storedRecord.id)!;
+              invariant(
+                record.tombstonedAt === undefined || name === 'table.field.add' || name === 'table.field.convert',
+                'table.record-tombstoned',
+                'Table Record is tombstoned',
+                409,
+              );
+              const changedKeys = Object.keys(recordInput.values);
+              invariant(changedKeys.length > 0, 'table.record-empty-edit', 'Table Record edit needs at least one Field');
+              invariant(changedKeys.every((key) => recordInput.observedVersions[key] !== undefined), 'table.record-observed-version-required', 'Observed version is required for every edited Field');
+              for (const key of changedKeys) invariant((record.fieldVersions[key] ?? 0) === recordInput.observedVersions[key], 'table.record-edit-conflict', `Table Field value changed after observation: ${key}`, 409);
+              const storedFields = await this.store.listTableFields(selectedChannelId);
+              const fields = pendingChanges.reduce<TableField[]>((current, change) => {
+                if (change.kind === 'table.field-added') return [...current, change.field];
+                if (change.kind === 'table.field-updated') return current.map((field) => field.id === change.field.id ? change.field : field);
+                if (change.kind === 'table.field-purged') return current.filter((field) => field.id !== change.fieldId);
+                return current;
+              }, [...storedFields]);
+              const activeFieldKeys = new Set(fields.filter((field) => field.tombstonedAt === undefined).map((field) => field.key));
+              invariant(
+                changedKeys.every((key) => activeFieldKeys.has(key)),
+                'table.record-unknown-field',
+                'Table Record patches may target active Fields only',
+              );
+              const validatedValues = await this.#validatedRecordValues(
+                actorId,
+                fields,
+                records,
+                { ...record.values, ...recordInput.values },
+                record.id,
+                true,
+                new Set(changedKeys),
+              );
+              pendingChanges.push({
+                expectedVersions: Object.fromEntries(changedKeys.map((key) => [key, recordInput.observedVersions[key]!])),
+                kind: 'table.record-updated',
+                previousValues: changedKeys.map((key) => ({ existed: Object.hasOwn(record.values, key), key, ...(Object.hasOwn(record.values, key) ? { value: record.values[key] } : {}) })),
+                recordId: record.id,
+                updatedAt: nowIso(),
+                values: Object.fromEntries(changedKeys.map((key) => [key, validatedValues[key]!])),
+              });
               pendingSubject = { id: recordInput.recordId, kind: 'record' };
             },
             restoreTableRecord: async (recordId, expectedTombstonedAt) => {
@@ -740,17 +804,21 @@ export class DatagramApplication {
                 nextQueryStack,
               );
             },
-            readSourceTable: async (channelId) => {
-              const source = await this.#requireChannel(channelId, 'table');
-              return this.executeQuery(
-                actorId,
-                origin,
-                'table.records.list',
-                { channelId },
-                { typeId: source.typeId, typeVersion: source.typeVersion },
-                nextQueryStack,
-              );
-            },
+            ...(contract.typeId === 'chart' && typeof (input as { channelId?: unknown }).channelId === 'string' ? {
+              readSourceTable: async () => {
+                const definition = await this.store.getChartDefinition((input as { channelId: string }).channelId);
+                invariant(definition, 'chart.definition-not-found', 'Chart definition not found', 404);
+                const source = await this.#requireChannel(definition.sourceChannelId, 'table');
+                return this.executeQuery(
+                  actorId,
+                  origin,
+                  'table.records.list',
+                  { channelId: source.id },
+                  { typeId: source.typeId, typeVersion: source.typeVersion },
+                  nextQueryStack,
+                );
+              },
+            } : {}),
             transform: (source, definition) => transformResult(source, definition),
             ...(typeof (input as { channelId?: unknown }).channelId === 'string'
               ? {
@@ -815,7 +883,19 @@ export class DatagramApplication {
       acceptsTableFieldValue: (field, value) => this.#fieldAccepts(actorId, field, value),
       channel,
       chartDefinition: () => this.store.getChartDefinition(channelId),
-      validateChartDefinition: (definition) => this.#validateChartDefinition(actorId, definition),
+      validateChartDefinition: async (definition) => {
+        invariant(definition.channelId === channelId, 'channel-type.capability-denied', 'Chart definition must belong to the selected Channel', 403);
+        const current = await this.store.getChartDefinition(channelId);
+        if (current) {
+          invariant(
+            definition.sourceChannelId === current.sourceChannelId,
+            'chart.source-change-denied',
+            'Chart source cannot be changed without a new authorized Result Handle',
+            403,
+          );
+        }
+        await this.#validateChartDefinition(actorId, definition);
+      },
       dictionaryEntries: () => this.store.listDictionaryEntries(channelId),
       dictionaryEntry: async (entryId) => scoped(await this.store.getDictionaryEntry(entryId)),
       displayFieldId: () => this.store.getTableDisplayFieldId(channelId),

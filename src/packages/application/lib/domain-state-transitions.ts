@@ -115,11 +115,84 @@ export function checkOwnerInvariant(state: StoreState): void {
   }
 }
 
+function assertOperationScope(state: StoreState, operation: Operation, change: DomainChange): void {
+  let channelId: string | undefined;
+  switch (change.kind) {
+    case 'person.created':
+    case 'person.deactivated':
+    case 'channel-group.created':
+    case 'channel-group.updated':
+      return;
+    case 'channel.created': channelId = change.channel.id; break;
+    case 'channel.deleted':
+    case 'channel.restored':
+    case 'channel.purged':
+    case 'membership.reverted':
+    case 'membership.left':
+    case 'channel.ownership-transferred':
+    case 'channel-group.entry-removed':
+    case 'table.display-field-set': channelId = change.channelId; break;
+    case 'membership.granted': channelId = change.membership.channelId; break;
+    case 'invitation.created': channelId = change.invitation.channelId; break;
+    case 'invitation.accepted': channelId = one(state.invitations, (candidate) => candidate.id === change.invitationId)?.channelId; break;
+    case 'channel-group.entry-set': channelId = change.entry.channelId; break;
+    case 'channel-navigation.updated': channelId = change.navigation.channelId; break;
+    case 'dictionary.entry-created': channelId = change.entry.channelId; break;
+    case 'dictionary.entry-renamed':
+    case 'dictionary.entry-retired':
+    case 'dictionary.entry-restored': channelId = one(state.dictionaryEntries, (candidate) => candidate.id === change.entryId)?.channelId; break;
+    case 'table.field-added': channelId = change.field.channelId; break;
+    case 'table.field-purged': {
+      const current = one(state.tableFields, (candidate) => candidate.id === change.fieldId);
+      channelId = current?.channelId ?? change.channelId;
+      if (current && change.channelId !== current.channelId) throw new Error('Table Field transition crosses Channel scope');
+      break;
+    }
+    case 'table.field-updated': {
+      const current = one(state.tableFields, (candidate) => candidate.id === change.field.id);
+      channelId = current?.channelId ?? change.field.channelId;
+      if (current && (change.field.channelId !== current.channelId || change.previousField.channelId !== current.channelId)) {
+        throw new Error('Table Field transition crosses Channel scope');
+      }
+      break;
+    }
+    case 'table.record-created': channelId = change.record.channelId; break;
+    case 'table.record-updated':
+    case 'table.record-tombstoned':
+    case 'table.record-restored': channelId = one(state.tableRecords, (candidate) => candidate.id === change.recordId)?.channelId; break;
+    case 'table.view-saved': {
+      const current = one(state.tableViews, (candidate) => candidate.id === change.view.id);
+      channelId = current?.channelId ?? change.view.channelId;
+      if (current && change.view.channelId !== current.channelId) throw new Error('Table View transition crosses Channel scope');
+      break;
+    }
+    case 'chart.definition-set': {
+      const current = one(state.chartDefinitions, (candidate) => candidate.channelId === change.definition.channelId);
+      channelId = current?.channelId ?? change.definition.channelId;
+      break;
+    }
+    case 'discussion.message-posted': channelId = change.message.channelId; break;
+    case 'discussion.message-edited':
+    case 'discussion.message-tombstoned':
+    case 'discussion.message-restored': channelId = one(state.messages, (candidate) => candidate.id === change.messageId)?.channelId; break;
+    case 'activity.appended':
+      channelId = change.activity.channelId;
+      if (change.activity.operationId !== operation.id) {
+        throw new Error('Channel Activity must belong to its Operation');
+      }
+      break;
+  }
+  if (channelId !== undefined && channelId !== operation.channelId) {
+    throw new Error('Domain Change crosses Operation Channel scope');
+  }
+}
+
 export function applyOperation(state: StoreState, operation: Operation): void {
   if (state.operations.some((candidate) => candidate.id === operation.id)) {
     throw new Error('Operation identity already exists');
   }
   for (const change of operation.changes) {
+    assertOperationScope(state, operation, change);
     if (change.kind !== 'activity.appended') applyChange(state, change);
   }
   checkOwnerInvariant(state);
@@ -501,6 +574,7 @@ export function applyChange(state: StoreState, change: DomainChange): void {
         (candidate) =>
           candidate.id === change.fieldId &&
           candidate.channelId === change.channelId &&
+          candidate.key === change.fieldKey &&
           candidate.version === change.expectedVersion &&
           candidate.tombstonedAt !== undefined,
       );

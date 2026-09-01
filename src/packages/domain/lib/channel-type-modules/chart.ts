@@ -55,6 +55,7 @@ export const chartChannelType = {
       const current = await capabilities.state!.chartDefinition();
       invariant(current, 'chart.definition-not-found', 'Chart definition not found', 404);
       invariant(current.version === input.observedVersion, 'chart.definition-conflict', 'Chart definition changed after observation', 409);
+      invariant(input.sourceChannelId === current.sourceChannelId, 'chart.source-change-denied', 'Chart source cannot be changed without a new authorized Result Handle', 403);
       const definition: ChartDefinition = {
         aggregations: input.aggregations.map((aggregation) => ({ as: aggregation.as, ...(aggregation.field === undefined ? {} : { field: aggregation.field }), operator: aggregation.operator })),
         channelId: input.channelId,
@@ -106,7 +107,8 @@ export const chartChannelType = {
     const definition = await capabilities.state!.chartDefinition();
     invariant(definition, 'chart.definition-not-found', 'Chart definition not found', 404);
     await capabilities.state!.validateChartDefinition(definition);
-    let current = await capabilities.readSourceTable(definition.sourceChannelId);
+    invariant(capabilities.readSourceTable, 'chart.source-read-denied', 'Chart source read is unavailable', 403);
+    let current = await capabilities.readSourceTable();
     if (definition.filters.length > 0) current = capabilities.transform(current, { filters: definition.filters, kind: 'filter' });
     if (definition.grouping.length > 0) current = capabilities.transform(current, { fields: definition.grouping, kind: 'group' });
     current = capabilities.transform(current, { aggregations: definition.aggregations, kind: 'aggregate' });

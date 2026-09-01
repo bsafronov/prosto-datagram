@@ -603,5 +603,60 @@ export function storeConformance(name: string, createFixture: StoreFixtureFactor
         await fixture.dispose();
       }
     });
+
+    test('rejects Domain Changes that cross Operation Channel scope', async () => {
+      const fixture = await createFixture();
+      try {
+        const owner = await fixture.store.ensureLocalOwner('Owner');
+        await commitChannel(fixture.store, owner, 'scope-a', 1);
+        await commitChannel(fixture.store, owner, 'scope-b', 2);
+        const record = {
+          channelId: 'scope-b',
+          createdAt: timestamp(3),
+          createdBy: owner.id,
+          fieldVersions: {},
+          id: 'scope-record',
+          values: {},
+        };
+        await expect(fixture.store.commit(operation({
+          action: 'test.cross-scope-create',
+          actorId: owner.id,
+          changes: [{ kind: 'table.record-created', record }],
+          channelId: 'scope-a',
+          id: 'operation-cross-scope-create',
+          second: 3,
+        }))).rejects.toThrow('Domain Change crosses Operation Channel scope');
+        expect(await fixture.store.getTableRecord(record.id)).toBeNull();
+
+        await fixture.store.commit(operation({
+          action: 'test.seed-record',
+          actorId: owner.id,
+          changes: [{ kind: 'table.record-created', record }],
+          channelId: 'scope-b',
+          id: 'operation-seed-record',
+          second: 4,
+        }));
+        await expect(fixture.store.commit(operation({
+          action: 'test.cross-scope-update',
+          actorId: owner.id,
+          changes: [{ kind: 'table.record-updated', recordId: record.id, updatedAt: timestamp(5), values: { forged: true } }],
+          channelId: 'scope-a',
+          id: 'operation-cross-scope-update',
+          second: 5,
+        }))).rejects.toThrow('Domain Change crosses Operation Channel scope');
+        expect((await fixture.store.getTableRecord(record.id))?.values).toEqual({});
+        await expect(fixture.store.commit(operation({
+          action: 'test.cross-scope-activity',
+          actorId: owner.id,
+          changes: [{ activity: activity('scope-activity', 'scope-b', owner.id, 'operation-cross-scope-activity', 6), kind: 'activity.appended' }],
+          channelId: 'scope-a',
+          id: 'operation-cross-scope-activity',
+          second: 6,
+        }))).rejects.toThrow('Domain Change crosses Operation Channel scope');
+        expect(await fixture.store.getActivity('scope-activity')).toBeNull();
+      } finally {
+        await fixture.dispose();
+      }
+    });
   });
 }
