@@ -5,12 +5,22 @@ export interface ChannelContract<TInput = unknown> {
   readonly name: string;
 }
 
+export interface ChannelStateRule {
+  readonly name: string;
+  readonly validate: (contract: string, input: unknown) => void;
+}
+
 export const contract = <TInput>(
   name: string,
   inputSchema: z.ZodType<TInput>,
 ): ChannelContract<TInput> => ({ inputSchema, name });
 
 export const channelIdSchema = z.string().min(1);
+
+export const stateRule = (
+  name: string,
+  validate: ChannelStateRule['validate'],
+): ChannelStateRule => ({ name, validate });
 
 export const channelCreateContract = contract('channel.create', z.object({
   title: z.string().trim().min(1).max(160),

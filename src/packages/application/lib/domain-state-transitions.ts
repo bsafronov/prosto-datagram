@@ -43,7 +43,6 @@ export interface StoreState {
   tableViews: TableView[];
 }
 
-
 export const emptyState = (): StoreState => ({
   schemaVersion: 1,
   activitySequence: 0,
@@ -647,4 +646,3 @@ export function applyChange(state: StoreState, change: DomainChange): void {
     }
   }
 }
-

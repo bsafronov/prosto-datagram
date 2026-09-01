@@ -34,7 +34,7 @@ export const discussionActivityKinds = [
 export const discussionQueries = [
   contract('discussion.messages.list', z.object({
     channelId: channelIdSchema,
-    includeTombstoned: z.boolean().default(false),
+    includeTombstoned: z.boolean().default(true),
   })),
   contract('discussion.message.revisions', z.object({
     channelId: channelIdSchema,

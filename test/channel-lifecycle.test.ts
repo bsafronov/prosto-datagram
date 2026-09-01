@@ -222,7 +222,7 @@ describe('shared Channel lifecycle', () => {
           recordId: record.subject!.id,
         })
       ).data,
-    ).toEqual({ channelId, recordId: record.subject!.id, status: 'unresolved' });
+    ).toEqual({ channelId, recordId: record.subject!.id, status: 'deleted' });
     await value.app.executeAction(value.owner.id, 'cli', 'table.record.restore', {
       channelId,
       recordId: record.subject!.id,

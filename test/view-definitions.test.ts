@@ -254,5 +254,12 @@ describe('semantic View Definitions', () => {
       viewId: view.id,
     });
     expect(opened.view.commands).toEqual([]);
+    const configuration = await value.app.executeQuery(
+      viewer.subject!.id,
+      'cli',
+      'table.configuration',
+      { channelId: channel.subject!.id },
+    );
+    expect(configuration.view.commands).toEqual([]);
   });
 });

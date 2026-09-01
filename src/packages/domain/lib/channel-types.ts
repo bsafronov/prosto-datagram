@@ -16,6 +16,13 @@ const channelContractSchema = z.object({
   name: z.string().min(1),
 });
 
+const channelStateRuleSchema = z.object({
+  name: z.string().min(1),
+  validate: z.custom<(contract: string, input: unknown) => void>(
+    (value) => typeof value === 'function',
+  ),
+});
+
 const compareVersions = (left: string, right: string): number => {
   const leftParts = left.split('.').map(Number);
   const rightParts = right.split('.').map(Number);
@@ -26,13 +33,30 @@ const compareVersions = (left: string, right: string): number => {
   return 0;
 };
 
+const deepFreeze = <T>(value: T, seen = new WeakSet<object>()): T => {
+  if ((typeof value !== 'object' && typeof value !== 'function') || value === null) return value;
+  const object = value as object;
+  if (seen.has(object)) return value;
+  seen.add(object);
+  for (const descriptor of Object.values(Object.getOwnPropertyDescriptors(object))) {
+    if ('value' in descriptor) deepFreeze(descriptor.value, seen);
+  }
+  return Object.freeze(value);
+};
+
+const immutableSchemaFacade = (schema: z.ZodType): z.ZodType =>
+  Object.freeze({
+    parse: schema.parse.bind(schema),
+    safeParse: schema.safeParse.bind(schema),
+  }) as unknown as z.ZodType;
+
 export const channelTypeDefinitionSchema = z.object({
   actions: z.array(channelContractSchema),
   activityKinds: z.array(z.string()),
   id: z.string().min(1),
   queries: z.array(channelContractSchema),
   recordKinds: z.array(z.enum(['dictionary-entry', 'discussion-message', 'table-record'])),
-  stateRules: z.array(z.string()),
+  stateRules: z.array(channelStateRuleSchema),
   title: z.string().min(1),
   version: z.string().regex(/^\d+\.\d+\.\d+$/),
   views: z.array(z.object({
@@ -52,11 +76,29 @@ export const bundledChannelTypes: readonly ChannelTypeDefinition[] = [
 
 export class ChannelTypeRegistry {
   readonly #definitions = new Map<string, ChannelTypeDefinition>();
+  readonly #schemas = new Map<string, z.ZodType>();
   readonly #versions = new Map<string, ChannelTypeDefinition[]>();
 
   constructor(definitions: readonly ChannelTypeDefinition[]) {
     for (const candidate of definitions) {
-      const definition = channelTypeDefinitionSchema.parse(candidate);
+      const parsed = channelTypeDefinitionSchema.parse(candidate);
+      const definition = {
+        ...parsed,
+        actions: parsed.actions.map((contract) => {
+          this.#schemas.set(
+            `action:${ChannelTypeRegistry.key(parsed.id, parsed.version)}:${contract.name}`,
+            contract.inputSchema,
+          );
+          return { ...contract, inputSchema: immutableSchemaFacade(contract.inputSchema) };
+        }),
+        queries: parsed.queries.map((contract) => {
+          this.#schemas.set(
+            `query:${ChannelTypeRegistry.key(parsed.id, parsed.version)}:${contract.name}`,
+            contract.inputSchema,
+          );
+          return { ...contract, inputSchema: immutableSchemaFacade(contract.inputSchema) };
+        }),
+      } satisfies ChannelTypeDefinition;
       const key = ChannelTypeRegistry.key(definition.id, definition.version);
       if (this.#definitions.has(key)) {
         throw new DatagramError(
@@ -64,7 +106,7 @@ export class ChannelTypeRegistry {
           `Duplicate Channel Type version: ${definition.id}@${definition.version}`,
         );
       }
-      const frozen = Object.freeze(definition);
+      const frozen = deepFreeze(definition);
       this.#definitions.set(key, frozen);
       this.#versions.set(
         definition.id,
@@ -100,11 +142,43 @@ export class ChannelTypeRegistry {
   }
 
   requireAction(id: string, version: string, name: string): z.ZodType | undefined {
-    return this.require(id, version).actions.find((contract) => contract.name === name)?.inputSchema;
+    this.require(id, version);
+    return this.#schemas.get(`action:${ChannelTypeRegistry.key(id, version)}:${name}`);
   }
 
   requireQuery(id: string, version: string, name: string): z.ZodType | undefined {
-    return this.require(id, version).queries.find((contract) => contract.name === name)?.inputSchema;
+    this.require(id, version);
+    return this.#schemas.get(`query:${ChannelTypeRegistry.key(id, version)}:${name}`);
+  }
+
+  canonicalAction(name: string): z.ZodType | undefined {
+    return this.#canonicalContract('actions', name);
+  }
+
+  canonicalQuery(name: string): z.ZodType | undefined {
+    return this.#canonicalContract('queries', name);
+  }
+
+  #canonicalContract(
+    kind: 'actions' | 'queries',
+    name: string,
+  ): z.ZodType | undefined {
+    let schema: z.ZodType | undefined;
+    for (const definitions of this.#versions.values()) {
+      const definition = definitions.at(-1);
+      if (!definition?.[kind].some((candidate) => candidate.name === name)) continue;
+      const candidate = this.#schemas.get(
+        `${kind === 'actions' ? 'action' : 'query'}:${ChannelTypeRegistry.key(definition.id, definition.version)}:${name}`,
+      )!;
+      if (schema && schema !== candidate) {
+        throw new DatagramError(
+          'channel-type.contract-conflict',
+          `Current Channel Types declare incompatible contracts: ${name}`,
+        );
+      }
+      schema = candidate;
+    }
+    return schema;
   }
 
   assertImplementations(
@@ -129,6 +203,10 @@ export class ChannelTypeRegistry {
         }
       }
     }
+  }
+
+  validateState(id: string, version: string, contract: string, input: unknown): void {
+    for (const rule of this.require(id, version).stateRules) rule.validate(contract, input);
   }
 
   assertView(

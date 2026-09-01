@@ -228,6 +228,13 @@ describe('universal Discussion lifecycle', () => {
       text: null,
       tombstonedAt: expect.any(String),
     });
+    const activeOnly = (
+      await value.app.executeQuery(viewerId, 'http', 'discussion.messages.list', {
+        channelId,
+        includeTombstoned: false,
+      })
+    ).data as Array<Record<string, unknown>>;
+    expect(activeOnly.some((message) => message.id === reply.subject!.id)).toBe(false);
     await value.app.executeAction(
       contributorId,
       'cli',

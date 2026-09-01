@@ -91,12 +91,32 @@ describe('Record Reference Fields', () => {
       channelId: sourceChannelId,
       values: { targets: [entry.subject!.id, message.subject!.id] },
     });
+    const linkedMessage = await value.app.executeAction(
+      value.owner.id,
+      'cli',
+      'discussion.message.post',
+      {
+        channelId: sourceChannelId,
+        recordReferences: [entry.subject!.id, message.subject!.id],
+        text: 'Cross-type links',
+      },
+    );
 
     const values = async () =>
       ((await value.app.executeQuery(value.owner.id, 'cli', 'table.records.list', {
         channelId: sourceChannelId,
       })).data as Array<{ values: { targets: unknown[] } }>)[0]!.values.targets;
     expect(await values()).toEqual([
+      { channelId: targetChannelId, recordId: entry.subject!.id, status: 'resolved' },
+      { channelId: targetChannelId, recordId: message.subject!.id, status: 'resolved' },
+    ]);
+    expect(
+      (
+        (await value.app.executeQuery(value.owner.id, 'cli', 'discussion.messages.list', {
+          channelId: sourceChannelId,
+        })).data as Array<{ id: string; recordReferences: unknown[] }>
+      ).find((candidate) => candidate.id === linkedMessage.subject!.id)?.recordReferences,
+    ).toEqual([
       { channelId: targetChannelId, recordId: entry.subject!.id, status: 'resolved' },
       { channelId: targetChannelId, recordId: message.subject!.id, status: 'resolved' },
     ]);
@@ -111,7 +131,15 @@ describe('Record Reference Fields', () => {
     });
     expect(await values()).toEqual([
       { channelId: targetChannelId, recordId: entry.subject!.id, status: 'retired' },
-      { channelId: targetChannelId, recordId: message.subject!.id, status: 'unresolved' },
+      { channelId: targetChannelId, recordId: message.subject!.id, status: 'deleted' },
+    ]);
+    await value.app.executeAction(value.owner.id, 'cli', 'discussion.message.restore', {
+      channelId: targetChannelId,
+      messageId: message.subject!.id,
+    });
+    expect(await values()).toEqual([
+      { channelId: targetChannelId, recordId: entry.subject!.id, status: 'retired' },
+      { channelId: targetChannelId, recordId: message.subject!.id, status: 'resolved' },
     ]);
     expect(await value.store.getTableRecord(source.subject!.id)).toMatchObject({
       values: { targets: [entry.subject!.id, message.subject!.id] },
@@ -261,7 +289,7 @@ describe('Record Reference Fields', () => {
       channelId: targetChannelId,
       recordId: target.subject!.id,
     });
-    expect(await resolution()).toMatchObject({ status: 'unresolved' });
+    expect(await resolution()).toMatchObject({ status: 'deleted' });
     await value.app.executeAction(value.owner.id, 'cli', 'table.record.restore', {
       channelId: targetChannelId,
       recordId: target.subject!.id,

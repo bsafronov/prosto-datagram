@@ -1,7 +1,8 @@
 import * as z from 'zod/v4';
 
 import type { ChannelTypeDefinition } from '../channel-types';
-import { channelCreateContract, channelIdSchema, contract } from './contract';
+import { channelCreateContract, channelIdSchema, contract, stateRule } from './contract';
+import { invariant } from '../errors';
 import {
   discussionActions,
   discussionActivityKinds,
@@ -63,8 +64,15 @@ export const dictionaryChannelType = {
   ],
   recordKinds: ['dictionary-entry', 'discussion-message'],
   stateRules: [
-    'entry-labels-are-normalized-and-unique',
-    'retired-entries-remain-resolvable',
+    stateRule('entry-labels-are-normalized', (name, rawInput) => {
+      if (!['dictionary.entry.create', 'dictionary.entry.rename'].includes(name)) return;
+      const label = (rawInput as { label?: unknown }).label;
+      invariant(
+        typeof label === 'string' && label === normalizeDictionaryLabel(label),
+        'dictionary.label-invalid',
+        'Dictionary Entry label must be normalized',
+      );
+    }),
   ],
   title: 'Dictionary',
   version: '1.0.0',

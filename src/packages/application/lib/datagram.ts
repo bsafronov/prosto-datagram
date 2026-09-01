@@ -117,8 +117,14 @@ export class DatagramApplication {
     handles = new ResultHandleBroker(),
   ) {
     this.handles = handles;
-    const actions = this.#actionDefinitions();
-    const queries = this.#queryDefinitions();
+    const actions = this.#actionDefinitions().map((definition) => ({
+      ...definition,
+      inputSchema: this.channelTypes.canonicalAction(definition.name) ?? definition.inputSchema,
+    }));
+    const queries = this.#queryDefinitions().map((definition) => ({
+      ...definition,
+      inputSchema: this.channelTypes.canonicalQuery(definition.name) ?? definition.inputSchema,
+    }));
     this.channelTypes.assertImplementations(
       new Set(actions.map((definition) => definition.name)),
       new Set(queries.map((definition) => definition.name)),
@@ -202,9 +208,14 @@ export class DatagramApplication {
       typeVersion = type.version;
     }
     if (!typeId || !typeVersion) return undefined;
-    return kind === 'action'
-      ? this.channelTypes.requireAction(typeId, typeVersion, name)
-      : this.channelTypes.requireQuery(typeId, typeVersion, name);
+    const schema =
+      kind === 'action'
+        ? this.channelTypes.requireAction(typeId, typeVersion, name)
+        : this.channelTypes.requireQuery(typeId, typeVersion, name);
+    return schema?.transform((input) => {
+      this.channelTypes.validateState(typeId, typeVersion, name, input);
+      return input;
+    });
   }
 
   async prepareQuery(
@@ -3433,14 +3444,14 @@ export class DatagramApplication {
         name: 'table.configuration',
         run: async (context, input): Promise<QueryResult> => {
           await this.#requireChannel(input.channelId, 'table');
-          await this.#requireRole(context.actorId, input.channelId, 'viewer');
+          const role = await this.#requireRole(context.actorId, input.channelId, 'viewer');
           return {
             data: {
               displayFieldId: await this.store.getTableDisplayFieldId(input.channelId),
             },
             view: {
               bindings: { configuration: '$result' },
-              commands: ['table.display-field.set'],
+              commands: roleRank[role] >= roleRank.admin ? ['table.display-field.set'] : [],
               kind: 'value',
               schemaVersion: 'datagram/view@1',
               title: 'Table Configuration',
@@ -3694,13 +3705,18 @@ export class DatagramApplication {
       }),
       defineQuery({
         description: 'List Messages in one Channel Discussion.',
-        inputSchema: z.object({ channelId: z.string().min(1) }),
+        inputSchema: z.object({
+          channelId: z.string().min(1),
+          includeTombstoned: z.boolean().default(true),
+        }),
         name: 'discussion.messages.list',
         run: async (context, input): Promise<QueryResult> => {
           const channel = await this.#requireChannel(input.channelId);
           const membership = await this.store.getMembership(input.channelId, context.actorId);
           invariant(membership, 'permission.denied', 'Channel membership is required', 403);
-          const messages = await this.store.listMessages(input.channelId);
+          const messages = (await this.store.listMessages(input.channelId)).filter(
+            (message) => input.includeTombstoned || message.tombstonedAt === undefined,
+          );
           return {
             data: await Promise.all(
               messages.map(async (message) => ({
@@ -3710,12 +3726,9 @@ export class DatagramApplication {
                 recordReferences:
                   message.tombstonedAt === undefined
                     ? await Promise.all(
-                        message.recordReferences.map(async (recordId) => {
-                          const record = await this.store.getTableRecord(recordId);
-                          return record
-                            ? this.#resolveReference(context.actorId, record.channelId, recordId)
-                            : { recordId, status: 'unresolved' as const };
-                        }),
+                        message.recordReferences.map((recordId) =>
+                          this.#resolveChannelRecordId(context.actorId, recordId),
+                        ),
                       )
                     : [],
                 ...(message.replyToMessageId === undefined
@@ -4019,7 +4032,7 @@ export class DatagramApplication {
       if (status === 'unresolved') {
         return { channelId, recordId, status: 'unresolved' };
       }
-      if (status === 'retired') return { channelId, recordId, status };
+      if (status === 'deleted' || status === 'retired') return { channelId, recordId, status };
     }
     return { channelId, ...(recordId ? { recordId } : {}), status: 'resolved' };
   }
@@ -4169,9 +4182,13 @@ export class DatagramApplication {
           ? value.filter((recordId): recordId is string => typeof recordId === 'string')
           : [];
     for (const recordId of recordIds) {
+      const status = await this.#channelRecordStatus(
+        recordKinds,
+        field.targetChannelId,
+        recordId,
+      );
       invariant(
-        (await this.#channelRecordStatus(recordKinds, field.targetChannelId, recordId)) !==
-          'unresolved',
+        status === 'resolved' || status === 'retired',
         'table.record-reference-invalid',
         'Record Reference target is unavailable',
       );
@@ -4182,11 +4199,11 @@ export class DatagramApplication {
     recordKinds: readonly ('dictionary-entry' | 'discussion-message' | 'table-record')[],
     channelId: string,
     recordId: string,
-  ): Promise<'resolved' | 'retired' | 'unresolved'> {
+  ): Promise<'deleted' | 'resolved' | 'retired' | 'unresolved'> {
     if (recordKinds.includes('table-record')) {
       const record = await this.store.getTableRecord(recordId);
       if (record?.channelId === channelId) {
-        return record.tombstonedAt === undefined ? 'resolved' : 'unresolved';
+        return record.tombstonedAt === undefined ? 'resolved' : 'deleted';
       }
     }
     if (recordKinds.includes('dictionary-entry')) {
@@ -4198,10 +4215,22 @@ export class DatagramApplication {
     if (recordKinds.includes('discussion-message')) {
       const message = await this.store.getMessage(recordId);
       if (message?.channelId === channelId) {
-        return message.tombstonedAt === undefined ? 'resolved' : 'unresolved';
+        return message.tombstonedAt === undefined ? 'resolved' : 'deleted';
       }
     }
     return 'unresolved';
+  }
+
+  async #resolveChannelRecordId(actorId: string, recordId: string): Promise<JsonValue> {
+    const tableRecord = await this.store.getTableRecord(recordId);
+    if (tableRecord) return this.#resolveReference(actorId, tableRecord.channelId, recordId);
+    const dictionaryEntry = await this.store.getDictionaryEntry(recordId);
+    if (dictionaryEntry) {
+      return this.#resolveReference(actorId, dictionaryEntry.channelId, recordId);
+    }
+    const message = await this.store.getMessage(recordId);
+    if (message) return this.#resolveReference(actorId, message.channelId, recordId);
+    return { recordId, status: 'unresolved' };
   }
 
   async #validateDictionaryEntry(

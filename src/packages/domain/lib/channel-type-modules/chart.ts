@@ -2,7 +2,8 @@ import * as z from 'zod/v4';
 
 import type { ChannelTypeDefinition } from '../channel-types';
 import { jsonValueSchema } from '../model';
-import { channelIdSchema, contract } from './contract';
+import { channelIdSchema, contract, stateRule } from './contract';
+import { invariant } from '../errors';
 import {
   discussionActions,
   discussionActivityKinds,
@@ -61,9 +62,16 @@ export const chartChannelType = {
   queries: [contract('chart.open', z.object({ channelId: channelIdSchema })), ...discussionQueries],
   recordKinds: ['discussion-message'],
   stateRules: [
-    'definition-retains-live-source-query',
-    'source-access-is-rechecked-on-open',
-    'ordinary-source-changes-produce-no-chart-activity',
+    stateRule('aggregation-names-are-unique', (name, rawInput) => {
+      if (name !== 'chart.definition.update') return;
+      const aggregations = (rawInput as { aggregations?: Array<{ as?: unknown }> }).aggregations;
+      invariant(
+        Array.isArray(aggregations) &&
+          new Set(aggregations.map((aggregation) => aggregation.as)).size === aggregations.length,
+        'chart.definition-invalid-aggregation',
+        'Chart needs uniquely named aggregations',
+      );
+    }),
   ],
   title: 'Chart',
   version: '1.0.0',

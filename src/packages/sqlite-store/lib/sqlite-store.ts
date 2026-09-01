@@ -1,8 +1,11 @@
 import { Database } from 'bun:sqlite';
 
 import {
+  applyChange,
   applyTableRecordUpdate,
+  checkOwnerInvariant,
   parseRecordState,
+  type StoreState,
   validatePostedMessage,
 } from '../../application/transitions';
 
@@ -1178,25 +1181,27 @@ export class SqliteStore implements DatagramStore {
 
   async commit(operation: Operation): Promise<void> {
     const apply = this.#database.transaction((candidate: Operation) => {
+      const state = this.#transitionState();
+      if (state.operations.some((existing) => existing.id === candidate.id)) {
+        throw new Error('Operation identity already exists');
+      }
+      for (const change of candidate.changes) {
+        if (change.kind !== 'activity.appended') applyChange(state, change);
+      }
+      checkOwnerInvariant(state);
+      if (!state.persons.some((person) => person.id === candidate.actorId)) {
+        throw new Error('Operation actor is unavailable');
+      }
+      if (
+        candidate.channelId !== undefined &&
+        !state.channels.some((channel) => channel.id === candidate.channelId)
+      ) {
+        throw new Error('Operation Channel is unavailable');
+      }
+
       for (const change of candidate.changes) {
         if (change.kind !== 'activity.appended') this.#persistChange(change);
       }
-
-      const invalidOwnership = this.#database
-        .query(
-          `SELECT channels.id
-           FROM channels
-           LEFT JOIN channel_memberships
-             ON channel_memberships.channel_id = channels.id
-            AND channel_memberships.role = 'owner'
-           WHERE channels.purged_at IS NULL
-           GROUP BY channels.id
-           HAVING COUNT(channel_memberships.person_id) <> 1
-              OR MAX(channel_memberships.person_id = channels.owner_id) <> 1
-           LIMIT 1`,
-        )
-        .get();
-      if (invalidOwnership) throw new Error('Each Channel must have exactly one Owner');
 
       this.#database.run(
         `INSERT INTO operations
@@ -1251,6 +1256,69 @@ export class SqliteStore implements DatagramStore {
       );
     });
     apply(operation);
+  }
+
+  #transitionState(): StoreState {
+    const messages = this.#database.query('SELECT * FROM messages').all() as MessageRow[];
+    const activityPosition = this.#database
+      .query('SELECT COALESCE(MAX(sequence), 0) AS position FROM channel_activities')
+      .get() as { position: number };
+    const eventPosition = this.#database
+      .query('SELECT COALESCE(MAX(position), 0) AS position FROM subscription_events')
+      .get() as { position: number };
+    const tableDisplayFields = this.#database
+      .query('SELECT channel_id, display_field_id FROM table_settings')
+      .all() as Array<{ channel_id: string; display_field_id: string | null }>;
+
+    return {
+      schemaVersion: 1,
+      activities: (
+        this.#database.query('SELECT *, sequence AS position FROM channel_activities').all() as ActivityRow[]
+      ).map(activityFromRow),
+      activitySequence: activityPosition.position,
+      channelGroupEntries: (
+        this.#database.query('SELECT * FROM channel_group_entries').all() as ChannelGroupEntryRow[]
+      ).map(groupEntryFromRow),
+      channelGroups: (this.#database.query('SELECT * FROM channel_groups').all() as ChannelGroupRow[]).map(
+        groupFromRow,
+      ),
+      channels: (this.#database.query('SELECT * FROM channels').all() as ChannelRow[]).map(channelFromRow),
+      chartDefinitions: (
+        this.#database.query('SELECT * FROM chart_definitions').all() as ChartDefinitionRow[]
+      ).map(chartDefinitionFromRow),
+      dictionaryEntries: (
+        this.#database.query('SELECT * FROM dictionary_entries').all() as DictionaryEntryRow[]
+      ).map(dictionaryEntryFromRow),
+      eventSequence: eventPosition.position,
+      events: [],
+      invitations: (
+        this.#database.query('SELECT * FROM channel_invitations').all() as InvitationRow[]
+      ).map(invitationFromRow),
+      memberships: (
+        this.#database.query('SELECT * FROM channel_memberships').all() as MembershipRow[]
+      ).map(membershipFromRow),
+      messages: messages.map((row) => messageFromRow(row, this.#listMessageRevisions(row.id))),
+      navigation: (
+        this.#database.query('SELECT * FROM channel_navigation').all() as NavigationRow[]
+      ).map(navigationFromRow),
+      operations: (this.#database.query('SELECT * FROM operations').all() as OperationRow[]).map(
+        operationFromRow,
+      ),
+      persons: (this.#database.query('SELECT * FROM persons').all() as PersonRow[]).map(personFromRow),
+      tableDisplayFields: tableDisplayFields.map((setting) => ({
+        channelId: setting.channel_id,
+        ...(setting.display_field_id === null ? {} : { displayFieldId: setting.display_field_id }),
+      })),
+      tableFields: (this.#database.query('SELECT * FROM table_fields').all() as TableFieldRow[]).map(
+        tableFieldFromRow,
+      ),
+      tableRecords: (this.#database.query('SELECT * FROM table_records').all() as TableRecordRow[]).map(
+        tableRecordFromRow,
+      ),
+      tableViews: (this.#database.query('SELECT * FROM table_views').all() as TableViewRow[]).map(
+        tableViewFromRow,
+      ),
+    };
   }
 
   #persistChange(change: DomainChange): void {

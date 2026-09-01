@@ -47,6 +47,19 @@ describe('Channel Type version pinning', () => {
     }
   });
 
+  test('deep-freezes installed definitions, contracts, schemas, and views', () => {
+    const registry = new ChannelTypeRegistry(bundledChannelTypes);
+    const definition = registry.require('table', '1.0.0');
+    expect(Object.isFrozen(definition)).toBeTrue();
+    expect(Object.isFrozen(definition.actions)).toBeTrue();
+    expect(Object.isFrozen(definition.actions[0])).toBeTrue();
+    expect(Object.isFrozen(definition.actions[0]!.inputSchema)).toBeTrue();
+    expect(Object.isFrozen(definition.views)).toBeTrue();
+    expect(Object.isFrozen(definition.views[0])).toBeTrue();
+    expect(Object.isFrozen(definition.views[0]!.commands)).toBeTrue();
+    expect(() => definition.views[0]!.commands.push('mutated')).toThrow();
+  });
+
   test('rejects reads and actions for a Channel pinned to an unavailable version', async () => {
     const store = new SqliteStore(':memory:');
     stores.push(store);

@@ -9,7 +9,7 @@ import {
   type TableField,
 } from '../model';
 import { DatagramError, invariant } from '../errors';
-import { channelCreateContract, channelIdSchema, contract } from './contract';
+import { channelCreateContract, channelIdSchema, contract, stateRule } from './contract';
 import {
   discussionActions,
   discussionActivityKinds,
@@ -204,9 +204,33 @@ export const tableChannelType = {
   ],
   recordKinds: ['table-record', 'discussion-message'],
   stateRules: [
-    'fields-own-validation-and-conversion',
-    'records-preserve-stable-identity',
-    'record-mutations-require-contributor',
+    stateRule('record-reference-configuration', (name, rawInput) => {
+      if (
+        !['table.field.add', 'table.field.convert', 'table.field.conversion.preview'].includes(name)
+      ) return;
+      const input = rawInput as {
+        cardinality?: unknown;
+        targetChannelId?: unknown;
+        targetType?: unknown;
+        type?: unknown;
+      };
+      const type = input.type ?? input.targetType;
+      invariant(
+        type !== 'record-reference' ||
+          (typeof input.targetChannelId === 'string' &&
+            (input.cardinality === 'one' || input.cardinality === 'many')),
+        'table.field-reference-configuration',
+        'Record Reference Field requires one target Channel and cardinality',
+      );
+    }),
+    stateRule('record-values-use-channel-type-invariants', (name, rawInput) => {
+      if (!['table.record.create', 'table.record.edit'].includes(name)) return;
+      invariant(
+        rawInput !== null && typeof rawInput === 'object' && !Array.isArray(rawInput),
+        'table.record-invalid',
+        'Table Record input must be an object',
+      );
+    }),
   ],
   title: 'Table',
   version: '1.0.0',
