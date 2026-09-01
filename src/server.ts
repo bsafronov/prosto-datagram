@@ -1,26 +1,14 @@
-import { createHttpHandler } from './http';
-import { createRuntime } from './runtime';
+import { startServerService } from './packages/server';
 
-export interface ServerOptions {
-  readonly databasePath?: string;
-  readonly hostname?: string;
-  readonly port?: number;
-}
-
-export async function startHttpServer(options: ServerOptions = {}) {
-  const runtime = await createRuntime({
-    ...(options.databasePath === undefined ? {} : { databasePath: options.databasePath }),
-  });
-  const server = Bun.serve({
-    fetch: createHttpHandler({ app: runtime.app, defaultActorId: runtime.owner.id }),
-    hostname: options.hostname ?? process.env.HOST ?? '127.0.0.1',
-    port: options.port ?? Number(process.env.PORT ?? 3100),
-  });
-  return { runtime, server };
-}
+export {
+  createServerServiceRuntime,
+  startServerService,
+  type ServerServiceOptions,
+  type ServerServiceRuntime,
+} from './packages/server';
 
 if (import.meta.main) {
-  const { runtime, server } = await startHttpServer();
+  const { runtime, server } = await startServerService();
   process.stderr.write(`Datagram HTTP listening on ${server.url.toString()}\n`);
   const close = async () => {
     await server.stop();

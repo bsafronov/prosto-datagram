@@ -3,9 +3,9 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { DatagramError } from '../src/domain/errors';
-import { viewDefinitionSchema } from '../src/domain/model';
-import { createRuntime, type DatagramRuntime } from '../src/runtime';
+import { DatagramError } from '../src/packages/application/errors';
+import { viewDefinitionSchema } from '../src/packages/domain/model';
+import { createRuntime, type DatagramRuntime } from '../src/packages/runtime';
 
 const openRuntimes: DatagramRuntime[] = [];
 
@@ -78,7 +78,11 @@ describe('Datagram application', () => {
       { channelId },
     );
     expect(records.data).toEqual([
-      { id: record.subject!.id, values: { available: true, name: 'Apples' } },
+      {
+        fieldVersions: { available: 1, name: 1 },
+        id: record.subject!.id,
+        values: { available: true, name: 'Apples' },
+      },
     ]);
     expect(messages.data).toHaveLength(1);
     expect(viewDefinitionSchema.parse(records.view)).toEqual(records.view);
@@ -136,9 +140,14 @@ describe('Datagram application', () => {
     const serialized = JSON.stringify(handle);
     expect(serialized).not.toContain('Secret Inventory');
     expect(serialized).not.toContain('Hidden Apples');
-    expect(handle.view.title).toBe('table.records.list');
+    expect(handle.view).not.toHaveProperty('title');
+    expect(handle.view.kind).toBe('table-records');
 
-    const consumed = value.app.handles.consume(value.owner.id, handle.id, 'table.records.list');
+    const consumed = await value.app.consumeResultHandle(
+      value.owner.id,
+      handle.id,
+      'table.records.list',
+    );
     expect(JSON.stringify(consumed.data)).toContain('Hidden Apples');
   });
 

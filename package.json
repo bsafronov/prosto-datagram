@@ -8,12 +8,14 @@
     "datagram-mcp": "./src/mcp.ts"
   },
   "scripts": {
-    "check": "bun run typecheck && bun run lint:boundaries && bun test",
+    "check": "bun run typecheck && bun run lint:boundaries && bun test && bun run test:postgres:provisioned",
     "cli": "bun src/cli.ts",
-    "lint:boundaries": "depcruise src/packages",
+    "lint:boundaries": "bun --bun node_modules/.bin/depcruise src/packages",
     "mcp": "bun src/mcp.ts",
     "serve": "bun src/server.ts",
     "test": "bun test",
+    "test:postgres:provisioned": "bun scripts/postgres-check.ts",
+    "test:postgres": "bun -e 'if (!process.env.DATAGRAM_TEST_POSTGRES_URL) throw new Error(\"DATAGRAM_TEST_POSTGRES_URL is required\")' && bun test test/postgres-store.test.ts test/acceptance-journey.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

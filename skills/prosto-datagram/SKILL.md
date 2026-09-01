@@ -22,4 +22,12 @@ Follow this protocol:
 6. Treat Result Handles as actor-bound, purpose-bound, short-lived capabilities. They may be passed only to compatible rendering, aggregation, export, or workflow tooling.
 7. Report Datagram error codes concisely. Change an input and retry only when the correction follows unambiguously from the user's request.
 
+Completion reporting:
+
+- Say an Action completed only after receiving its Action receipt. Include the `operationId` and safe subject identity when useful.
+- Say a Query was prepared or a Data View was opened only after receiving its Result Handle. Do not say what the result contains.
+- If a multi-Action request stops, list completed Operation IDs and the failed or unattempted step. Never claim the whole request completed.
+- Runtime, transport, approval, or plan-limit failure never authorizes a CLI, HTTP, Store, or direct database fallback. Retry the same tool contract only when safe and requested.
+- Codex login, session tokens, and ChatGPT subscription limits belong to Codex. Never request, copy, persist, or reinterpret them as API credentials.
+
 Keep control metadata such as Action names, Operation IDs, entity IDs, and Channel references separate from stored data. The model orchestrates tools; the Store and trusted host own data access and rendering.
