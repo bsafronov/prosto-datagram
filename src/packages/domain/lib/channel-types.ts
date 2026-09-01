@@ -22,11 +22,6 @@ export { dictionaryLabelKey, normalizeDictionaryLabel } from './channel-type-mod
 export { validateTableFieldValue } from './channel-type-modules/table';
 export type { ChannelViewDeclaration, ChannelViewInput } from './channel-type-modules/contract';
 
-const defaultContractHandler = (
-  input: any,
-  capabilities: ChannelActionCapabilities | ChannelQueryCapabilities,
-): Promise<any> => capabilities.execute(input);
-
 const channelContractSchema = z.object({
   allowedOperations: z.array(z.enum([
     'channel.create',
@@ -47,7 +42,7 @@ const channelContractSchema = z.object({
     capabilities: ChannelActionCapabilities | ChannelQueryCapabilities,
   ) => Promise<any>>(
     (value) => typeof value === 'function',
-  ).default(defaultContractHandler),
+  ),
   inputSchema: z.custom<z.ZodType>(
     (value) => typeof (value as { parse?: unknown } | null)?.parse === 'function',
   ),
@@ -282,7 +277,7 @@ export class ChannelTypeRegistry {
   ): Promise<T> {
     const schema = this.requireAction(id, version, name);
     if (!schema) throw new DatagramError('channel-type.action-undeclared', `Channel Type Action is not declared: ${name}`);
-    const parsed = schema.parse(input);
+    const parsed = deepFreeze(schema.parse(input));
     this.validateState(id, version, name, parsed);
     const handler = this.#handlers.get(
       `action:${ChannelTypeRegistry.key(id, version)}:${name}`,
@@ -299,7 +294,7 @@ export class ChannelTypeRegistry {
   ): Promise<T> {
     const schema = this.requireQuery(id, version, name);
     if (!schema) throw new DatagramError('channel-type.query-undeclared', `Channel Type Query is not declared: ${name}`);
-    const parsed = schema.parse(input);
+    const parsed = deepFreeze(schema.parse(input));
     this.validateState(id, version, name, parsed);
     const handler = this.#handlers.get(
       `query:${ChannelTypeRegistry.key(id, version)}:${name}`,

@@ -41,7 +41,12 @@ import type {
 import type { DatagramStore } from './store';
 import type { ChannelActionCapabilities } from '../../domain/lib/channel-type-modules/contract';
 import { ActionRegistry, QueryRegistry, defineAction, defineQuery } from './contracts';
-import type { ChannelTypeContractSelector, ExecutionContext } from './contracts';
+import type {
+  ActionDefinition,
+  ChannelTypeContractSelector,
+  ExecutionContext,
+  QueryDefinition,
+} from './contracts';
 import { ResultHandleBroker, transformResult } from './result-handles';
 import type {
   DataViewQueryDefinition,
@@ -115,7 +120,15 @@ const pendingChannelTypeView = (): QueryResult['view'] => ({
   title: 'Channel Type View',
 });
 
+const immutableInput = <T>(value: T): T => {
+  if (value === null || typeof value !== 'object' || Object.isFrozen(value)) return value;
+  for (const child of Object.values(value)) immutableInput(child);
+  return Object.freeze(value);
+};
+
 export class DatagramApplication {
+  readonly #typeActions: ReadonlyMap<string, ActionDefinition>;
+  readonly #typeQueries: ReadonlyMap<string, QueryDefinition>;
   readonly actions: ActionRegistry;
   readonly queries: QueryRegistry;
   readonly handles: ResultHandleBroker;
@@ -138,19 +151,33 @@ export class DatagramApplication {
         definition.queries.map((contract) => contract.name),
       ),
     );
+    this.#typeActions = new Map(
+      actions.filter((definition) => channelActionNames.has(definition.name))
+        .map((definition) => [definition.name, definition]),
+    );
+    this.#typeQueries = new Map(
+      queries.filter((definition) => channelQueryNames.has(definition.name))
+        .map((definition) => [definition.name, definition]),
+    );
     this.actions = new ActionRegistry(
-      actions,
+      actions.filter((definition) => !channelActionNames.has(definition.name)),
       (selector, name) =>
         this.channelTypes.requireAction(selector.typeId, selector.typeVersion, name),
       channelActionNames,
-      (selector) => this.channelTypes.require(selector.typeId, selector.typeVersion).actions,
+      (selector) => selector
+        ? this.channelTypes.require(selector.typeId, selector.typeVersion).actions
+        : [...new Map(this.channelTypes.list().flatMap((type) => type.actions)
+            .map((contract) => [contract.name, contract])).values()],
     );
     this.queries = new QueryRegistry(
-      queries,
+      queries.filter((definition) => !channelQueryNames.has(definition.name)),
       (selector, name) =>
         this.channelTypes.requireQuery(selector.typeId, selector.typeVersion, name),
       channelQueryNames,
-      (selector) => this.channelTypes.require(selector.typeId, selector.typeVersion).queries,
+      (selector) => selector
+        ? this.channelTypes.require(selector.typeId, selector.typeVersion).queries
+        : [...new Map(this.channelTypes.list().flatMap((type) => type.queries)
+            .map((contract) => [contract.name, contract])).values()],
     );
   }
 
@@ -168,6 +195,18 @@ export class DatagramApplication {
   ): Promise<ActionReceipt> {
     const actor = await this.#requirePerson(actorId);
     const selectedInput = this.#applySelectedCreationType(name, input, selectedType);
+    if (
+      name === 'channel.create' &&
+      selectedInput !== null &&
+      typeof selectedInput === 'object' &&
+      !Array.isArray(selectedInput) &&
+      (selectedInput as Record<string, unknown>).typeId === 'chart'
+    ) {
+      throw new DatagramError(
+        'chart.definition-required',
+        'Create Chart Channels through chart.create',
+      );
+    }
     const contract = await this.#channelContract('action', name, selectedInput, selectedType);
     if (selectedType && contract) {
       invariant(
@@ -179,6 +218,7 @@ export class DatagramApplication {
       );
     }
     if (contract) {
+      const parsedInput = immutableInput(contract.schema.parse(selectedInput));
       const authorization = this.channelTypes.requireAuthorization(
         contract.typeId,
         contract.typeVersion,
@@ -243,6 +283,17 @@ export class DatagramApplication {
         name,
         selectedInput,
         {
+          actions: {
+            [name]: async () => {
+              const implementation = this.#typeActions.get(name);
+              invariant(
+                implementation,
+                'channel-type.implementation-missing',
+                `Channel Type Action implementation is unavailable: ${name}`,
+              );
+              return implementation.run({ actorId, origin }, parsedInput);
+            },
+          },
           actorId,
           changes: Object.fromEntries(Object.entries({
             createChannel: (title) => {
@@ -273,11 +324,11 @@ export class DatagramApplication {
               pendingSubject = { id: selectedChannelId, kind: 'channel' };
               return selectedChannelId;
             },
-            createChart: (chartInput) => this.actions.execute(
-              'chart.create',
-              { actorId, origin },
-              chartInput,
-            ),
+            createChart: async () => {
+              const implementation = this.#typeActions.get('chart.create');
+              invariant(implementation, 'channel-type.implementation-missing', 'Chart creation implementation is unavailable');
+              return implementation.run({ actorId, origin }, parsedInput);
+            },
             createDictionaryEntry: async (label) => {
               invariant(
                 contract.typeId === 'dictionary' && selectedChannelId,
@@ -366,6 +417,11 @@ export class DatagramApplication {
                 referencedIds.every((fieldId) => knownIds.has(fieldId)),
                 'table.view-unknown-field',
                 'Table View references an unknown Field',
+              );
+              invariant(
+                new Set(viewInput.visibleFieldIds).size === viewInput.visibleFieldIds.length,
+                'table.view-duplicate-field',
+                'Visible Fields must be unique',
               );
               const viewId = newId('view');
               pendingChanges.push({
@@ -473,7 +529,6 @@ export class DatagramApplication {
               pendingSubject,
             );
           },
-          execute: (parsed) => this.actions.execute(name, { actorId, origin }, parsed, z.any()),
           newId,
           now: nowIso,
         },
@@ -492,9 +547,10 @@ export class DatagramApplication {
     name: string,
     input: unknown,
     selectedType?: ChannelTypeContractSelector,
+    queryStack: readonly string[] = [],
   ): Promise<QueryResult> {
     await this.#requirePerson(actorId);
-    const contract = await this.#channelContract('query', name, input);
+    const contract = await this.#channelContract('query', name, input, selectedType);
     if (selectedType && contract) {
       invariant(
         contract.typeId === selectedType.typeId &&
@@ -504,6 +560,16 @@ export class DatagramApplication {
         409,
       );
     }
+    const contractKey = contract
+      ? `${contract.typeId}@${contract.typeVersion}:${name}`
+      : undefined;
+    invariant(
+      !contractKey || !queryStack.includes(contractKey),
+      'channel-type.query-cycle',
+      'Channel Type Query composition contains a cycle',
+      409,
+    );
+    const nextQueryStack = contractKey ? [...queryStack, contractKey] : queryStack;
     const queryRole = contract
       ? this.channelTypes.requireAuthorization(
           contract.typeId,
@@ -513,6 +579,12 @@ export class DatagramApplication {
         )
       : undefined;
     if (queryRole?.kind === 'channel-role') {
+      invariant(
+        typeof (input as { channelId?: unknown }).channelId === 'string',
+        'channel-type.capability-denied',
+        'Channel role authorization requires one selected Channel',
+        403,
+      );
       await this.#requireRole(
         actorId,
         (input as { channelId: string }).channelId,
@@ -543,7 +615,20 @@ export class DatagramApplication {
           input,
           {
             actorId,
-            execute: (parsed) => this.queries.execute(name, { actorId, origin }, parsed, z.any()),
+            queries: {
+              [name]: async () => {
+                const implementation = this.#typeQueries.get(name);
+                invariant(
+                  implementation,
+                  'channel-type.implementation-missing',
+                  `Channel Type Query implementation is unavailable: ${name}`,
+                );
+                return implementation.run(
+                  { actorId, origin },
+                  immutableInput(contract.schema.parse(input)),
+                );
+              },
+            },
             read: async (query, readInput) => {
               const selectedChannelId = (input as { channelId: string }).channelId;
               invariant(
@@ -571,13 +656,24 @@ export class DatagramApplication {
                   ? readAuthorization.minimumRole
                   : 'viewer',
               );
-              return this.queries.execute(query, { actorId, origin }, readInput);
+              return this.executeQuery(
+                actorId,
+                origin,
+                query,
+                readInput,
+                { typeId: contract.typeId, typeVersion: contract.typeVersion },
+                nextQueryStack,
+              );
             },
-            role: await this.#requireRole(
-              actorId,
-              (input as { channelId: string }).channelId,
-              'viewer',
-            ),
+            ...(typeof (input as { channelId?: unknown }).channelId === 'string'
+              ? {
+                  role: await this.#requireRole(
+                    actorId,
+                    (input as { channelId: string }).channelId,
+                    'viewer',
+                  ),
+                }
+              : {}),
           },
         )
       : await this.queries.execute(name, { actorId, origin }, input);
@@ -645,6 +741,10 @@ export class DatagramApplication {
           : selectedType
             ? this.channelTypes.require(selectedType.typeId, selectedType.typeVersion)
           : this.channelTypes.requireCurrent('chart');
+      typeId = type.id;
+      typeVersion = type.version;
+    } else if (selectedType) {
+      const type = this.channelTypes.require(selectedType.typeId, selectedType.typeVersion);
       typeId = type.id;
       typeVersion = type.version;
     }
@@ -926,6 +1026,28 @@ export class DatagramApplication {
     const createdChannel = operation.changes.find((change) => change.kind === 'channel.created');
     const channel = persistedChannel ?? (createdChannel?.kind === 'channel.created' ? createdChannel.channel : null);
     if (channel) {
+      const typeDefinition = this.channelTypes.require(channel.typeId, channel.typeVersion);
+      if (
+        operation.changes.length > 0 &&
+        typeDefinition.actions.some((contract) => contract.name === action)
+      ) {
+        const expectedActivity = this.channelTypes.activityFor(
+          channel.typeId,
+          channel.typeVersion,
+          operation.changes,
+        );
+        const activities = operation.changes.filter(
+          (change) => change.kind === 'activity.appended',
+        );
+        invariant(
+          expectedActivity !== undefined &&
+            activities.length === 1 &&
+            activities[0]!.kind === 'activity.appended' &&
+            activities[0]!.activity.kind === expectedActivity,
+          'channel-type.activity-invalid',
+          'Channel Type mutation must emit its declared Activity',
+        );
+      }
       this.channelTypes.validateTransition(channel.typeId, channel.typeVersion, operation);
     }
     await this.store.commit(operation);

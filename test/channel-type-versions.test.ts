@@ -72,7 +72,10 @@ describe('Channel Type version pinning', () => {
         actions: [{
           allowedOperations: [],
           authorization: { kind: 'channel-role', minimumRole: 'contributor' },
-          execute: (input, capabilities) => capabilities.execute(input),
+          execute: (_input, capabilities) => {
+            if (!('actions' in capabilities)) throw new Error('Action capabilities required');
+            return capabilities.actions['custom.write']!();
+          },
           inputSchema: source,
           name: 'custom.write',
         }],
@@ -118,10 +121,11 @@ describe('Channel Type version pinning', () => {
           capabilities: Parameters<typeof action.execute>[1],
         ) => {
           if (input.title !== 'Selected pinned chart' || !('changes' in capabilities)) {
-            return capabilities.execute(input);
+            if (!('actions' in capabilities)) throw new Error('Action capabilities required');
+            return capabilities.actions['chart.create']!();
           }
           if (input.typeVersion !== '1.0.0') throw new Error('Pinned Chart version was not injected');
-          return capabilities.changes.createChart!(input);
+          return capabilities.changes.createChart!();
         },
       } : action),
     };
@@ -136,7 +140,10 @@ describe('Channel Type version pinning', () => {
                 input: { title: string; typeId: string; typeVersion?: string },
                 capabilities: Parameters<typeof action.execute>[1],
               ) => {
-                if (input.title !== 'Owned v1 creation' || !('changes' in capabilities)) return capabilities.execute(input);
+                if (input.title !== 'Owned v1 creation' || !('changes' in capabilities)) {
+                  if (!('actions' in capabilities)) throw new Error('Action capabilities required');
+                  return capabilities.actions['channel.create']!();
+                }
                 capabilities.changes.createChannel!(input.title);
                 return capabilities.commit();
               },
@@ -166,7 +173,8 @@ describe('Channel Type version pinning', () => {
                   capabilities: Parameters<typeof action.execute>[1],
                 ) => {
                   if (input.name !== 'Scoped viewer view' || !('changes' in capabilities)) {
-                    return capabilities.execute(input);
+                    if (!('actions' in capabilities)) throw new Error('Action capabilities required');
+                    return capabilities.actions['table.view.create']!();
                   }
                   expect(capabilities.changes.setTableDisplayField).toBeUndefined();
                   expect(capabilities.changes.createTableRecord).toBeUndefined();
@@ -190,17 +198,22 @@ describe('Channel Type version pinning', () => {
                 ) =>
                   input.fieldId === 'v2-default' && 'commit' in capabilities
                     ? (capabilities.changes.setTableDisplayField!(null), capabilities.commit())
-                    : capabilities.execute(input),
+                    : 'actions' in capabilities
+                      ? capabilities.actions['table.display-field.set']!()
+                      : Promise.reject(new Error('Action capabilities required')),
               }
           : action,
       ), {
         allowedOperations: ['table.display-field.set' as const],
         authorization: { kind: 'channel-role' as const, minimumRole: 'admin' as const },
         execute: async (
-          _input: { channelId: string },
+          input: { channelId: string },
           capabilities: Parameters<(typeof table.actions)[number]['execute']>[1],
         ) => {
           if (!('changes' in capabilities)) throw new Error('Action capabilities required');
+          expect(Object.isFrozen(input)).toBeTrue();
+          expect(Reflect.set(input, 'channelId', 'table-v1')).toBeFalse();
+          expect(input.channelId).toBe('table-v2');
           capabilities.changes.setTableDisplayField!(null);
           return capabilities.commit();
         },
@@ -216,9 +229,7 @@ describe('Channel Type version pinning', () => {
                 capabilities: Parameters<typeof query.execute>[1],
               ) => {
                 if (!('read' in capabilities)) throw new Error('Query capabilities required');
-                const result = await capabilities.read('table.configuration', {
-                  channelId: input.channelId,
-                });
+                const result = await capabilities.queries['table.configuration']!();
                 return {
                   ...result,
                   data: { ...(result.data as Record<string, unknown>), edition: 'v2' },
@@ -238,11 +249,29 @@ describe('Channel Type version pinning', () => {
           capabilities: Parameters<(typeof table.queries)[number]['execute']>[1],
         ) => {
           if (!('read' in capabilities)) throw new Error('Query capabilities required');
-          const result = await capabilities.read('table.configuration', { channelId: input.channelId });
+          const result = await capabilities.read('table.configuration', {
+            channelId: input.channelId,
+            edition: 'v2',
+          });
           return { ...result, data: { mediated: true, source: result.data } };
         },
         inputSchema: z.object({ channelId: z.string().min(1) }),
         name: 'table.custom.configuration',
+      }, {
+        allowedOperations: [],
+        authorization: { kind: 'operator' as const },
+        execute: async () => ({
+          data: { status: 'ready' },
+          view: {
+            bindings: { status: '$result' },
+            commands: [],
+            kind: 'operator-status',
+            schemaVersion: 'datagram/view@1' as const,
+            title: 'Operator Status',
+          },
+        }),
+        inputSchema: z.object({}),
+        name: 'table.custom.operator-status',
       }],
       title: 'Table v2',
       version: '2.0.0',
@@ -286,6 +315,19 @@ describe('Channel Type version pinning', () => {
         }),
         query: 'table.custom.configuration',
         title: 'Custom configuration',
+      }, {
+        bindings: { status: '$result' },
+        commands: [],
+        kind: 'operator-status',
+        produce: (_input: ChannelViewInput, declaration: ChannelViewDeclaration) => ({
+          bindings: declaration.bindings,
+          commands: [],
+          kind: declaration.kind,
+          schemaVersion: 'datagram/view@1' as const,
+          title: 'Operator Status',
+        }),
+        query: 'table.custom.operator-status',
+        title: 'Operator Status',
       }],
     };
     const registry = new ChannelTypeRegistry([
@@ -446,6 +488,20 @@ describe('Channel Type version pinning', () => {
     await expect(app.executeAction(viewer.subject!.id, 'cli', 'table.custom.reset-display', {
       channelId: 'table-v2',
     })).rejects.toMatchObject({ code: 'permission.denied' });
+    await expect(app.executeQuery(
+      viewer.subject!.id,
+      'cli',
+      'table.custom.operator-status',
+      {},
+      { typeId: 'table', typeVersion: '2.0.0' },
+    )).rejects.toMatchObject({ code: 'permission.denied' });
+    await expect(app.executeQuery(
+      owner.id,
+      'cli',
+      'table.custom.operator-status',
+      {},
+      { typeId: 'table', typeVersion: '2.0.0' },
+    )).resolves.toMatchObject({ data: { status: 'ready' } });
     await app.executeAction(viewer.subject!.id, 'cli', 'table.view.create', {
       channelId: 'table-v2',
       filters: [],

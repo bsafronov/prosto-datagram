@@ -37,19 +37,8 @@ export const chartChannelType = {
       title: z.string().trim().min(1).max(160),
       typeVersion: z.string().regex(/^\d+\.\d+\.\d+$/).optional(),
     }), async (input, capabilities) => {
-      if (!('changes' in capabilities)) return capabilities.execute(input);
-      return capabilities.changes.createChart!({
-        handleId: input.handleId,
-        presentation: {
-          ...(input.presentation.categoryField === undefined
-            ? {}
-            : { categoryField: input.presentation.categoryField }),
-          series: input.presentation.series,
-          type: input.presentation.type,
-        },
-        title: input.title,
-        ...(input.typeVersion === undefined ? {} : { typeVersion: input.typeVersion }),
-      });
+      if (!('changes' in capabilities)) throw new Error('Chart creation needs Action capabilities');
+      return capabilities.changes.createChart!();
     }, { kind: 'authenticated' }, ['chart.create']),
     contract('chart.definition.update', z.object({
       aggregations: z.array(chartAggregationSchema).min(1),

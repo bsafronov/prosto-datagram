@@ -187,6 +187,14 @@ describe('typed Table Record lifecycle', () => {
     await expect(
       value.app.executeAction(person.subject!.id, 'cli', 'table.view.create', {
         ...definition,
+        visibleFieldIds: [field.subject!.id, field.subject!.id],
+      }),
+    ).rejects.toMatchObject({
+      code: 'table.view-duplicate-field',
+    } satisfies Partial<DatagramError>);
+    await expect(
+      value.app.executeAction(person.subject!.id, 'cli', 'table.view.create', {
+        ...definition,
         name: 'Shared',
         visibility: 'shared',
       }),

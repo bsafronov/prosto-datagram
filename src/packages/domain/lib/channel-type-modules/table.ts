@@ -142,7 +142,7 @@ export const tableChannelType = {
       channelId: channelIdSchema,
       values: z.record(z.string(), jsonValueSchema),
     }), async (input, capabilities) => {
-      if (!('changes' in capabilities)) return capabilities.execute(input);
+      if (!('changes' in capabilities)) throw new Error('Table Record creation needs Action capabilities');
       await capabilities.changes.createTableRecord!(input.values);
       return capabilities.commit();
     }, { kind: 'channel-role', minimumRole: 'contributor' }, ['table.record.create']),
@@ -150,7 +150,7 @@ export const tableChannelType = {
       channelId: channelIdSchema,
       fieldId: z.string().min(1).nullable(),
     }), async (input, capabilities) => {
-      if (!('changes' in capabilities)) return capabilities.execute(input);
+      if (!('changes' in capabilities)) throw new Error('Display Field selection needs Action capabilities');
       await capabilities.changes.setTableDisplayField!(input.fieldId);
       return capabilities.commit();
     }, { kind: 'channel-role', minimumRole: 'admin' }, ['table.display-field.set']),
@@ -177,7 +177,7 @@ export const tableChannelType = {
       visibility: z.enum(['personal', 'shared']),
       visibleFieldIds: z.array(z.string().min(1)),
     }), async (input, capabilities) => {
-      if (!('changes' in capabilities)) return capabilities.execute(input);
+      if (!('changes' in capabilities)) throw new Error('Table View creation needs Action capabilities');
       await capabilities.changes.createTableView!({
         filters: input.filters.map((filter) => ({
           fieldId: filter.fieldId,

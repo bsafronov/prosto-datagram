@@ -44,7 +44,7 @@ type ContractSchemaResolver = (
 ) => z.ZodType | undefined;
 
 type SelectedContractResolver = (
-  selector: ChannelTypeContractSelector,
+  selector?: ChannelTypeContractSelector,
 ) => readonly { readonly inputSchema: z.ZodType; readonly name: string }[];
 
 export const defineAction = <TInput>(definition: {
@@ -126,7 +126,7 @@ export class ActionRegistry {
 
   list(selector?: ChannelTypeContractSelector): readonly ActionDefinition[] {
     const definitions = this.#registry.list(this.#selectedSchemaResolver(selector));
-    if (!selector || !this.#selectedContracts) return definitions;
+    if (!this.#selectedContracts) return definitions;
     const names = new Set(definitions.map((definition) => definition.name));
     return [
       ...definitions,
@@ -194,7 +194,7 @@ export class QueryRegistry {
 
   list(selector?: ChannelTypeContractSelector): readonly QueryDefinition[] {
     const definitions = this.#registry.list(this.#selectedSchemaResolver(selector));
-    if (!selector || !this.#selectedContracts) return definitions;
+    if (!this.#selectedContracts) return definitions;
     const names = new Set(definitions.map((definition) => definition.name));
     return [
       ...definitions,

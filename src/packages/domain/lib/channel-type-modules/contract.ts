@@ -25,15 +25,11 @@ export type ChannelTypeOperation =
   | 'table.view.create';
 
 export interface ChannelActionCapabilities {
+  readonly actions: Readonly<Record<string, () => Promise<ActionReceipt>>>;
   readonly actorId: string;
   readonly changes: {
     readonly createChannel?: (title: string) => string;
-    readonly createChart?: (input: {
-      readonly handleId: string;
-      readonly presentation: ChartDefinition['presentation'];
-      readonly title: string;
-      readonly typeVersion?: string;
-    }) => Promise<ActionReceipt>;
+    readonly createChart?: () => Promise<ActionReceipt>;
     readonly createDictionaryEntry?: (label: string) => Promise<string>;
     readonly createTableRecord?: (values: Readonly<Record<string, JsonValue>>) => Promise<string>;
     readonly createTableView?: (
@@ -42,16 +38,15 @@ export interface ChannelActionCapabilities {
     readonly setTableDisplayField?: (displayFieldId: string | null) => Promise<void>;
   };
   readonly commit: () => Promise<ActionReceipt>;
-  readonly execute: (input: unknown) => Promise<ActionReceipt>;
   readonly newId: (prefix: string) => string;
   readonly now: () => string;
 }
 
 export interface ChannelQueryCapabilities {
   readonly actorId: string;
-  readonly execute: (input: unknown) => Promise<QueryResult>;
+  readonly queries: Readonly<Record<string, () => Promise<QueryResult>>>;
   readonly read: (query: string, input: Readonly<Record<string, JsonValue>>) => Promise<QueryResult>;
-  readonly role: ChannelRole;
+  readonly role?: ChannelRole;
 }
 
 export interface ChannelContract<TInput = unknown> {
@@ -74,7 +69,13 @@ export interface ChannelStateRule {
 export const contract = <TInput>(
   name: string,
   inputSchema: z.ZodType<TInput>,
-  execute: ChannelContract<TInput>['execute'] = (input, capabilities) => capabilities.execute(input),
+  execute: ChannelContract<TInput>['execute'] = (_input, capabilities) => {
+    const implementation = 'actions' in capabilities
+      ? capabilities.actions[name]
+      : capabilities.queries[name];
+    if (!implementation) throw new Error(`Missing scoped Channel Type implementation: ${name}`);
+    return implementation();
+  },
   authorization: ChannelContractAuthorization = { kind: 'channel-role', minimumRole: 'viewer' },
   allowedOperations: readonly ChannelTypeOperation[] = [],
 ): ChannelContract<TInput> => ({ allowedOperations: [...allowedOperations], authorization, execute, inputSchema, name });
@@ -126,7 +127,7 @@ export const channelCreateContract = contract('channel.create', z.object({
   typeId: z.string().min(1),
   typeVersion: z.string().regex(/^\d+\.\d+\.\d+$/).optional(),
 }), async (input, capabilities) => {
-  if (!('changes' in capabilities)) return capabilities.execute(input);
+  if (!('changes' in capabilities)) throw new Error('Channel creation needs Action capabilities');
   capabilities.changes.createChannel!(input.title);
   return capabilities.commit();
 }, { kind: 'authenticated' }, ['channel.create']);

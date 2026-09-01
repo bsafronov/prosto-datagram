@@ -38,7 +38,7 @@ export const dictionaryChannelType = {
       channelId: channelIdSchema,
       label: dictionaryLabelSchema,
     }), async (input, capabilities) => {
-      if (!('changes' in capabilities)) return capabilities.execute(input);
+      if (!('changes' in capabilities)) throw new Error('Dictionary creation needs Action capabilities');
       await capabilities.changes.createDictionaryEntry!(input.label);
       return capabilities.commit();
     }, { kind: 'channel-role', minimumRole: 'contributor' }, ['dictionary.entry.create']),
