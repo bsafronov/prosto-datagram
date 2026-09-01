@@ -12,6 +12,7 @@ import { invariant } from '../errors';
 import {
   discussionActions,
   discussionActivityKinds,
+  discussionActivityFor,
   discussionQueries,
   discussionView,
 } from './discussion';
@@ -36,7 +37,11 @@ export const dictionaryChannelType = {
     contract('dictionary.entry.create', z.object({
       channelId: channelIdSchema,
       label: dictionaryLabelSchema,
-    }), undefined, { kind: 'channel-role', minimumRole: 'contributor' }),
+    }), async (input, capabilities) => {
+      if (!('changes' in capabilities)) return capabilities.execute(input);
+      await capabilities.changes.createDictionaryEntry!(input.label);
+      return capabilities.commit();
+    }, { kind: 'channel-role', minimumRole: 'contributor' }, ['dictionary.entry.create']),
     contract('dictionary.entry.rename', z.object({
       channelId: channelIdSchema,
       entryId: z.string().min(1),
@@ -52,6 +57,14 @@ export const dictionaryChannelType = {
     }), undefined, { kind: 'channel-role', minimumRole: 'contributor' }),
     ...discussionActions,
   ],
+  activityFor: (changes) => {
+    if (changes.some((change) => change.kind === 'channel.created')) return 'channel.created';
+    if (changes.some((change) => change.kind === 'dictionary.entry-created')) return 'dictionary.entry-created';
+    if (changes.some((change) => change.kind === 'dictionary.entry-renamed')) return 'dictionary.entry-renamed';
+    if (changes.some((change) => change.kind === 'dictionary.entry-retired')) return 'dictionary.entry-retired';
+    if (changes.some((change) => change.kind === 'dictionary.entry-restored')) return 'dictionary.entry-restored';
+    return discussionActivityFor(changes);
+  },
   activityKinds: [
     'channel.created',
     'dictionary.entry-created',
@@ -95,6 +108,7 @@ export const dictionaryChannelType = {
   version: '1.0.0',
   views: [
     {
+      bindings: { entries: '$result' },
       commands: [
         'dictionary.entry.create',
         'dictionary.entry.rename',
@@ -104,13 +118,16 @@ export const dictionaryChannelType = {
       kind: 'dictionary',
       produce: produceOwnedView,
       query: 'dictionary.entries.list',
+      title: 'Dictionary Entries',
     },
     discussionView,
     {
+      bindings: { revisions: '$result' },
       commands: [],
       kind: 'table',
       produce: produceOwnedView,
       query: 'discussion.message.revisions',
+      title: (input) => `${input.channelTitle ?? 'Channel'} Message Revisions`,
     },
   ],
 } as const satisfies ChannelTypeDefinition;

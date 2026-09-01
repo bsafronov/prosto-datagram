@@ -7,6 +7,7 @@ import { invariant } from '../errors';
 import {
   discussionActions,
   discussionActivityKinds,
+  discussionActivityFor,
   discussionQueries,
   discussionView,
 } from './discussion';
@@ -35,7 +36,21 @@ export const chartChannelType = {
       presentation: chartPresentationSchema,
       title: z.string().trim().min(1).max(160),
       typeVersion: z.string().regex(/^\d+\.\d+\.\d+$/).optional(),
-    }), undefined, { kind: 'authenticated' }),
+    }), async (input, capabilities) => {
+      if (!('changes' in capabilities)) return capabilities.execute(input);
+      return capabilities.changes.createChart!({
+        handleId: input.handleId,
+        presentation: {
+          ...(input.presentation.categoryField === undefined
+            ? {}
+            : { categoryField: input.presentation.categoryField }),
+          series: input.presentation.series,
+          type: input.presentation.type,
+        },
+        title: input.title,
+        ...(input.typeVersion === undefined ? {} : { typeVersion: input.typeVersion }),
+      });
+    }, { kind: 'authenticated' }, ['chart.create']),
     contract('chart.definition.update', z.object({
       aggregations: z.array(chartAggregationSchema).min(1),
       channelId: channelIdSchema,
@@ -51,6 +66,14 @@ export const chartChannelType = {
     }), undefined, { kind: 'channel-role', minimumRole: 'contributor' }),
     ...discussionActions,
   ],
+  activityFor: (changes) => {
+    if (changes.some((change) => change.kind === 'channel.created')) return 'channel.created';
+    if (changes.some((change) => change.kind === 'chart.definition-set')) return 'chart.definition-changed';
+    const appended = changes.find((change) => change.kind === 'activity.appended');
+    return appended?.kind === 'activity.appended'
+      ? appended.activity.kind
+      : discussionActivityFor(changes);
+  },
   activityKinds: [
     'channel.created',
     'chart.definition-changed',
@@ -89,6 +112,7 @@ export const chartChannelType = {
   version: '1.0.0',
   views: [
     {
+      bindings: { presentation: '$result.presentation', series: '$result.series' },
       commandRoles: {
         'chart.definition.update': 'admin',
         'chart.event.record': 'contributor',
@@ -97,13 +121,16 @@ export const chartChannelType = {
       kind: 'chart',
       produce: produceOwnedView,
       query: 'chart.open',
+      title: (input) => input.channelTitle ?? 'Chart',
     },
     discussionView,
     {
+      bindings: { revisions: '$result' },
       commands: [],
       kind: 'table',
       produce: produceOwnedView,
       query: 'discussion.message.revisions',
+      title: (input) => `${input.channelTitle ?? 'Channel'} Message Revisions`,
     },
   ],
 } as const satisfies ChannelTypeDefinition;

@@ -13,28 +13,37 @@ import { DatagramError } from './errors';
 import {
   viewDefinitionSchema,
   type ChannelRole,
+  type DomainChange,
   type Operation,
   type ViewDefinition,
 } from './model';
 
 export { dictionaryLabelKey, normalizeDictionaryLabel } from './channel-type-modules/dictionary';
 export { validateTableFieldValue } from './channel-type-modules/table';
+export type { ChannelViewDeclaration, ChannelViewInput } from './channel-type-modules/contract';
 
 const defaultContractHandler = (
   input: any,
-  next: (input: any) => Promise<any>,
-  _capabilities: ChannelActionCapabilities | ChannelQueryCapabilities,
-): Promise<any> => next(input);
+  capabilities: ChannelActionCapabilities | ChannelQueryCapabilities,
+): Promise<any> => capabilities.execute(input);
 
 const channelContractSchema = z.object({
+  allowedOperations: z.array(z.enum([
+    'channel.create',
+    'chart.create',
+    'dictionary.entry.create',
+    'table.display-field.set',
+    'table.record.create',
+    'table.view.create',
+  ])),
   authorization: z.discriminatedUnion('kind', [
     z.object({ kind: z.literal('authenticated') }),
+    z.object({ kind: z.literal('message-author-or-admin') }),
     z.object({ kind: z.literal('operator') }),
     z.object({ kind: z.literal('channel-role'), minimumRole: z.enum(['viewer', 'contributor', 'admin', 'owner']) }),
   ]),
   execute: z.custom<(
     input: any,
-    next: (input: any) => Promise<any>,
     capabilities: ChannelActionCapabilities | ChannelQueryCapabilities,
   ) => Promise<any>>(
     (value) => typeof value === 'function',
@@ -116,27 +125,30 @@ const snapshotSchema = (root: z.ZodType): z.ZodType => {
 };
 
 const publicContract = (
+  allowedOperations: ChannelTypeDefinition['actions'][number]['allowedOperations'],
   authorization: ChannelTypeDefinition['actions'][number]['authorization'],
   name: string,
   schema: z.ZodType,
   execute: (
     input: unknown,
-    next: (input: unknown) => Promise<unknown>,
     capabilities: ChannelActionCapabilities | ChannelQueryCapabilities,
   ) => Promise<unknown>,
-): { readonly authorization: typeof authorization; readonly execute: typeof execute; readonly inputSchema: z.ZodType; readonly name: string } =>
+): { readonly allowedOperations: typeof allowedOperations; readonly authorization: typeof authorization; readonly execute: typeof execute; readonly inputSchema: z.ZodType; readonly name: string } =>
   Object.defineProperties(
-    { authorization, execute, name },
+    { allowedOperations, authorization, execute, name },
     {
       inputSchema: {
         enumerable: true,
         get: () => snapshotSchema(schema),
       },
     },
-  ) as { readonly authorization: typeof authorization; readonly execute: typeof execute; readonly inputSchema: z.ZodType; readonly name: string };
+  ) as { readonly allowedOperations: typeof allowedOperations; readonly authorization: typeof authorization; readonly execute: typeof execute; readonly inputSchema: z.ZodType; readonly name: string };
 
 export const channelTypeDefinitionSchema = z.object({
   actions: z.array(channelContractSchema),
+  activityFor: z.custom<(changes: readonly DomainChange[]) => string | undefined>(
+    (value) => typeof value === 'function',
+  ),
   activityKinds: z.array(z.string()),
   id: z.string().min(1),
   queries: z.array(channelContractSchema),
@@ -145,6 +157,7 @@ export const channelTypeDefinitionSchema = z.object({
   title: z.string().min(1),
   version: z.string().regex(/^\d+\.\d+\.\d+$/),
   views: z.array(z.object({
+    bindings: z.record(z.string(), z.string()),
     commandRoles: z.record(z.string(), z.enum(['viewer', 'contributor', 'admin', 'owner'])).optional(),
     commands: z.array(z.string()),
     kind: z.string().min(1),
@@ -152,6 +165,10 @@ export const channelTypeDefinitionSchema = z.object({
       (value) => value === undefined || typeof value === 'function',
     ).optional(),
     query: z.string().min(1),
+    title: z.union([
+      z.string().min(1),
+      z.custom<(input: ChannelViewInput) => string>((value) => typeof value === 'function'),
+    ]),
   })),
 });
 
@@ -167,7 +184,6 @@ export class ChannelTypeRegistry {
   readonly #definitions = new Map<string, ChannelTypeDefinition>();
   readonly #handlers = new Map<string, (
     input: unknown,
-    next: (input: unknown) => Promise<unknown>,
     capabilities: ChannelActionCapabilities | ChannelQueryCapabilities,
   ) => Promise<unknown>>();
   readonly #schemas = new Map<string, z.ZodType>();
@@ -188,7 +204,7 @@ export class ChannelTypeRegistry {
             `action:${ChannelTypeRegistry.key(parsed.id, parsed.version)}:${contract.name}`,
             contract.execute,
           );
-          return publicContract(contract.authorization, contract.name, schema, contract.execute);
+          return publicContract(contract.allowedOperations, contract.authorization, contract.name, schema, contract.execute);
         }),
         queries: parsed.queries.map((contract) => {
           const schema = snapshotSchema(contract.inputSchema);
@@ -200,7 +216,7 @@ export class ChannelTypeRegistry {
             `query:${ChannelTypeRegistry.key(parsed.id, parsed.version)}:${contract.name}`,
             contract.execute,
           );
-          return publicContract(contract.authorization, contract.name, schema, contract.execute);
+          return publicContract(contract.allowedOperations, contract.authorization, contract.name, schema, contract.execute);
         }),
       } satisfies ChannelTypeDefinition;
       const key = ChannelTypeRegistry.key(definition.id, definition.version);
@@ -263,16 +279,15 @@ export class ChannelTypeRegistry {
     name: string,
     input: unknown,
     capabilities: ChannelActionCapabilities,
-    next: (input: unknown) => Promise<T>,
   ): Promise<T> {
     const schema = this.requireAction(id, version, name);
-    if (!schema) return next(input);
+    if (!schema) throw new DatagramError('channel-type.action-undeclared', `Channel Type Action is not declared: ${name}`);
     const parsed = schema.parse(input);
     this.validateState(id, version, name, parsed);
     const handler = this.#handlers.get(
       `action:${ChannelTypeRegistry.key(id, version)}:${name}`,
     );
-    return (handler ? handler(parsed, next, capabilities) : next(parsed)) as Promise<T>;
+    return handler!(parsed, capabilities) as Promise<T>;
   }
 
   async executeQuery<T>(
@@ -281,21 +296,28 @@ export class ChannelTypeRegistry {
     name: string,
     input: unknown,
     capabilities: ChannelQueryCapabilities,
-    next: (input: unknown) => Promise<T>,
   ): Promise<T> {
     const schema = this.requireQuery(id, version, name);
-    if (!schema) return next(input);
+    if (!schema) throw new DatagramError('channel-type.query-undeclared', `Channel Type Query is not declared: ${name}`);
     const parsed = schema.parse(input);
     this.validateState(id, version, name, parsed);
     const handler = this.#handlers.get(
       `query:${ChannelTypeRegistry.key(id, version)}:${name}`,
     );
-    return (handler ? handler(parsed, next, capabilities) : next(parsed)) as Promise<T>;
+    return handler!(parsed, capabilities) as Promise<T>;
   }
 
   requireAuthorization(id: string, version: string, kind: 'action' | 'query', name: string) {
     const contracts = kind === 'action' ? this.require(id, version).actions : this.require(id, version).queries;
     return contracts.find((candidate) => candidate.name === name)?.authorization;
+  }
+
+  requireAllowedOperations(id: string, version: string, name: string) {
+    return this.require(id, version).actions.find((candidate) => candidate.name === name)?.allowedOperations ?? [];
+  }
+
+  activityFor(id: string, version: string, changes: readonly DomainChange[]): string | undefined {
+    return this.require(id, version).activityFor(changes);
   }
 
   validateState(id: string, version: string, contract: string, input: unknown): void {
@@ -321,8 +343,10 @@ export class ChannelTypeRegistry {
       );
     }
     const declaration: ChannelViewDeclaration = {
+      bindings: declared.bindings,
       commands: declared.commands,
       kind: declared.kind,
+      title: declared.title,
       ...(declared.commandRoles === undefined ? {} : { commandRoles: declared.commandRoles }),
     };
     const view = viewDefinitionSchema.parse(declared.produce?.(input, declaration));

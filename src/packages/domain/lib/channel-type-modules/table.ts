@@ -19,6 +19,7 @@ import {
 import {
   discussionActions,
   discussionActivityKinds,
+  discussionActivityFor,
   discussionQueries,
   discussionView,
 } from './discussion';
@@ -140,11 +141,19 @@ export const tableChannelType = {
     contract('table.record.create', z.object({
       channelId: channelIdSchema,
       values: z.record(z.string(), jsonValueSchema),
-    }), undefined, { kind: 'channel-role', minimumRole: 'contributor' }),
+    }), async (input, capabilities) => {
+      if (!('changes' in capabilities)) return capabilities.execute(input);
+      await capabilities.changes.createTableRecord!(input.values);
+      return capabilities.commit();
+    }, { kind: 'channel-role', minimumRole: 'contributor' }, ['table.record.create']),
     contract('table.display-field.set', z.object({
       channelId: channelIdSchema,
       fieldId: z.string().min(1).nullable(),
-    }), undefined, { kind: 'channel-role', minimumRole: 'admin' }),
+    }), async (input, capabilities) => {
+      if (!('changes' in capabilities)) return capabilities.execute(input);
+      await capabilities.changes.setTableDisplayField!(input.fieldId);
+      return capabilities.commit();
+    }, { kind: 'channel-role', minimumRole: 'admin' }, ['table.display-field.set']),
     contract('table.record.edit', z.object({
       channelId: channelIdSchema,
       observedVersions: z.record(z.string(), z.number().int().nonnegative()),
@@ -167,9 +176,36 @@ export const tableChannelType = {
       sorting: z.array(tableViewSortSchema).default([]),
       visibility: z.enum(['personal', 'shared']),
       visibleFieldIds: z.array(z.string().min(1)),
-    }), undefined, { kind: 'channel-role', minimumRole: 'viewer' }),
+    }), async (input, capabilities) => {
+      if (!('changes' in capabilities)) return capabilities.execute(input);
+      await capabilities.changes.createTableView!({
+        filters: input.filters.map((filter) => ({
+          fieldId: filter.fieldId,
+          operator: filter.operator,
+          ...(filter.value === undefined ? {} : { value: filter.value }),
+        })),
+        grouping: input.grouping,
+        name: input.name,
+        sorting: input.sorting,
+        visibility: input.visibility,
+        visibleFieldIds: input.visibleFieldIds,
+      });
+      return capabilities.commit();
+    }, { kind: 'channel-role', minimumRole: 'viewer' }, ['table.view.create']),
     ...discussionActions,
   ],
+  activityFor: (changes) => {
+    if (changes.some((change) => change.kind === 'channel.created')) return 'channel.created';
+    if (changes.some((change) => ['table.field-added', 'table.field-updated', 'table.field-purged'].includes(change.kind))) return 'table.schema-changed';
+    if (changes.some((change) => change.kind === 'table.record-created')) return 'table.record-created';
+    if (changes.some((change) => change.kind === 'table.record-updated')) return 'table.record-edited';
+    if (changes.some((change) => change.kind === 'table.record-tombstoned')) return 'table.record-tombstoned';
+    if (changes.some((change) => change.kind === 'table.record-restored')) return 'table.record-restored';
+    if (changes.some((change) => change.kind === 'table.display-field-set')) return 'table.display-field-changed';
+    const savedView = changes.find((change) => change.kind === 'table.view-saved');
+    if (savedView?.kind === 'table.view-saved') return savedView.view.visibility === 'shared' ? 'table.shared-view-created' : 'table.personal-view-created';
+    return discussionActivityFor(changes);
+  },
   activityKinds: [
     'channel.created',
     'table.schema-changed',
@@ -257,6 +293,7 @@ export const tableChannelType = {
   version: '1.0.0',
   views: [
     {
+      bindings: { fields: '$result' },
       commandRoles: {
         'table.field.add': 'admin',
         'table.field.convert': 'admin',
@@ -275,22 +312,28 @@ export const tableChannelType = {
       kind: 'table-schema',
       produce: produceOwnedView,
       query: 'table.describe',
+      title: (input) => `${input.channelTitle ?? 'Table'} Fields`,
     },
     {
+      bindings: { preview: '$result' },
       commandRoles: { 'table.field.convert': 'admin' },
       commands: ['table.field.convert'],
       kind: 'table',
       produce: produceOwnedView,
       query: 'table.field.conversion.preview',
+      title: 'Field Conversion Preview',
     },
     {
+      bindings: { configuration: '$result' },
       commandRoles: { 'table.display-field.set': 'admin' },
       commands: ['table.display-field.set'],
       kind: 'value',
       produce: produceOwnedView,
       query: 'table.configuration',
+      title: 'Table Configuration',
     },
     {
+      bindings: { rows: '$result' },
       commands: [
         'table.record.create',
         'table.record.edit',
@@ -300,8 +343,10 @@ export const tableChannelType = {
       kind: 'table-records',
       produce: produceOwnedView,
       query: 'table.records.list',
+      title: (input) => input.channelTitle ?? 'Table Records',
     },
     {
+      bindings: { rows: '$result' },
       commands: [
         'table.record.create',
         'table.record.edit',
@@ -311,20 +356,25 @@ export const tableChannelType = {
       kind: 'table-records',
       produce: produceOwnedView,
       query: 'table.view.open',
+      title: 'Table View',
     },
     {
+      bindings: { views: '$result' },
       commandRoles: { 'table.view.create': 'viewer' },
       commands: ['table.view.create'],
       kind: 'table-views',
       produce: produceOwnedView,
       query: 'table.views.list',
+      title: 'Table Views',
     },
     discussionView,
     {
+      bindings: { revisions: '$result' },
       commands: [],
       kind: 'table',
       produce: produceOwnedView,
       query: 'discussion.message.revisions',
+      title: (input) => `${input.channelTitle ?? 'Channel'} Message Revisions`,
     },
   ],
 } as const satisfies ChannelTypeDefinition;

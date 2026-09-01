@@ -6,6 +6,8 @@ import { createDatagramApplication, DatagramApplication } from '../src/packages/
 import {
   bundledChannelTypes,
   ChannelTypeRegistry,
+  type ChannelViewDeclaration,
+  type ChannelViewInput,
 } from '../src/packages/domain/channel-types';
 import type { Channel, Operation, QueryResult } from '../src/packages/domain/model';
 import { SqliteStore } from '../src/packages/sqlite-store';
@@ -68,11 +70,13 @@ describe('Channel Type version pinning', () => {
     const registry = new ChannelTypeRegistry([
       {
         actions: [{
+          allowedOperations: [],
           authorization: { kind: 'channel-role', minimumRole: 'contributor' },
-          execute: (input, next) => next(input),
+          execute: (input, capabilities) => capabilities.execute(input),
           inputSchema: source,
           name: 'custom.write',
         }],
+        activityFor: () => undefined,
         activityKinds: [],
         id: 'custom',
         queries: [],
@@ -105,24 +109,19 @@ describe('Channel Type version pinning', () => {
       actions: chart.actions.map((action) => action.name === 'chart.create' ? {
         ...action,
         execute: async (
-          input: { title: string; typeVersion?: string },
-          next: (input: { title: string; typeVersion?: string }) => Promise<unknown>,
-          capabilities: Parameters<typeof action.execute>[2],
+          input: {
+            handleId: string;
+            presentation: { series: string[]; type: 'bar' | 'line' | 'pie' };
+            title: string;
+            typeVersion?: string;
+          },
+          capabilities: Parameters<typeof action.execute>[1],
         ) => {
           if (input.title !== 'Selected pinned chart' || !('changes' in capabilities)) {
-            return next(input);
+            return capabilities.execute(input);
           }
           if (input.typeVersion !== '1.0.0') throw new Error('Pinned Chart version was not injected');
-          capabilities.changes.createChannel(input.title);
-          capabilities.changes.setChartDefinition({
-            aggregations: [{ as: 'count', operator: 'count' }],
-            filters: [],
-            grouping: [],
-            presentation: { series: ['count'], type: 'bar' },
-            sourceChannelId: 'table-v1',
-            version: 1,
-          });
-          return capabilities.commit();
+          return capabilities.changes.createChart!(input);
         },
       } : action),
     };
@@ -135,11 +134,10 @@ describe('Channel Type version pinning', () => {
               ...action,
               execute: async (
                 input: { title: string; typeId: string; typeVersion?: string },
-                next: (input: { title: string; typeId: string; typeVersion?: string }) => Promise<unknown>,
-                capabilities: Parameters<typeof action.execute>[2],
+                capabilities: Parameters<typeof action.execute>[1],
               ) => {
-                if (input.title !== 'Owned v1 creation' || !('changes' in capabilities)) return next(input);
-                capabilities.changes.createChannel(input.title);
+                if (input.title !== 'Owned v1 creation' || !('changes' in capabilities)) return capabilities.execute(input);
+                capabilities.changes.createChannel!(input.title);
                 return capabilities.commit();
               },
             }
@@ -152,28 +150,58 @@ describe('Channel Type version pinning', () => {
                 values: z.record(z.string(), z.unknown()),
               }),
             }
+          : action.name === 'table.view.create'
+            ? {
+                ...action,
+                execute: async (
+                  input: {
+                    channelId: string;
+                    filters: [];
+                    grouping: [];
+                    name: string;
+                    sorting: [];
+                    visibility: 'personal' | 'shared';
+                    visibleFieldIds: string[];
+                  },
+                  capabilities: Parameters<typeof action.execute>[1],
+                ) => {
+                  if (input.name !== 'Scoped viewer view' || !('changes' in capabilities)) {
+                    return capabilities.execute(input);
+                  }
+                  expect(capabilities.changes.setTableDisplayField).toBeUndefined();
+                  expect(capabilities.changes.createTableRecord).toBeUndefined();
+                  await capabilities.changes.createTableView!({
+                    filters: input.filters,
+                    grouping: input.grouping,
+                    name: input.name,
+                    sorting: input.sorting,
+                    visibility: input.visibility,
+                    visibleFieldIds: input.visibleFieldIds,
+                  });
+                  return capabilities.commit();
+                },
+              }
           : action.name === 'table.display-field.set'
             ? {
                 ...action,
                 execute: async (
                   input: { channelId: string; fieldId: string | null },
-                  next: (input: { channelId: string; fieldId: string | null }) => Promise<unknown>,
-                  capabilities: Parameters<typeof action.execute>[2],
+                  capabilities: Parameters<typeof action.execute>[1],
                 ) =>
                   input.fieldId === 'v2-default' && 'commit' in capabilities
-                    ? (capabilities.changes.setTableDisplayField(null), capabilities.commit())
-                    : next(input),
+                    ? (capabilities.changes.setTableDisplayField!(null), capabilities.commit())
+                    : capabilities.execute(input),
               }
           : action,
       ), {
+        allowedOperations: ['table.display-field.set' as const],
         authorization: { kind: 'channel-role' as const, minimumRole: 'admin' as const },
         execute: async (
           _input: { channelId: string },
-          _next: (input: { channelId: string }) => Promise<unknown>,
-          capabilities: Parameters<(typeof table.actions)[number]['execute']>[2],
+          capabilities: Parameters<(typeof table.actions)[number]['execute']>[1],
         ) => {
           if (!('changes' in capabilities)) throw new Error('Action capabilities required');
-          capabilities.changes.setTableDisplayField(null);
+          capabilities.changes.setTableDisplayField!(null);
           return capabilities.commit();
         },
         inputSchema: z.object({ channelId: z.string().min(1) }),
@@ -185,12 +213,12 @@ describe('Channel Type version pinning', () => {
               ...query,
               execute: async (
                 input: { channelId: string; edition: 'v2' },
-                next: (input: { channelId: string; edition: 'v2' }) => Promise<unknown>,
-                capabilities: Parameters<typeof query.execute>[2],
+                capabilities: Parameters<typeof query.execute>[1],
               ) => {
-                const result = 'read' in capabilities
-                  ? await capabilities.read('table.configuration', { channelId: input.channelId })
-                  : await next(input) as QueryResult;
+                if (!('read' in capabilities)) throw new Error('Query capabilities required');
+                const result = await capabilities.read('table.configuration', {
+                  channelId: input.channelId,
+                });
                 return {
                   ...result,
                   data: { ...(result.data as Record<string, unknown>), edition: 'v2' },
@@ -203,11 +231,11 @@ describe('Channel Type version pinning', () => {
             }
           : query,
       ), {
+        allowedOperations: [],
         authorization: { kind: 'channel-role' as const, minimumRole: 'viewer' as const },
         execute: async (
           input: { channelId: string },
-          _next: (input: { channelId: string }) => Promise<unknown>,
-          capabilities: Parameters<(typeof table.queries)[number]['execute']>[2],
+          capabilities: Parameters<(typeof table.queries)[number]['execute']>[1],
         ) => {
           if (!('read' in capabilities)) throw new Error('Query capabilities required');
           const result = await capabilities.read('table.configuration', { channelId: input.channelId });
@@ -236,8 +264,8 @@ describe('Channel Type version pinning', () => {
               ...view,
               commands: [],
               kind: 'table-configuration-v2',
-              produce: (input: Parameters<ChannelTypeRegistry['produceView']>[3]) => ({
-                bindings: input.bindings,
+              produce: (_input: ChannelViewInput, declaration: ChannelViewDeclaration) => ({
+                bindings: declaration.bindings,
                 commands: [],
                 kind: 'table-configuration-v2',
                 schemaVersion: 'datagram/view@1' as const,
@@ -246,16 +274,18 @@ describe('Channel Type version pinning', () => {
             }
           : view,
       ), {
+        bindings: { configuration: '$result' },
         commands: [],
         kind: 'table-custom-configuration',
-        produce: (input: Parameters<ChannelTypeRegistry['produceView']>[3]) => ({
-          bindings: input.bindings,
+        produce: (_input: ChannelViewInput, declaration: ChannelViewDeclaration) => ({
+          bindings: declaration.bindings,
           commands: [],
           kind: 'table-custom-configuration',
           schemaVersion: 'datagram/view@1' as const,
           title: 'Custom configuration',
         }),
         query: 'table.custom.configuration',
+        title: 'Custom configuration',
       }],
     };
     const registry = new ChannelTypeRegistry([
@@ -319,12 +349,36 @@ describe('Channel Type version pinning', () => {
       typeId: 'table',
       typeVersion: '2.0.0',
     });
+    const sourceHandle = await app.prepareQuery(
+      owner.id,
+      'agent',
+      'table.records.list',
+      { channelId: 'table-v1' },
+      'chart.aggregate',
+    );
+    const chartHandle = await app.composeResultHandle(owner.id, {
+      handleId: sourceHandle.id,
+      inputPurpose: 'chart.aggregate',
+      outputPurpose: 'chart.create',
+      transform: { aggregations: [{ as: 'count', operator: 'count' }], kind: 'aggregate' },
+    });
+    await expect(app.executeAction(
+      owner.id,
+      'cli',
+      'chart.create',
+      {
+        handleId: 'fake-handle',
+        presentation: { series: ['count'], type: 'bar' },
+        title: 'Selected pinned chart',
+      },
+      { typeId: 'chart', typeVersion: '1.0.0' },
+    )).rejects.toBeDefined();
     const pinnedChart = await app.executeAction(
       owner.id,
       'cli',
       'chart.create',
       {
-        handleId: 'owned-handler-does-not-consume-it',
+        handleId: chartHandle.id,
         presentation: { series: ['count'], type: 'bar' },
         title: 'Selected pinned chart',
       },
@@ -392,6 +446,19 @@ describe('Channel Type version pinning', () => {
     await expect(app.executeAction(viewer.subject!.id, 'cli', 'table.custom.reset-display', {
       channelId: 'table-v2',
     })).rejects.toMatchObject({ code: 'permission.denied' });
+    await app.executeAction(viewer.subject!.id, 'cli', 'table.view.create', {
+      channelId: 'table-v2',
+      filters: [],
+      grouping: [],
+      name: 'Scoped viewer view',
+      sorting: [],
+      visibility: 'personal',
+      visibleFieldIds: [],
+    });
+    expect((await store.listOperations('table-v2')).at(-1)!.changes).toEqual([
+      expect.objectContaining({ kind: 'table.view-saved' }),
+      expect.objectContaining({ kind: 'activity.appended' }),
+    ]);
     await app.executeAction(owner.id, 'cli', 'table.record.create', {
       channelId: 'table-v1',
       values: {},
