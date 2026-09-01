@@ -79,7 +79,6 @@ async function chart(value: DatagramRuntime, sourceChannelId: string) {
   });
   const created = await value.app.executeAction(value.owner.id, 'agent', 'chart.create', {
     handleId: aggregated.id,
-    handlePurpose: 'chart.create',
     presentation: { categoryField: 'region', series: ['total'], type: 'bar' },
     title: 'Live private revenue',
   });
@@ -211,12 +210,43 @@ describe('live Chart Channel', () => {
     await expect(
       value.app.executeAction(value.owner.id, 'agent', 'chart.create', {
         handleId: handle.id,
-        handlePurpose: 'chart.create',
         presentation: { series: ['count'], type: 'bar' },
         title: 'Invalid Chart',
       }),
     ).rejects.toMatchObject({
       code: 'chart.result-handle-incompatible',
+    } satisfies Partial<DatagramError>);
+    expect(await value.store.listChannels(value.owner.id)).toHaveLength(before.length);
+  });
+
+  test('fixes Chart creation purpose and blocks definitionless generic Charts', async () => {
+    const value = await runtime();
+    const sourceChannelId = await source(value);
+    const spoofed = await value.app.prepareQuery(
+      value.owner.id,
+      'agent',
+      'table.records.list',
+      { channelId: sourceChannelId },
+      'attacker-controlled',
+    );
+    const before = await value.store.listChannels(value.owner.id);
+
+    await expect(
+      value.app.executeAction(value.owner.id, 'agent', 'chart.create', {
+        handleId: spoofed.id,
+        presentation: { series: ['count'], type: 'bar' },
+        title: 'Spoofed Chart',
+      }),
+    ).rejects.toMatchObject({
+      code: 'result-handle.purpose-mismatch',
+    } satisfies Partial<DatagramError>);
+    await expect(
+      value.app.executeAction(value.owner.id, 'cli', 'channel.create', {
+        title: 'Definitionless Chart',
+        typeId: 'chart',
+      }),
+    ).rejects.toMatchObject({
+      code: 'chart.definition-required',
     } satisfies Partial<DatagramError>);
     expect(await value.store.listChannels(value.owner.id)).toHaveLength(before.length);
   });

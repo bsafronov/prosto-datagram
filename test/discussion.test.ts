@@ -23,6 +23,34 @@ async function createPerson(value: DatagramRuntime, displayName: string) {
 }
 
 async function createChannel(value: DatagramRuntime, typeId: string) {
+  if (typeId === 'chart') {
+    const source = await value.app.executeAction(value.owner.id, 'cli', 'channel.create', {
+      title: 'chart source',
+      typeId: 'table',
+    });
+    const prepared = await value.app.prepareQuery(
+      value.owner.id,
+      'agent',
+      'table.records.list',
+      { channelId: source.subject!.id },
+      'chart.aggregate',
+    );
+    const aggregated = await value.app.composeResultHandle(value.owner.id, {
+      handleId: prepared.id,
+      inputPurpose: 'chart.aggregate',
+      outputPurpose: 'chart.create',
+      transform: {
+        aggregations: [{ as: 'count', operator: 'count' }],
+        kind: 'aggregate',
+      },
+    });
+    const receipt = await value.app.executeAction(value.owner.id, 'cli', 'chart.create', {
+      handleId: aggregated.id,
+      presentation: { series: ['count'], type: 'bar' },
+      title: 'chart discussion',
+    });
+    return receipt.subject!.id;
+  }
   const receipt = await value.app.executeAction(
     value.owner.id,
     'cli',

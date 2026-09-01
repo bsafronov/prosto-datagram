@@ -19,6 +19,31 @@ async function createChannel(value: DatagramRuntime, title: string, typeId = 'ta
   return receipt.subject!.id;
 }
 
+async function createChart(value: DatagramRuntime, title: string, sourceChannelId: string) {
+  const source = await value.app.prepareQuery(
+    value.owner.id,
+    'agent',
+    'table.records.list',
+    { channelId: sourceChannelId },
+    'chart.aggregate',
+  );
+  const aggregate = await value.app.composeResultHandle(value.owner.id, {
+    handleId: source.id,
+    inputPurpose: 'chart.aggregate',
+    outputPurpose: 'chart.create',
+    transform: {
+      aggregations: [{ as: 'count', operator: 'count' }],
+      kind: 'aggregate',
+    },
+  });
+  const receipt = await value.app.executeAction(value.owner.id, 'cli', 'chart.create', {
+    handleId: aggregate.id,
+    presentation: { series: ['count'], type: 'bar' },
+    title,
+  });
+  return receipt.subject!.id;
+}
+
 async function createPerson(value: DatagramRuntime, displayName: string) {
   const receipt = await value.app.executeAction(
     value.owner.id,
@@ -50,7 +75,7 @@ describe('Flat Channel List', () => {
     const value = await runtime();
     const tableId = await createChannel(value, 'Table', 'table');
     const dictionaryId = await createChannel(value, 'Dictionary', 'dictionary');
-    const chartId = await createChannel(value, 'Chart', 'chart');
+    const chartId = await createChart(value, 'Chart', tableId);
 
     expect((await list(value, value.owner.id)).map((item) => item.id)).toEqual([
       chartId,

@@ -462,6 +462,11 @@ export class DatagramApplication {
         run: async (context, input) => {
           await this.#requirePerson(context.actorId);
           const type = this.channelTypes.require(input.typeId);
+          invariant(
+            type.id !== 'chart',
+            'chart.definition-required',
+            'Create Chart Channels through chart.create',
+          );
           const channelId = newId('channel');
           const channel: Channel = {
             createdAt: nowIso(),
@@ -2598,7 +2603,6 @@ export class DatagramApplication {
         description: 'Create a live Chart Channel from a compatible Result Handle.',
         inputSchema: z.object({
           handleId: z.string().min(1),
-          handlePurpose: z.string().min(1),
           presentation: chartPresentationSchema,
           title: z.string().trim().min(1).max(160),
         }),
@@ -2608,7 +2612,7 @@ export class DatagramApplication {
             this.handles.serviceId,
             context.actorId,
             input.handleId,
-            input.handlePurpose,
+            'chart.create',
           );
           const channelId = newId('channel');
           const definition = await this.#chartDefinitionFromResult(
