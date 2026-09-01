@@ -97,6 +97,39 @@ test('MCP exposes only core and one exact Channel Type contract set', async () =
   expect(names).not.toContain('chart.open');
 });
 
+test('MCP dispatch enforces selected Channel Type contract against input Channel', async () => {
+  runtime = await createRuntime({ databasePath: ':memory:' });
+  const created = await runtime.app.executeAction(
+    runtime.owner.id,
+    'cli',
+    'channel.create',
+    { title: 'Dictionary', typeId: 'dictionary' },
+  );
+  const channelId = created.subject!.id;
+  server = await createMcpGateway({
+    app: runtime.app,
+    authenticateIdentity: () => ({ actorId: runtime!.owner.id }),
+    channelType: { typeId: 'table', typeVersion: '1.0.0' },
+  });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const client = new McpTestClient(clientTransport);
+  await client.start();
+  await server.connect(serverTransport);
+  await client.initialize();
+
+  for (const [name, input] of [
+    ['discussion.message.post', { channelId, text: 'wrong type' }],
+    ['discussion.messages.list', { channelId }],
+  ] as const) {
+    const result = await call(client, name, input) as {
+      isError: boolean;
+      structuredContent: { error: { code: string } };
+    };
+    expect(result.isError).toBeTrue();
+    expect(result.structuredContent.error.code).toBe('channel-type.version-mismatch');
+  }
+});
+
 const call = (client: McpTestClient, name: string, args: Record<string, unknown>) =>
   client.request('tools/call', { arguments: args, name });
 

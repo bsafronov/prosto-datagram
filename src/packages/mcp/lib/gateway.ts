@@ -93,7 +93,13 @@ export async function createMcpGateway({
       },
       async (rawInput) => {
         try {
-          const receipt = await app.executeAction(actorId, 'mcp', definition.name, rawInput);
+          const receipt = await app.executeAction(
+            actorId,
+            'mcp',
+            definition.name,
+            rawInput,
+            channelType,
+          );
           return toolResult(actionOutput(receipt));
         } catch (error) {
           return toolResult(safeToolError(error, 'Action'), true);
@@ -112,7 +118,14 @@ export async function createMcpGateway({
       },
       async (rawInput) => {
         try {
-          const handle = await app.prepareQuery(actorId, 'mcp', definition.name, rawInput);
+          const handle = await app.prepareQuery(
+            actorId,
+            'mcp',
+            definition.name,
+            rawInput,
+            undefined,
+            channelType,
+          );
           return toolResult(queryOutput(handle));
         } catch (error) {
           return toolResult(safeToolError(error, 'Query'), true);

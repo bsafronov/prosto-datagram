@@ -91,3 +91,41 @@ test('CLI maps invalid input to safe structured errors', async () => {
   expect(result.stderr).not.toContain('protected value');
   expect(result.stderr).not.toContain('at ');
 });
+
+test('CLI dispatch enforces selected Channel Type contract against input Channel', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'datagram-cli-type-selection-'));
+  temporaryDirectories.push(directory);
+  const databasePath = join(directory, 'datagram.sqlite');
+  const created = await cli([
+    'action',
+    'channel.create',
+    '--input',
+    JSON.stringify({ title: 'Dictionary', typeId: 'dictionary' }),
+    '--db',
+    databasePath,
+  ]);
+  const channelId = (JSON.parse(created.stdout) as { subject: { id: string } }).subject.id;
+
+  for (const [command, name, value] of [
+    ['action', 'discussion.message.post', { channelId, text: 'wrong type' }],
+    ['query', 'discussion.messages.list', { channelId }],
+    ['agent-query', 'discussion.messages.list', { channelId }],
+  ] as const) {
+    const result = await cli([
+      command,
+      name,
+      '--type-id',
+      'table',
+      '--type-version',
+      '1.0.0',
+      '--input',
+      JSON.stringify(value),
+      '--db',
+      databasePath,
+    ]);
+    expect(result.exitCode).toBe(1);
+    expect(JSON.parse(result.stderr)).toMatchObject({
+      error: { code: 'channel-type.version-mismatch' },
+    });
+  }
+});

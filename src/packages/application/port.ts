@@ -5,6 +5,7 @@ import type {
   SubscriptionEvent,
 } from '../domain/model';
 import type { ActionRegistry, QueryRegistry } from './contracts';
+import type { ChannelTypeContractSelector } from './contracts';
 import type {
   DataViewQueryDefinition,
   IssuedResultHandle,
@@ -22,12 +23,14 @@ export interface DatagramApplicationPort {
     origin: OperationOrigin,
     name: string,
     input: unknown,
+    selectedType?: ChannelTypeContractSelector,
   ): Promise<ActionReceipt>;
   executeQuery(
     actorId: string,
     origin: OperationOrigin,
     name: string,
     input: unknown,
+    selectedType?: ChannelTypeContractSelector,
   ): Promise<QueryResult>;
   prepareQuery(
     actorId: string,
@@ -35,6 +38,7 @@ export interface DatagramApplicationPort {
     name: string,
     input: unknown,
     purpose?: string,
+    selectedType?: ChannelTypeContractSelector,
   ): Promise<IssuedResultHandle>;
   reopenDataView(
     actorId: string,

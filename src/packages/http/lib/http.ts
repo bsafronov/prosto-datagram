@@ -148,7 +148,7 @@ function handler(
           throw new DatagramError('action.unknown', `Unknown definition: ${name}`, 404);
         }
         return json(
-          await app.executeAction(actorId, 'http', name, await body(request)),
+          await app.executeAction(actorId, 'http', name, await body(request), selector),
           201,
         );
       }
@@ -160,7 +160,7 @@ function handler(
           throw new DatagramError('query.unknown', `Unknown definition: ${name}`, 404);
         }
         return json(
-          await app.executeQuery(actorId, 'http', name, await body(request)),
+          await app.executeQuery(actorId, 'http', name, await body(request), selector),
         );
       }
 
@@ -176,6 +176,8 @@ function handler(
             'agent',
             name,
             await body(request),
+            undefined,
+            selector,
           ),
           201,
         );

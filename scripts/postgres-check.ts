@@ -1,6 +1,17 @@
 const suppliedUrl = process.env.DATAGRAM_TEST_POSTGRES_URL;
 const containerName = `datagram-postgres-check-${crypto.randomUUID()}`;
 const password = crypto.randomUUID();
+const readinessTimeoutMs = 30_000;
+const postgresProbe = `
+  import { SQL } from 'bun';
+
+  const client = new SQL(process.env.DATAGRAM_TEST_POSTGRES_URL!);
+  try {
+    await client\`SELECT 1\`;
+  } finally {
+    await client.close();
+  }
+`;
 
 async function command(
   argv: readonly string[],
@@ -27,7 +38,24 @@ async function runTests(connectionString: string): Promise<void> {
   );
 }
 
+async function waitForPostgres(connectionString: string): Promise<void> {
+  const deadline = Date.now() + readinessTimeoutMs;
+  while (true) {
+    try {
+      await command(['bun', '-e', postgresProbe], {
+        env: { ...Bun.env, DATAGRAM_TEST_POSTGRES_URL: connectionString },
+        quiet: true,
+      });
+      return;
+    } catch (error) {
+      if (Date.now() >= deadline) throw error;
+      await Bun.sleep(250);
+    }
+  }
+}
+
 if (suppliedUrl) {
+  await waitForPostgres(suppliedUrl);
   await runTests(suppliedUrl);
 } else {
   try {
@@ -58,22 +86,10 @@ if (suppliedUrl) {
     ]);
     const address = await command(['docker', 'port', containerName, '5432/tcp']);
     const port = address.slice(address.lastIndexOf(':') + 1);
-    const deadline = Date.now() + 30_000;
-    while (true) {
-      try {
-        await command(
-          ['docker', 'exec', containerName, 'pg_isready', '--username', 'datagram', '--dbname', 'datagram'],
-          { quiet: true },
-        );
-        break;
-      } catch (error) {
-        if (Date.now() >= deadline) throw error;
-        await Bun.sleep(250);
-      }
-    }
-    await runTests(
-      `postgres://datagram:${password}@127.0.0.1:${port}/datagram?sslmode=disable`,
-    );
+    const connectionString =
+      `postgres://datagram:${password}@127.0.0.1:${port}/datagram?sslmode=disable`;
+    await waitForPostgres(connectionString);
+    await runTests(connectionString);
   } finally {
     await command(['docker', 'rm', '--force', containerName], { quiet: true }).catch(() => {});
   }

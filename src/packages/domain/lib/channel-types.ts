@@ -1,10 +1,19 @@
 import * as z from 'zod/v4';
 
 import { chartChannelType } from './channel-type-modules/chart';
+import type {
+  ChannelActionCapabilities,
+  ChannelQueryCapabilities,
+} from './channel-type-modules/contract';
 import { dictionaryChannelType } from './channel-type-modules/dictionary';
 import { tableChannelType } from './channel-type-modules/table';
 import { DatagramError } from './errors';
-import { viewDefinitionSchema, type Operation, type ViewDefinition } from './model';
+import {
+  viewDefinitionSchema,
+  type ChannelRole,
+  type Operation,
+  type ViewDefinition,
+} from './model';
 
 export { dictionaryLabelKey, normalizeDictionaryLabel } from './channel-type-modules/dictionary';
 export { validateTableFieldValue } from './channel-type-modules/table';
@@ -12,10 +21,15 @@ export { validateTableFieldValue } from './channel-type-modules/table';
 const defaultContractHandler = (
   input: any,
   next: (input: any) => Promise<any>,
+  _capabilities: ChannelActionCapabilities | ChannelQueryCapabilities,
 ): Promise<any> => next(input);
 
 const channelContractSchema = z.object({
-  execute: z.custom<(input: any, next: (input: any) => Promise<any>) => Promise<any>>(
+  execute: z.custom<(
+    input: any,
+    next: (input: any) => Promise<any>,
+    capabilities: ChannelActionCapabilities | ChannelQueryCapabilities,
+  ) => Promise<any>>(
     (value) => typeof value === 'function',
   ).default(defaultContractHandler),
   inputSchema: z.custom<z.ZodType>(
@@ -97,7 +111,11 @@ const snapshotSchema = (root: z.ZodType): z.ZodType => {
 const publicContract = (
   name: string,
   schema: z.ZodType,
-  execute: (input: unknown, next: (input: unknown) => Promise<unknown>) => Promise<unknown>,
+  execute: (
+    input: unknown,
+    next: (input: unknown) => Promise<unknown>,
+    capabilities: ChannelActionCapabilities | ChannelQueryCapabilities,
+  ) => Promise<unknown>,
 ): { readonly execute: typeof execute; readonly inputSchema: z.ZodType; readonly name: string } =>
   Object.defineProperties(
     { execute, name },
@@ -121,7 +139,7 @@ export const channelTypeDefinitionSchema = z.object({
   views: z.array(z.object({
     commands: z.array(z.string()),
     kind: z.string().min(1),
-    produce: z.custom<(candidate: ViewDefinition) => ViewDefinition>(
+    produce: z.custom<(candidate: ViewDefinition, role?: ChannelRole) => ViewDefinition>(
       (value) => value === undefined || typeof value === 'function',
     ).optional(),
     query: z.string().min(1),
@@ -141,6 +159,7 @@ export class ChannelTypeRegistry {
   readonly #handlers = new Map<string, (
     input: unknown,
     next: (input: unknown) => Promise<unknown>,
+    capabilities: ChannelActionCapabilities | ChannelQueryCapabilities,
   ) => Promise<unknown>>();
   readonly #schemas = new Map<string, z.ZodType>();
   readonly #versions = new Map<string, ChannelTypeDefinition[]>();
@@ -167,6 +186,10 @@ export class ChannelTypeRegistry {
           this.#schemas.set(
             `query:${ChannelTypeRegistry.key(parsed.id, parsed.version)}:${contract.name}`,
             schema,
+          );
+          this.#handlers.set(
+            `query:${ChannelTypeRegistry.key(parsed.id, parsed.version)}:${contract.name}`,
+            contract.execute,
           );
           return publicContract(contract.name, schema, contract.execute);
         }),
@@ -230,6 +253,7 @@ export class ChannelTypeRegistry {
     version: string,
     name: string,
     input: unknown,
+    capabilities: ChannelActionCapabilities,
     next: (input: unknown) => Promise<T>,
   ): Promise<T> {
     const schema = this.requireAction(id, version, name);
@@ -239,7 +263,25 @@ export class ChannelTypeRegistry {
     const handler = this.#handlers.get(
       `action:${ChannelTypeRegistry.key(id, version)}:${name}`,
     );
-    return (handler ? handler(parsed, next) : next(parsed)) as Promise<T>;
+    return (handler ? handler(parsed, next, capabilities) : next(parsed)) as Promise<T>;
+  }
+
+  async executeQuery<T>(
+    id: string,
+    version: string,
+    name: string,
+    input: unknown,
+    capabilities: ChannelQueryCapabilities,
+    next: (input: unknown) => Promise<T>,
+  ): Promise<T> {
+    const schema = this.requireQuery(id, version, name);
+    if (!schema) return next(input);
+    const parsed = schema.parse(input);
+    this.validateState(id, version, name, parsed);
+    const handler = this.#handlers.get(
+      `query:${ChannelTypeRegistry.key(id, version)}:${name}`,
+    );
+    return (handler ? handler(parsed, next, capabilities) : next(parsed)) as Promise<T>;
   }
 
   assertImplementations(
@@ -279,6 +321,7 @@ export class ChannelTypeRegistry {
     version: string,
     query: string,
     candidate: ViewDefinition,
+    role?: ChannelRole,
   ): ViewDefinition {
     const definition = this.require(id, version);
     const declared = definition.views.find((candidate) => candidate.query === query);
@@ -288,7 +331,7 @@ export class ChannelTypeRegistry {
         `Channel Type Query has no View Definition: ${id}@${version}:${query}`,
       );
     }
-    const view = viewDefinitionSchema.parse(declared.produce?.(candidate) ?? candidate);
+    const view = viewDefinitionSchema.parse(declared.produce?.(candidate, role) ?? candidate);
     if (
       declared.kind !== view.kind ||
       view.commands.some((command) => !declared.commands.includes(command))

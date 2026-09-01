@@ -163,3 +163,34 @@ test('development HTTP actor selection is explicit and separate from production 
     person.subject!.id,
   );
 });
+
+test('HTTP dispatch enforces selected Channel Type contract against input Channel', async () => {
+  runtime = await createRuntime({ databasePath: ':memory:' });
+  const fetch = createDevelopmentHttpHandler({
+    app: runtime.app,
+    defaultActorId: runtime.owner.id,
+  });
+  const created = await runtime.app.executeAction(
+    runtime.owner.id,
+    'cli',
+    'channel.create',
+    { title: 'Dictionary', typeId: 'dictionary' },
+  );
+  const channelId = created.subject!.id;
+  const selected = 'typeId=table&typeVersion=1.0.0';
+
+  for (const [path, input] of [
+    [`/v1/actions/discussion.message.post?${selected}`, { channelId, text: 'wrong type' }],
+    [`/v1/queries/discussion.messages.list?${selected}`, { channelId }],
+    [`/v1/agent/queries/discussion.messages.list?${selected}`, { channelId }],
+  ] as const) {
+    const response = await fetch(new Request(`http://datagram.test${path}`, {
+      body: JSON.stringify(input),
+      method: 'POST',
+    }));
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({
+      error: { code: 'channel-type.version-mismatch' },
+    });
+  }
+});

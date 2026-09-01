@@ -40,7 +40,7 @@ import type {
 } from '../../domain/model';
 import type { DatagramStore } from './store';
 import { ActionRegistry, QueryRegistry, defineAction, defineQuery } from './contracts';
-import type { ExecutionContext } from './contracts';
+import type { ChannelTypeContractSelector, ExecutionContext } from './contracts';
 import { ResultHandleBroker, transformResult } from './result-handles';
 import type {
   DataViewQueryDefinition,
@@ -106,6 +106,14 @@ const fieldDefaultConversionResolutionSchema = z.object({
 
 const toJson = (value: unknown): JsonValue => jsonValueSchema.parse(value);
 
+const nestedChannelIds = (value: unknown): string[] => {
+  if (Array.isArray(value)) return value.flatMap(nestedChannelIds);
+  if (!value || typeof value !== 'object') return [];
+  return Object.entries(value).flatMap(([key, child]) =>
+    key === 'channelId' && typeof child === 'string' ? [child] : nestedChannelIds(child),
+  );
+};
+
 export class DatagramApplication {
   readonly actions: ActionRegistry;
   readonly queries: QueryRegistry;
@@ -157,15 +165,66 @@ export class DatagramApplication {
     origin: OperationOrigin,
     name: string,
     input: unknown,
+    selectedType?: ChannelTypeContractSelector,
   ): Promise<ActionReceipt> {
     await this.#requirePerson(actorId);
     const contract = await this.#channelContract('action', name, input);
+    if (selectedType && contract) {
+      invariant(
+        contract.typeId === selectedType.typeId &&
+          contract.typeVersion === selectedType.typeVersion,
+        'channel-type.version-mismatch',
+        'Selected Channel Type version does not own this Channel',
+        409,
+      );
+    }
     if (contract) {
       return this.channelTypes.executeAction(
         contract.typeId,
         contract.typeVersion,
         name,
         input,
+        {
+          actorId,
+          commit: async (request) => {
+            const requestedChannelId =
+              input && typeof input === 'object' && !Array.isArray(input)
+                ? (input as Record<string, unknown>).channelId
+                : undefined;
+            invariant(
+              requestedChannelId === request.channelId,
+              'channel-type.capability-denied',
+              'Channel Type handler may only commit to its selected Channel',
+              403,
+            );
+            invariant(
+              request.changes.every((change) => {
+                const channelIds = nestedChannelIds(change);
+                return channelIds.length > 0 && channelIds.every((value) => value === request.channelId);
+              }),
+              'channel-type.capability-denied',
+              'Channel Type handler transitions must stay within its selected Channel',
+              403,
+            );
+            const channel = await this.#requireChannel(request.channelId);
+            invariant(
+              channel.typeId === contract.typeId && channel.typeVersion === contract.typeVersion,
+              'channel-type.version-mismatch',
+              'Selected Channel Type version does not own this Channel',
+              409,
+            );
+            await this.#requireRole(actorId, request.channelId, request.requiredRole);
+            return this.#commit(
+              { actorId, origin },
+              name,
+              request.channelId,
+              () => request.changes,
+              request.subject,
+            );
+          },
+          newId,
+          now: nowIso,
+        },
         (parsed) => this.actions.execute(name, { actorId, origin }, parsed, z.any()),
       );
     }
@@ -181,23 +240,36 @@ export class DatagramApplication {
     origin: OperationOrigin,
     name: string,
     input: unknown,
+    selectedType?: ChannelTypeContractSelector,
   ): Promise<QueryResult> {
     await this.#requirePerson(actorId);
     const contract = await this.#channelContract('query', name, input);
-    const result = await this.queries.execute(
-      name,
-      { actorId, origin },
-      input,
-      contract?.schema.transform((parsed) => {
-        this.channelTypes.validateState(
+    if (selectedType && contract) {
+      invariant(
+        contract.typeId === selectedType.typeId &&
+          contract.typeVersion === selectedType.typeVersion,
+        'channel-type.version-mismatch',
+        'Selected Channel Type version does not own this Channel',
+        409,
+      );
+    }
+    const result = contract
+      ? await this.channelTypes.executeQuery(
           contract.typeId,
           contract.typeVersion,
           name,
-          parsed,
-        );
-        return parsed;
-      }),
-    );
+          input,
+          {
+            actorId,
+            role: await this.#requireRole(
+              actorId,
+              (input as { channelId: string }).channelId,
+              'viewer',
+            ),
+          },
+          (parsed) => this.queries.execute(name, { actorId, origin }, parsed, z.any()),
+        )
+      : await this.queries.execute(name, { actorId, origin }, input);
     if (input !== null && !Array.isArray(input) && typeof input === 'object') {
       const channelId = (input as Record<string, unknown>).channelId;
       if (typeof channelId === 'string') {
@@ -213,6 +285,7 @@ export class DatagramApplication {
               channel!.typeVersion,
               name,
               result.view,
+              await this.#requireRole(actorId, channelId, 'viewer'),
             ),
           };
         }
@@ -270,10 +343,11 @@ export class DatagramApplication {
     name: string,
     input: unknown,
     purpose = name,
+    selectedType?: ChannelTypeContractSelector,
   ): Promise<IssuedResultHandle> {
     let result: QueryResult;
     try {
-      result = await this.executeQuery(actorId, origin, name, input);
+      result = await this.executeQuery(actorId, origin, name, input, selectedType);
     } catch (error) {
       if (error instanceof DatagramError) {
         throw new DatagramError(error.code, 'Agent Query could not be prepared', error.status);

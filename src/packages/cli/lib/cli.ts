@@ -107,7 +107,7 @@ export async function runCli(args: readonly string[]): Promise<void> {
           throw new DatagramError('action.unknown', `Unknown definition: ${name}`, 404);
         }
         output(
-          await runtime.app.executeAction(actorId, 'cli', name, input(args)),
+          await runtime.app.executeAction(actorId, 'cli', name, input(args), selector),
         );
         break;
       }
@@ -117,7 +117,7 @@ export async function runCli(args: readonly string[]): Promise<void> {
           throw new DatagramError('query.unknown', `Unknown definition: ${name}`, 404);
         }
         output(
-          await runtime.app.executeQuery(actorId, 'cli', name, input(args)),
+          await runtime.app.executeQuery(actorId, 'cli', name, input(args), selector),
         );
         break;
       }
@@ -127,7 +127,7 @@ export async function runCli(args: readonly string[]): Promise<void> {
           throw new DatagramError('query.unknown', `Unknown definition: ${name}`, 404);
         }
         output(
-          await runtime.app.prepareQuery(actorId, 'agent', name, input(args)),
+          await runtime.app.prepareQuery(actorId, 'agent', name, input(args), undefined, selector),
         );
         break;
       }

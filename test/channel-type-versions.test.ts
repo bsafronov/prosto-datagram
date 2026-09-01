@@ -7,7 +7,7 @@ import {
   bundledChannelTypes,
   ChannelTypeRegistry,
 } from '../src/packages/domain/channel-types';
-import type { Channel, Operation } from '../src/packages/domain/model';
+import type { Channel, Operation, QueryResult } from '../src/packages/domain/model';
 import { SqliteStore } from '../src/packages/sqlite-store';
 
 const stores: SqliteStore[] = [];
@@ -116,10 +116,18 @@ describe('Channel Type version pinning', () => {
                 execute: async (
                   input: { channelId: string; fieldId: string | null },
                   next: (input: { channelId: string; fieldId: string | null }) => Promise<unknown>,
-                ) => next({
-                  ...input,
-                  fieldId: input.fieldId === 'v2-default' ? null : input.fieldId,
-                }),
+                  capabilities: Parameters<typeof action.execute>[2],
+                ) =>
+                  input.fieldId === 'v2-default' && 'commit' in capabilities
+                    ? capabilities.commit({
+                        changes: [{
+                          channelId: input.channelId,
+                          kind: 'table.display-field-set',
+                        }],
+                        channelId: input.channelId,
+                        requiredRole: 'admin',
+                      })
+                    : next(input),
               }
           : action,
       ),
@@ -127,6 +135,16 @@ describe('Channel Type version pinning', () => {
         query.name === 'table.configuration'
           ? {
               ...query,
+              execute: async (
+                input: { channelId: string; edition: 'v2' },
+                next: (input: { channelId: string; edition: 'v2' }) => Promise<unknown>,
+              ) => {
+                const result = (await next(input)) as QueryResult;
+                return {
+                  ...result,
+                  data: { ...(result.data as Record<string, unknown>), edition: 'v2' },
+                };
+              },
               inputSchema: z.object({
                 channelId: z.string().min(1),
                 edition: z.literal('v2'),
@@ -215,6 +233,15 @@ describe('Channel Type version pinning', () => {
     await expect(
       app.executeQuery(owner.id, 'cli', 'table.configuration', { channelId: 'table-v2' }),
     ).rejects.toBeDefined();
+    await expect(
+      app.executeQuery(
+        owner.id,
+        'cli',
+        'table.configuration',
+        { channelId: 'table-v2', edition: 'v2' },
+        { typeId: 'table', typeVersion: '1.0.0' },
+      ),
+    ).rejects.toMatchObject({ code: 'channel-type.version-mismatch' });
     const v2Result = await app.executeQuery(owner.id, 'cli', 'table.configuration', {
       channelId: 'table-v2',
       edition: 'v2',
@@ -224,6 +251,7 @@ describe('Channel Type version pinning', () => {
       kind: 'table-configuration-v2',
       title: 'Table Configuration v2',
     });
+    expect(v2Result.data).toMatchObject({ edition: 'v2' });
     await app.executeAction(owner.id, 'cli', 'table.record.create', {
       channelId: 'table-v1',
       values: {},
@@ -250,6 +278,10 @@ describe('Channel Type version pinning', () => {
       fieldId: 'v2-default',
     });
     expect(await store.getTableDisplayFieldId('table-v2')).toBeNull();
+    expect((await store.listOperations('table-v2')).at(-1)?.changes).toContainEqual({
+      channelId: 'table-v2',
+      kind: 'table.display-field-set',
+    });
   });
 
   test('rejects reads and actions for a Channel pinned to an unavailable version', async () => {
