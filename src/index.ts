@@ -3,6 +3,7 @@ export * from './packages/application/contracts';
 export * from './packages/application/port';
 export * from './packages/application/result-handles';
 export * from './packages/application/store';
+export * from './packages/agent-runtime';
 export * from './packages/domain/channel-types';
 export * from './packages/domain/errors';
 export * from './packages/domain/model';
