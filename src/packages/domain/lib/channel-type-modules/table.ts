@@ -154,7 +154,7 @@ export const tableChannelType = {
       invariant(field, 'table.field-not-found', 'Table Field not found', 404);
       invariant(field.tombstonedAt === undefined, 'table.field-already-tombstoned', 'Table Field is already tombstoned', 409);
       invariant(field.version === input.observedVersion, 'table.field-conflict', 'Table Field changed after observation', 409);
-      await capabilities.changes.updateTableField!({ ...field, tombstonedAt: capabilities.now(), tombstonedBy: capabilities.actorId, version: field.version + 1 }, field);
+      await capabilities.changes.updateTableField!({ fieldId: field.id, kind: 'tombstone', observedVersion: input.observedVersion });
       if (await capabilities.state!.displayFieldId() === field.id) await capabilities.changes.setTableDisplayField!(null);
       return capabilities.commit();
     }, { kind: 'channel-role', minimumRole: 'admin' }, ['updateTableField', 'setTableDisplayField']),
@@ -168,12 +168,7 @@ export const tableChannelType = {
       invariant(field, 'table.field-not-found', 'Table Field not found', 404);
       invariant(field.tombstonedAt !== undefined, 'table.field-not-tombstoned', 'Table Field is not tombstoned', 409);
       invariant(field.version === input.observedVersion, 'table.field-conflict', 'Table Field changed after observation', 409);
-      const { tombstonedAt: _at, tombstonedBy: _by, ...active } = field;
-      const next: TableField = { ...active, version: field.version + 1 };
-      const fields = (await capabilities.state!.tableFields()).map((candidate) => candidate.id === field.id ? next : candidate);
-      const records = await capabilities.state!.tableRecords();
-      for (const record of records.filter((candidate) => candidate.tombstonedAt === undefined)) await capabilities.state!.validateTableRecordValues(fields, records, record.values, record.id, true, []);
-      await capabilities.changes.updateTableField!(next, field);
+      await capabilities.changes.updateTableField!({ fieldId: field.id, kind: 'restore', observedVersion: input.observedVersion });
       return capabilities.commit();
     }, { kind: 'channel-role', minimumRole: 'admin' }, ['updateTableField']),
     contract('table.field.convert', z.object({
@@ -247,10 +242,18 @@ export const tableChannelType = {
         return update ? { ...record, values: { ...record.values, [field.key]: update.value } } : record;
       });
       for (const record of nextRecords.filter((candidate) => candidate.tombstonedAt === undefined)) await capabilities.state!.validateTableRecordValues(nextFields, nextRecords, record.values, record.id, true, [field.key]);
-      await capabilities.changes.updateTableField!(next, field);
-      for (const { record, value } of updates) await capabilities.changes.updateTableRecord!({ observedVersions: { [field.key]: record.fieldVersions[field.key] ?? 0 }, recordId: record.id, values: { [field.key]: value } });
+      await capabilities.changes.updateTableField!({
+        ...(input.cardinality === undefined ? {} : { cardinality: input.cardinality }),
+        ...(input.targetChannelId === undefined ? {} : { targetChannelId: input.targetChannelId }),
+        ...(nextDefault === undefined ? {} : { defaultValue: nextDefault }),
+        fieldId: field.id,
+        kind: 'convert',
+        observedVersion: input.observedVersion,
+        recordUpdates: updates.map(({ record, value }) => ({ recordId: record.id, value })),
+        targetType: input.targetType,
+      });
       return capabilities.commit();
-    }, { kind: 'channel-role', minimumRole: 'admin' }, ['cancel', 'updateTableField', 'updateTableRecord']),
+    }, { kind: 'channel-role', minimumRole: 'admin' }, ['cancel', 'updateTableField']),
     contract('table.field.purge', z.object({
       channelId: channelIdSchema,
       fieldId: z.string().min(1),

@@ -261,6 +261,7 @@ describe('Channel Type version pinning', () => {
 
   test('derives Field purge and Record update transitions from canonical state', async () => {
     let fieldId = '';
+    let keepFieldId = '';
     let recordId = '';
     const definitions = bundledChannelTypes.map((definition) => definition.id === 'table' ? {
       ...definition,
@@ -273,6 +274,33 @@ describe('Channel Type version pinning', () => {
         },
         inputSchema: z.object({ channelId: z.string() }),
         name: 'table.attack.invalid-record',
+      }, {
+        allowedOperations: ['updateTableField' as const],
+        authorization: { kind: 'channel-role' as const, minimumRole: 'owner' as const },
+        execute: async (_input: unknown, capabilities: any) => {
+          await capabilities.changes.updateTableField({ fieldId, kind: 'tombstone', observedVersion: 999 });
+          return capabilities.commit();
+        },
+        inputSchema: z.object({ channelId: z.string() }),
+        name: 'table.attack.field-version',
+      }, {
+        allowedOperations: ['updateTableField' as const],
+        authorization: { kind: 'channel-role' as const, minimumRole: 'owner' as const },
+        execute: async (_input: unknown, capabilities: any) => {
+          await capabilities.changes.updateTableField({ fieldId, kind: 'restore', observedVersion: 1 });
+          return capabilities.commit();
+        },
+        inputSchema: z.object({ channelId: z.string() }),
+        name: 'table.attack.field-undo',
+      }, {
+        allowedOperations: ['updateTableField' as const],
+        authorization: { kind: 'channel-role' as const, minimumRole: 'owner' as const },
+        execute: async (_input: unknown, capabilities: any) => {
+          await capabilities.changes.updateTableField({ fieldId: keepFieldId, kind: 'convert', observedVersion: 1, recordUpdates: [], targetType: 'number' });
+          return capabilities.commit();
+        },
+        inputSchema: z.object({ channelId: z.string() }),
+        name: 'table.attack.field-schema',
       }, {
         allowedOperations: ['purgeTableField' as const],
         authorization: { kind: 'channel-role' as const, minimumRole: 'owner' as const },
@@ -291,11 +319,18 @@ describe('Channel Type version pinning', () => {
     const app = new DatagramApplication(store, new ChannelTypeRegistry(definitions));
     const channelId = (await app.executeAction(owner.id, 'cli', 'channel.create', { title: 'Table', typeId: 'table' })).subject!.id;
     fieldId = (await app.executeAction(owner.id, 'cli', 'table.field.add', { channelId, key: 'score', label: 'Score', required: false, type: 'number', unique: false })).subject!.id;
-    await app.executeAction(owner.id, 'cli', 'table.field.add', { channelId, key: 'keep', label: 'Keep', required: false, type: 'text', unique: false });
+    keepFieldId = (await app.executeAction(owner.id, 'cli', 'table.field.add', { channelId, key: 'keep', label: 'Keep', required: false, type: 'text', unique: false })).subject!.id;
     recordId = (await app.executeAction(owner.id, 'cli', 'table.record.create', { channelId, values: { keep: 'safe', score: 5 } })).subject!.id;
     const before = (await store.listOperations(channelId)).length;
     await expect(app.executeAction(owner.id, 'cli', 'table.attack.invalid-record', { channelId }))
       .rejects.toMatchObject({ code: 'table.field-type' });
+    for (const [action, code] of [
+      ['table.attack.field-version', 'table.field-conflict'],
+      ['table.attack.field-undo', 'table.field-not-tombstoned'],
+      ['table.attack.field-schema', 'table.field-conversion-unresolved'],
+    ] as const) {
+      await expect(app.executeAction(owner.id, 'cli', action, { channelId })).rejects.toMatchObject({ code });
+    }
     expect(await store.listOperations(channelId)).toHaveLength(before);
     expect((await store.getTableRecord(recordId))?.values).toEqual({ keep: 'safe', score: 5 });
     await app.executeAction(owner.id, 'cli', 'table.field.tombstone', { channelId, fieldId, observedVersion: 1 });

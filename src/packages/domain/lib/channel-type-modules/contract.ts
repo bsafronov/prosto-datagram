@@ -107,7 +107,20 @@ export interface ChannelActionCapabilities {
     readonly setTableDisplayField?: (displayFieldId: string | null) => Promise<void>;
     readonly addTableField?: (field: TableField) => Promise<void>;
     readonly purgeTableField?: (fieldId: string) => Promise<void>;
-    readonly updateTableField?: (field: TableField, previousField: TableField) => Promise<void>;
+    readonly updateTableField?: (intent:
+      | { readonly fieldId: string; readonly kind: 'restore'; readonly observedVersion: number }
+      | { readonly fieldId: string; readonly kind: 'tombstone'; readonly observedVersion: number }
+      | {
+          readonly cardinality?: 'many' | 'one';
+          readonly defaultValue?: JsonValue;
+          readonly fieldId: string;
+          readonly kind: 'convert';
+          readonly observedVersion: number;
+          readonly recordUpdates: readonly { readonly recordId: string; readonly value: JsonValue }[];
+          readonly targetChannelId?: string;
+          readonly targetType: TableField['type'];
+        }
+    ) => Promise<void>;
     readonly updateTableRecord?: (input: {
       readonly observedVersions: Readonly<Record<string, number>>;
       readonly recordId: string;

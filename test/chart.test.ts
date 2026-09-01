@@ -196,6 +196,37 @@ describe('live Chart Channel', () => {
     } satisfies Partial<DatagramError>);
   });
 
+  test('revalidates and stores a changed live Table source without copying results', async () => {
+    const value = await runtime();
+    const originalSourceId = await source(value);
+    const nextSourceId = await source(value);
+    const created = await chart(value, originalSourceId);
+    await value.app.executeAction(value.owner.id, 'cli', 'table.record.create', {
+      channelId: nextSourceId,
+      values: { amount: 100, region: 'Hidden North' },
+    });
+
+    await value.app.executeAction(value.owner.id, 'cli', 'chart.definition.update', {
+      aggregations: [{ as: 'total', field: 'amount', operator: 'sum' }],
+      channelId: created.channelId,
+      filters: [{ field: 'region', operator: 'equals', value: 'Hidden North' }],
+      grouping: ['region'],
+      observedVersion: 1,
+      presentation: { categoryField: 'region', series: ['total'], type: 'line' },
+      sourceChannelId: nextSourceId,
+    });
+
+    expect(await value.store.getChartDefinition(created.channelId)).toMatchObject({
+      sourceChannelId: nextSourceId,
+      version: 2,
+    });
+    expect(await value.app.executeQuery(value.owner.id, 'cli', 'chart.open', {
+      channelId: created.channelId,
+    })).toMatchObject({
+      data: { series: [{ region: 'Hidden North', total: 115 }] },
+    });
+  });
+
   test('rejects non-aggregate Handles without creating a Chart', async () => {
     const value = await runtime();
     const sourceChannelId = await source(value);

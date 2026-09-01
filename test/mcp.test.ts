@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from 'bun:test';
+import * as z from 'zod/v4';
 
 import {
   InMemoryTransport,
@@ -7,17 +8,23 @@ import {
 } from '@modelcontextprotocol/server';
 
 import { DatagramError } from '../src/packages/application/errors';
+import { DatagramApplication } from '../src/packages/application';
+import { bundledChannelTypes, ChannelTypeRegistry } from '../src/packages/domain/channel-types';
 import { createMcpGateway } from '../src/packages/mcp/gateway';
 import { createRuntime, type DatagramRuntime } from '../src/packages/runtime';
+import { SqliteStore } from '../src/packages/sqlite-store';
 
 let runtime: DatagramRuntime | undefined;
 let server: McpServer | undefined;
+let customStore: SqliteStore | undefined;
 
 afterEach(async () => {
   await server?.close();
   server = undefined;
   await runtime?.close();
   runtime = undefined;
+  await customStore?.close();
+  customStore = undefined;
 });
 
 class McpTestClient {
@@ -145,6 +152,40 @@ test('MCP requires authenticated identity mapped to an active Service person', a
       authenticateIdentity: () => ({ actorId: 'person_missing' }),
     }),
   ).rejects.toMatchObject({ code: 'person.not-found' });
+});
+
+test('default MCP omits selector-required no-Channel type Queries', async () => {
+  const definitions = bundledChannelTypes.map((definition) => definition.id === 'table' ? {
+    ...definition,
+    queries: [...definition.queries, {
+      allowedOperations: [],
+      authorization: { kind: 'operator' as const },
+      execute: async () => ({ data: { ok: true }, view: { bindings: {}, commands: [], kind: 'test', schemaVersion: 'datagram/view@1' as const, title: 'Test' } }),
+      inputSchema: z.object({}),
+      name: 'table.selector-required',
+    }],
+    views: [...definition.views, {
+      bindings: {},
+      commands: [],
+      kind: 'test',
+      produce: () => ({ bindings: {}, commands: [], kind: 'test', schemaVersion: 'datagram/view@1' as const, title: 'Test' }),
+      query: 'table.selector-required',
+      title: 'Test',
+    }],
+  } : definition);
+  customStore = new SqliteStore(':memory:');
+  await customStore.initialize();
+  const owner = await customStore.ensureLocalOwner();
+  const app = new DatagramApplication(customStore, new ChannelTypeRegistry(definitions));
+  server = await createMcpGateway({ app, authenticateIdentity: () => ({ actorId: owner.id }) });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const client = new McpTestClient(clientTransport);
+  await client.start();
+  await server.connect(serverTransport);
+  await client.initialize();
+  const listed = await client.request('tools/list') as { tools: { name: string }[] };
+  expect(listed.tools.map((tool) => tool.name)).not.toContain('table.selector-required');
+  await expect(call(client, 'table.selector-required', {})).rejects.toThrow('Tool table.selector-required not found');
 });
 
 test('MCP initializes, discovers every shared contract, and executes Actions and Queries', async () => {

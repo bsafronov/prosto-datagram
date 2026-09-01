@@ -55,7 +55,6 @@ export const chartChannelType = {
       const current = await capabilities.state!.chartDefinition();
       invariant(current, 'chart.definition-not-found', 'Chart definition not found', 404);
       invariant(current.version === input.observedVersion, 'chart.definition-conflict', 'Chart definition changed after observation', 409);
-      invariant(input.sourceChannelId === current.sourceChannelId, 'chart.source-change-denied', 'Chart source cannot be changed without a new authorized Result Handle', 403);
       const definition: ChartDefinition = {
         aggregations: input.aggregations.map((aggregation) => ({ as: aggregation.as, ...(aggregation.field === undefined ? {} : { field: aggregation.field }), operator: aggregation.operator })),
         channelId: input.channelId,

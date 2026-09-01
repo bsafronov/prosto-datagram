@@ -245,6 +245,14 @@ describe('universal Discussion lifecycle', () => {
       channelId,
       messageId: parent.subject!.id,
     });
+    const replyToTombstone = await value.app.executeAction(contributorId, 'cli', 'discussion.message.post', {
+      channelId,
+      replyToMessageId: parent.subject!.id,
+      text: 'Reply to stable tombstoned identity',
+    });
+    expect(await value.store.getMessage(replyToTombstone.subject!.id)).toMatchObject({
+      replyToMessageId: parent.subject!.id,
+    });
     await value.app.executeAction(value.owner.id, 'cli', 'discussion.message.restore', {
       channelId,
       messageId: parent.subject!.id,
@@ -260,7 +268,7 @@ describe('universal Discussion lifecycle', () => {
       text: 'Parent',
     });
 
-    const acceptedMutationCount = 8;
+    const acceptedMutationCount = 9;
     const operations = await value.store.listOperations(channelId);
     expect(operations).toHaveLength(beforeOperations.length + acceptedMutationCount);
     expect(await value.store.listActivities(channelId)).toHaveLength(

@@ -115,7 +115,10 @@ export class DatagramApplication {
         const implementations = new Set(overloads.map((candidate) => candidate.contract.execute));
         const typeId = overloads[0]!.owner.split('@', 1)[0]!;
         const sharedContract = overloads.length > 1 && implementations.size === 1;
-        return schemas.size === 1 && implementations.size === 1 &&
+        const inputJson = z.toJSONSchema(overloads[0]!.contract.inputSchema) as { required?: string[] };
+        const dispatchableWithoutSelector = inputJson.required?.includes('channelId') ||
+          overloads[0]!.contract.name === 'channel.create' || overloads[0]!.contract.name === 'chart.create';
+        return dispatchableWithoutSelector && schemas.size === 1 && implementations.size === 1 &&
           (sharedContract || (owners.size === 1 && versionsByType.get(typeId) === 1))
           ? [overloads[0]!.contract]
           : [];
@@ -246,6 +249,55 @@ export class DatagramApplication {
         await requireSelectedChannel();
         invariant(value?.channelId === selectedChannelId, code, 'Target does not belong to the selected Channel', 404);
         return value!;
+      };
+      type RecordUpdateIntent = Parameters<NonNullable<ChannelActionCapabilities['changes']['updateTableRecord']>>[0];
+      const queueTableRecordUpdate = async (recordInput: RecordUpdateIntent): Promise<void> => {
+        invariant(contract.typeId === 'table' && selectedChannelId, 'channel-type.capability-denied', 'This Channel Type cannot emit Table transitions', 403);
+        const storedRecord = await requireOwned(await this.store.getTableRecord(recordInput.recordId), 'table.record-not-found');
+        const storedRecords = await this.store.listTableRecords(selectedChannelId);
+        const records = pendingChanges.reduce<TableRecord[]>((current, change) =>
+          change.kind === 'table.record-updated'
+            ? current.map((record) => record.id === change.recordId ? applyTableRecordUpdate(record, change) : record)
+            : current,
+        [...storedRecords]);
+        const record = records.find((candidate) => candidate.id === storedRecord.id)!;
+        invariant(
+          record.tombstonedAt === undefined || name === 'table.field.add' || name === 'table.field.convert',
+          'table.record-tombstoned',
+          'Table Record is tombstoned',
+          409,
+        );
+        const changedKeys = Object.keys(recordInput.values);
+        invariant(changedKeys.length > 0, 'table.record-empty-edit', 'Table Record edit needs at least one Field');
+        invariant(changedKeys.every((key) => recordInput.observedVersions[key] !== undefined), 'table.record-observed-version-required', 'Observed version is required for every edited Field');
+        for (const key of changedKeys) invariant((record.fieldVersions[key] ?? 0) === recordInput.observedVersions[key], 'table.record-edit-conflict', `Table Field value changed after observation: ${key}`, 409);
+        const storedFields = await this.store.listTableFields(selectedChannelId);
+        const fields = pendingChanges.reduce<TableField[]>((current, change) => {
+          if (change.kind === 'table.field-added') return [...current, change.field];
+          if (change.kind === 'table.field-updated') return current.map((field) => field.id === change.field.id ? change.field : field);
+          if (change.kind === 'table.field-purged') return current.filter((field) => field.id !== change.fieldId);
+          return current;
+        }, [...storedFields]);
+        const activeFieldKeys = new Set(fields.filter((field) => field.tombstonedAt === undefined).map((field) => field.key));
+        invariant(changedKeys.every((key) => activeFieldKeys.has(key)), 'table.record-unknown-field', 'Table Record patches may target active Fields only');
+        const validatedValues = await this.#validatedRecordValues(
+          actorId,
+          fields,
+          records,
+          { ...record.values, ...recordInput.values },
+          record.id,
+          true,
+          new Set(changedKeys),
+        );
+        pendingChanges.push({
+          expectedVersions: Object.fromEntries(changedKeys.map((key) => [key, recordInput.observedVersions[key]!])),
+          kind: 'table.record-updated',
+          previousValues: changedKeys.map((key) => ({ existed: Object.hasOwn(record.values, key), key, ...(Object.hasOwn(record.values, key) ? { value: record.values[key] } : {}) })),
+          recordId: record.id,
+          updatedAt: nowIso(),
+          values: Object.fromEntries(changedKeys.map((key) => [key, validatedValues[key]!])),
+        });
+        pendingSubject = { id: recordInput.recordId, kind: 'record' };
       };
       return this.channelTypes.executeAction(
         contract.typeId,
@@ -381,8 +433,7 @@ export class DatagramApplication {
               invariant(selectedChannelId, 'channel-type.capability-denied', 'Discussion transition requires a Channel', 403);
               await requireSelectedChannel();
               if (messageInput.replyToMessageId) {
-                const reply = await requireOwned(await this.store.getMessage(messageInput.replyToMessageId), 'discussion.message-not-found');
-                invariant(reply.tombstonedAt === undefined, 'discussion.message-tombstoned', 'Cannot reply to a tombstoned Message', 409);
+                await requireOwned(await this.store.getMessage(messageInput.replyToMessageId), 'discussion.message-not-found');
               }
               const messageId = newId('message');
               const createdAt = nowIso();
@@ -539,66 +590,92 @@ export class DatagramApplication {
               pendingChanges.push({ channelId: selectedChannelId, expectedVersion: stored.version, fieldId: stored.id, fieldKey: stored.key, kind: 'table.field-purged' });
               pendingSubject = { id: stored.id, kind: 'field' };
             },
-            updateTableField: async (field, previousField) => {
-              invariant(contract.typeId === 'table' && selectedChannelId === field.channelId && previousField.channelId === selectedChannelId, 'channel-type.capability-denied', 'This Channel Type cannot emit Table transitions', 403);
+            updateTableField: async (intent) => {
+              invariant(contract.typeId === 'table' && selectedChannelId, 'channel-type.capability-denied', 'This Channel Type cannot emit Table transitions', 403);
               await requireSelectedChannel();
-              const stored = (await this.store.listTableFields(selectedChannelId)).find((candidate) => candidate.id === field.id);
-              invariant(stored?.channelId === selectedChannelId && stored.id === previousField.id, 'table.field-not-found', 'Table Field does not belong to the selected Channel', 404);
-              pendingChanges.push({ expectedVersion: previousField.version, field, kind: 'table.field-updated', previousField });
+              const stored = (await this.store.listTableFields(selectedChannelId)).find((candidate) => candidate.id === intent.fieldId);
+              invariant(stored?.channelId === selectedChannelId, 'table.field-not-found', 'Table Field does not belong to the selected Channel', 404);
+              invariant(stored.version === intent.observedVersion, 'table.field-conflict', 'Table Field changed after observation', 409);
+              let field: TableField;
+              if (intent.kind === 'tombstone') {
+                invariant(stored.tombstonedAt === undefined, 'table.field-already-tombstoned', 'Table Field is already tombstoned', 409);
+                field = { ...stored, tombstonedAt: nowIso(), tombstonedBy: actorId, version: stored.version + 1 };
+              } else if (intent.kind === 'restore') {
+                invariant(stored.tombstonedAt !== undefined, 'table.field-not-tombstoned', 'Table Field is not tombstoned', 409);
+                const { tombstonedAt: _at, tombstonedBy: _by, ...active } = stored;
+                field = { ...active, version: stored.version + 1 };
+                const fields = (await this.store.listTableFields(selectedChannelId)).map((candidate) => candidate.id === stored.id ? field : candidate);
+                const records = await this.store.listTableRecords(selectedChannelId);
+                for (const record of records.filter((candidate) => candidate.tombstonedAt === undefined)) {
+                  await this.#validatedRecordValues(actorId, fields, records, record.values, record.id, true, new Set());
+                }
+              } else {
+                invariant(stored.tombstonedAt === undefined, 'table.field-tombstoned', 'Table Field is tombstoned', 409);
+                invariant(stored.type !== intent.targetType, 'table.field-type-unchanged', 'Target Field type must differ', 409);
+                const isDictionary = intent.targetType === 'dictionary';
+                const isReference = intent.targetType === 'record-reference';
+                invariant(isReference ? intent.targetChannelId !== undefined && intent.cardinality !== undefined : intent.cardinality === undefined, 'table.field-reference-configuration', 'Record Reference Field requires one target Channel and cardinality');
+                invariant(isDictionary ? intent.targetChannelId !== undefined : isReference || intent.targetChannelId === undefined, 'table.field-dictionary-configuration', 'Dictionary Field requires one target Dictionary Channel');
+                const { cardinality: _oldCardinality, defaultValue: _oldDefault, targetChannelId: _oldTarget, ...base } = stored;
+                invariant(
+                  (stored.defaultValue === undefined) === (intent.defaultValue === undefined),
+                  'table.field-conversion-default-unresolved',
+                  'Field conversion must preserve or explicitly resolve its existing default',
+                  409,
+                );
+                field = {
+                  ...base,
+                  ...(intent.cardinality === undefined ? {} : { cardinality: intent.cardinality }),
+                  ...(intent.defaultValue === undefined ? {} : { defaultValue: intent.defaultValue }),
+                  ...(intent.targetChannelId === undefined ? {} : { targetChannelId: intent.targetChannelId }),
+                  type: intent.targetType,
+                  version: stored.version + 1,
+                };
+                await this.#channelTypeState(actorId, selectedChannelId, { typeId: contract.typeId, typeVersion: contract.typeVersion })
+                  .then((state) => state.validateTableFieldTarget(field));
+                if (field.defaultValue !== undefined) {
+                  invariant(!(field.required && field.defaultValue === null), 'table.record-required-field', `Required Field cannot default to null: ${field.key}`);
+                  if (field.defaultValue !== null) {
+                    this.#validateFieldValue(field, field.defaultValue);
+                    await this.#validateRecordReferenceTargets(actorId, field, field.defaultValue);
+                    if (field.type === 'dictionary') await this.#validateDictionaryEntry(actorId, field, field.defaultValue);
+                  }
+                  if (stored.defaultValue !== undefined && stored.defaultValue !== null) {
+                    let oldDefaultCompatible = true;
+                    try { this.#validateFieldValue(field, stored.defaultValue); } catch { oldDefaultCompatible = false; }
+                    invariant(
+                      !oldDefaultCompatible || JSON.stringify(field.defaultValue) === JSON.stringify(stored.defaultValue),
+                      'table.field-conversion-default-unresolved',
+                      'Compatible Field defaults must remain unchanged during conversion',
+                      409,
+                    );
+                  }
+                }
+                const records = await this.store.listTableRecords(selectedChannelId);
+                const updates = new Map(intent.recordUpdates.map((update) => [update.recordId, update.value]));
+                invariant(updates.size === intent.recordUpdates.length, 'table.field-conversion-resolution-duplicate', 'Each Record may have one conversion resolution');
+                const failures = records.filter((record) => {
+                  const value = record.values[stored.key];
+                  if (value === undefined || value === null) return false;
+                  try { this.#validateFieldValue(field, value); return false; } catch { return true; }
+                });
+                invariant(failures.length === updates.size && failures.every((record) => updates.has(record.id)), 'table.field-conversion-unresolved', 'Every incompatible value needs one explicit resolution', 409);
+                const nextRecords = records.map((record) => updates.has(record.id) ? { ...record, values: { ...record.values, [stored.key]: updates.get(record.id)! } } : record);
+                const fields = (await this.store.listTableFields(selectedChannelId)).map((candidate) => candidate.id === stored.id ? field : candidate);
+                for (const record of nextRecords.filter((candidate) => candidate.tombstonedAt === undefined)) {
+                  await this.#validatedRecordValues(actorId, fields, nextRecords, record.values, record.id, true, new Set([stored.key]));
+                }
+                pendingChanges.push({ expectedVersion: stored.version, field, kind: 'table.field-updated', previousField: stored });
+                for (const record of failures) {
+                  await queueTableRecordUpdate({ observedVersions: { [stored.key]: record.fieldVersions[stored.key] ?? 0 }, recordId: record.id, values: { [stored.key]: updates.get(record.id)! } });
+                }
+                pendingSubject = { id: field.id, kind: 'field' };
+                return;
+              }
+              pendingChanges.push({ expectedVersion: stored.version, field, kind: 'table.field-updated', previousField: stored });
               pendingSubject = { id: field.id, kind: 'field' };
             },
-            updateTableRecord: async (recordInput) => {
-              invariant(contract.typeId === 'table' && selectedChannelId, 'channel-type.capability-denied', 'This Channel Type cannot emit Table transitions', 403);
-              const storedRecord = await requireOwned(await this.store.getTableRecord(recordInput.recordId), 'table.record-not-found');
-              const storedRecords = await this.store.listTableRecords(selectedChannelId);
-              const records = pendingChanges.reduce<TableRecord[]>((current, change) =>
-                change.kind === 'table.record-updated'
-                  ? current.map((record) => record.id === change.recordId ? applyTableRecordUpdate(record, change) : record)
-                  : current,
-              [...storedRecords]);
-              const record = records.find((candidate) => candidate.id === storedRecord.id)!;
-              invariant(
-                record.tombstonedAt === undefined || name === 'table.field.add' || name === 'table.field.convert',
-                'table.record-tombstoned',
-                'Table Record is tombstoned',
-                409,
-              );
-              const changedKeys = Object.keys(recordInput.values);
-              invariant(changedKeys.length > 0, 'table.record-empty-edit', 'Table Record edit needs at least one Field');
-              invariant(changedKeys.every((key) => recordInput.observedVersions[key] !== undefined), 'table.record-observed-version-required', 'Observed version is required for every edited Field');
-              for (const key of changedKeys) invariant((record.fieldVersions[key] ?? 0) === recordInput.observedVersions[key], 'table.record-edit-conflict', `Table Field value changed after observation: ${key}`, 409);
-              const storedFields = await this.store.listTableFields(selectedChannelId);
-              const fields = pendingChanges.reduce<TableField[]>((current, change) => {
-                if (change.kind === 'table.field-added') return [...current, change.field];
-                if (change.kind === 'table.field-updated') return current.map((field) => field.id === change.field.id ? change.field : field);
-                if (change.kind === 'table.field-purged') return current.filter((field) => field.id !== change.fieldId);
-                return current;
-              }, [...storedFields]);
-              const activeFieldKeys = new Set(fields.filter((field) => field.tombstonedAt === undefined).map((field) => field.key));
-              invariant(
-                changedKeys.every((key) => activeFieldKeys.has(key)),
-                'table.record-unknown-field',
-                'Table Record patches may target active Fields only',
-              );
-              const validatedValues = await this.#validatedRecordValues(
-                actorId,
-                fields,
-                records,
-                { ...record.values, ...recordInput.values },
-                record.id,
-                true,
-                new Set(changedKeys),
-              );
-              pendingChanges.push({
-                expectedVersions: Object.fromEntries(changedKeys.map((key) => [key, recordInput.observedVersions[key]!])),
-                kind: 'table.record-updated',
-                previousValues: changedKeys.map((key) => ({ existed: Object.hasOwn(record.values, key), key, ...(Object.hasOwn(record.values, key) ? { value: record.values[key] } : {}) })),
-                recordId: record.id,
-                updatedAt: nowIso(),
-                values: Object.fromEntries(changedKeys.map((key) => [key, validatedValues[key]!])),
-              });
-              pendingSubject = { id: recordInput.recordId, kind: 'record' };
-            },
+            updateTableRecord: queueTableRecordUpdate,
             restoreTableRecord: async (recordId, expectedTombstonedAt) => {
               await requireOwned(await this.store.getTableRecord(recordId), 'table.record-not-found');
               pendingChanges.push({ kind: 'table.record-restored', recordId, restoredAt: nowIso(), ...(expectedTombstonedAt ? { expectedTombstonedAt } : {}) });
@@ -885,15 +962,6 @@ export class DatagramApplication {
       chartDefinition: () => this.store.getChartDefinition(channelId),
       validateChartDefinition: async (definition) => {
         invariant(definition.channelId === channelId, 'channel-type.capability-denied', 'Chart definition must belong to the selected Channel', 403);
-        const current = await this.store.getChartDefinition(channelId);
-        if (current) {
-          invariant(
-            definition.sourceChannelId === current.sourceChannelId,
-            'chart.source-change-denied',
-            'Chart source cannot be changed without a new authorized Result Handle',
-            403,
-          );
-        }
         await this.#validateChartDefinition(actorId, definition);
       },
       dictionaryEntries: () => this.store.listDictionaryEntries(channelId),
