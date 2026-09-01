@@ -19,6 +19,23 @@ afterEach(async () => {
 });
 
 describe('Channel Type version pinning', () => {
+  test('keeps bundled contract behavior out of the application registry', async () => {
+    const applicationSource = await Bun.file(
+      new URL('../src/packages/application/lib/datagram.ts', import.meta.url),
+    ).text();
+    expect(applicationSource).not.toContain('#typeActions');
+    expect(applicationSource).not.toContain('#typeQueries');
+    expect(applicationSource).not.toMatch(/name:\s*'(?:chart|dictionary|discussion|table)\./);
+    expect(applicationSource).not.toContain('operationBuilders');
+    for (const definition of bundledChannelTypes) {
+      for (const contract of [...definition.actions, ...definition.queries]) {
+        expect(typeof contract.execute).toBe('function');
+        expect(contract.execute.toString()).not.toContain('capabilities.actions');
+        expect(contract.execute.toString()).not.toContain('capabilities.queries');
+      }
+    }
+  });
+
   test('selects definitions by immutable id and version', () => {
     const table = bundledChannelTypes.find((definition) => definition.id === 'table')!;
     const next = { ...table, title: 'Table v2', version: '2.0.0' };
@@ -72,10 +89,7 @@ describe('Channel Type version pinning', () => {
         actions: [{
           allowedOperations: [],
           authorization: { kind: 'channel-role', minimumRole: 'contributor' },
-          execute: (_input, capabilities) => {
-            if (!('actions' in capabilities)) throw new Error('Action capabilities required');
-            return capabilities.actions['custom.write']!();
-          },
+          execute: async () => { throw new Error('not invoked'); },
           inputSchema: source,
           name: 'custom.write',
         }],
@@ -121,11 +135,11 @@ describe('Channel Type version pinning', () => {
           capabilities: Parameters<typeof action.execute>[1],
         ) => {
           if (input.title !== 'Selected pinned chart' || !('changes' in capabilities)) {
-            if (!('actions' in capabilities)) throw new Error('Action capabilities required');
-            return capabilities.actions['chart.create']!();
+            return action.execute(input, capabilities);
           }
           if (input.typeVersion !== '1.0.0') throw new Error('Pinned Chart version was not injected');
-          return capabilities.changes.createChart!();
+          await capabilities.changes.createChart!();
+          return capabilities.commit();
         },
       } : action),
     };
@@ -141,8 +155,7 @@ describe('Channel Type version pinning', () => {
                 capabilities: Parameters<typeof action.execute>[1],
               ) => {
                 if (input.title !== 'Owned v1 creation' || !('changes' in capabilities)) {
-                  if (!('actions' in capabilities)) throw new Error('Action capabilities required');
-                  return capabilities.actions['channel.create']!();
+                  return action.execute(input, capabilities);
                 }
                 capabilities.changes.createChannel!(input.title);
                 return capabilities.commit();
@@ -173,8 +186,7 @@ describe('Channel Type version pinning', () => {
                   capabilities: Parameters<typeof action.execute>[1],
                 ) => {
                   if (input.name !== 'Scoped viewer view' || !('changes' in capabilities)) {
-                    if (!('actions' in capabilities)) throw new Error('Action capabilities required');
-                    return capabilities.actions['table.view.create']!();
+                    return action.execute(input, capabilities);
                   }
                   expect(capabilities.changes.setTableDisplayField).toBeUndefined();
                   expect(capabilities.changes.createTableRecord).toBeUndefined();
@@ -198,13 +210,11 @@ describe('Channel Type version pinning', () => {
                 ) =>
                   input.fieldId === 'v2-default' && 'commit' in capabilities
                     ? (capabilities.changes.setTableDisplayField!(null), capabilities.commit())
-                    : 'actions' in capabilities
-                      ? capabilities.actions['table.display-field.set']!()
-                      : Promise.reject(new Error('Action capabilities required')),
+                    : action.execute(input, capabilities),
               }
           : action,
       ), {
-        allowedOperations: ['table.display-field.set' as const],
+        allowedOperations: ['setTableDisplayField' as const],
         authorization: { kind: 'channel-role' as const, minimumRole: 'admin' as const },
         execute: async (
           input: { channelId: string },
@@ -229,7 +239,7 @@ describe('Channel Type version pinning', () => {
                 capabilities: Parameters<typeof query.execute>[1],
               ) => {
                 if (!('read' in capabilities)) throw new Error('Query capabilities required');
-                const result = await capabilities.queries['table.configuration']!();
+                const result = await query.execute({ channelId: input.channelId }, capabilities);
                 return {
                   ...result,
                   data: { ...(result.data as Record<string, unknown>), edition: 'v2' },

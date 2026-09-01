@@ -1,11 +1,16 @@
 import * as z from 'zod/v4';
 import type {
   ActionReceipt,
+  Channel,
   ChannelRole,
   ChartDefinition,
+  DictionaryEntry,
   JsonValue,
+  Message,
   Operation,
   QueryResult,
+  TableField,
+  TableRecord,
   TableView,
   ViewDefinition,
 } from '../model';
@@ -17,36 +22,119 @@ export type ChannelContractAuthorization =
   | { readonly kind: 'channel-role'; readonly minimumRole: ChannelRole };
 
 export type ChannelTypeOperation =
-  | 'channel.create'
-  | 'chart.create'
-  | 'dictionary.entry.create'
-  | 'table.display-field.set'
-  | 'table.record.create'
-  | 'table.view.create';
+  | 'addTableField'
+  | 'cancel'
+  | 'createChannel'
+  | 'createChart'
+  | 'createDictionaryEntry'
+  | 'createTableRecord'
+  | 'createTableView'
+  | 'editDiscussionMessage'
+  | 'postDiscussionMessage'
+  | 'purgeTableField'
+  | 'recordChartEvent'
+  | 'renameDictionaryEntry'
+  | 'restoreDictionaryEntry'
+  | 'restoreDiscussionMessage'
+  | 'restoreTableRecord'
+  | 'retireDictionaryEntry'
+  | 'setChartDefinition'
+  | 'setTableDisplayField'
+  | 'tombstoneDiscussionMessage'
+  | 'tombstoneTableRecord'
+  | 'updateTableField'
+  | 'updateTableRecord';
+
+export interface ChannelTypeStatePort {
+  readonly acceptsTableFieldValue: (field: TableField, value: JsonValue) => Promise<boolean>;
+  readonly channel: Channel;
+  readonly chartDefinition: () => Promise<ChartDefinition | null>;
+  readonly validateChartDefinition: (definition: ChartDefinition) => Promise<void>;
+  readonly dictionaryEntries: () => Promise<readonly DictionaryEntry[]>;
+  readonly dictionaryEntry: (entryId: string) => Promise<DictionaryEntry | null>;
+  readonly displayFieldId: () => Promise<string | null>;
+  readonly message: (messageId: string) => Promise<Message | null>;
+  readonly messages: () => Promise<readonly Message[]>;
+  readonly resolveRecordReference: (recordId: string) => Promise<JsonValue>;
+  readonly resolveTableValues: (
+    fields: readonly TableField[],
+    values: Readonly<Record<string, JsonValue>>,
+  ) => Promise<Readonly<Record<string, JsonValue>>>;
+  readonly validateTableFieldTarget: (field: TableField) => Promise<void>;
+  readonly validateTableRecordValues: (
+    fields: readonly TableField[],
+    records: readonly TableRecord[],
+    values: Readonly<Record<string, JsonValue>>,
+    currentRecordId?: string,
+    applyDefaults?: boolean,
+    changedKeys?: readonly string[],
+  ) => Promise<Readonly<Record<string, JsonValue>>>;
+  readonly tableFields: () => Promise<readonly TableField[]>;
+  readonly tableRecord: (recordId: string) => Promise<TableRecord | null>;
+  readonly tableRecords: () => Promise<readonly TableRecord[]>;
+  readonly tableViews: () => Promise<readonly TableView[]>;
+}
 
 export interface ChannelActionCapabilities {
-  readonly actions: Readonly<Record<string, () => Promise<ActionReceipt>>>;
   readonly actorId: string;
+  readonly state?: ChannelTypeStatePort;
   readonly changes: {
     readonly createChannel?: (title: string) => string;
-    readonly createChart?: () => Promise<ActionReceipt>;
+    readonly createChart?: () => Promise<void>;
+    readonly setChartDefinition?: (definition: ChartDefinition, expectedVersion?: number) => void;
+    readonly recordChartEvent?: (kind: 'chart.insight-produced' | 'chart.report-produced' | 'chart.threshold-crossed') => void;
     readonly createDictionaryEntry?: (label: string) => Promise<string>;
+    readonly renameDictionaryEntry?: (input: {
+      readonly entryId: string;
+      readonly label: string;
+      readonly normalizedLabel: string;
+      readonly updatedAt: string;
+    }) => void;
+    readonly restoreDictionaryEntry?: (entryId: string, restoredAt: string) => void;
+    readonly retireDictionaryEntry?: (entryId: string, retiredAt: string) => void;
+    readonly editDiscussionMessage?: (messageId: string, text: string) => void;
+    readonly postDiscussionMessage?: (input: {
+      readonly recordReferences: readonly string[];
+      readonly replyToMessageId?: string;
+      readonly text: string;
+    }) => string;
+    readonly restoreDiscussionMessage?: (messageId: string) => void;
+    readonly tombstoneDiscussionMessage?: (messageId: string) => void;
     readonly createTableRecord?: (values: Readonly<Record<string, JsonValue>>) => Promise<string>;
     readonly createTableView?: (
       input: Omit<TableView, 'channelId' | 'createdAt' | 'id' | 'ownerId'>,
     ) => Promise<string>;
     readonly setTableDisplayField?: (displayFieldId: string | null) => Promise<void>;
+    readonly addTableField?: (field: TableField) => void;
+    readonly purgeTableField?: (field: TableField) => void;
+    readonly updateTableField?: (field: TableField, previousField: TableField) => void;
+    readonly updateTableRecord?: (input: {
+      readonly expectedVersions?: Readonly<Record<string, number>>;
+      readonly previousValues?: readonly { readonly existed: boolean; readonly key: string; readonly value?: JsonValue }[];
+      readonly recordId: string;
+      readonly removedKeys?: readonly string[];
+      readonly values: Readonly<Record<string, JsonValue>>;
+    }) => void;
+    readonly restoreTableRecord?: (recordId: string, expectedTombstonedAt?: string) => void;
+    readonly tombstoneTableRecord?: (recordId: string, expectedUpdatedAt?: string | null) => void;
   };
   readonly commit: () => Promise<ActionReceipt>;
+  readonly cancel?: (subject: ActionReceipt['subject']) => Promise<ActionReceipt>;
   readonly newId: (prefix: string) => string;
   readonly now: () => string;
 }
 
 export interface ChannelQueryCapabilities {
   readonly actorId: string;
-  readonly queries: Readonly<Record<string, () => Promise<QueryResult>>>;
   readonly read: (query: string, input: Readonly<Record<string, JsonValue>>) => Promise<QueryResult>;
+  readonly readSourceTable: (channelId: string) => Promise<QueryResult>;
   readonly role?: ChannelRole;
+  readonly state?: ChannelTypeStatePort;
+  readonly transform: (result: QueryResult, transform:
+    | { readonly aggregations: readonly { readonly as: string; readonly field?: string; readonly operator: 'average' | 'count' | 'maximum' | 'minimum' | 'sum' }[]; readonly kind: 'aggregate' }
+    | { readonly fields: readonly string[]; readonly kind: 'group' }
+    | { readonly filters: readonly { readonly field: string; readonly operator: 'contains' | 'equals' | 'greater-than' | 'is-empty' | 'less-than'; readonly value?: JsonValue }[]; readonly kind: 'filter' }
+  ) => QueryResult;
 }
 
 export interface ChannelContract<TInput = unknown> {
@@ -69,13 +157,7 @@ export interface ChannelStateRule {
 export const contract = <TInput>(
   name: string,
   inputSchema: z.ZodType<TInput>,
-  execute: ChannelContract<TInput>['execute'] = (_input, capabilities) => {
-    const implementation = 'actions' in capabilities
-      ? capabilities.actions[name]
-      : capabilities.queries[name];
-    if (!implementation) throw new Error(`Missing scoped Channel Type implementation: ${name}`);
-    return implementation();
-  },
+  execute: ChannelContract<TInput>['execute'],
   authorization: ChannelContractAuthorization = { kind: 'channel-role', minimumRole: 'viewer' },
   allowedOperations: readonly ChannelTypeOperation[] = [],
 ): ChannelContract<TInput> => ({ allowedOperations: [...allowedOperations], authorization, execute, inputSchema, name });
@@ -130,4 +212,4 @@ export const channelCreateContract = contract('channel.create', z.object({
   if (!('changes' in capabilities)) throw new Error('Channel creation needs Action capabilities');
   capabilities.changes.createChannel!(input.title);
   return capabilities.commit();
-}, { kind: 'authenticated' }, ['channel.create']);
+}, { kind: 'authenticated' }, ['createChannel']);

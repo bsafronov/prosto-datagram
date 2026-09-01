@@ -6,7 +6,9 @@ import {
   recordReferenceCardinalitySchema,
   tableFieldTypeSchema,
   type JsonValue,
+  type QueryResult,
   type TableField,
+  type TableRecord,
 } from '../model';
 import { DatagramError, invariant } from '../errors';
 import {
@@ -43,6 +45,8 @@ const defaultConversionResolutionSchema = z.object({
   kind: z.enum(['correct', 'map', 'null']),
   value: optionalJsonValueSchema,
 });
+
+const pendingView = () => ({ bindings: {}, commands: [], kind: 'pending', schemaVersion: 'datagram/view@1' as const, title: 'Channel Type View' });
 
 export function validateTableFieldValue(field: TableField, rawValue: unknown): JsonValue {
   const value = jsonValueSchema.parse(rawValue);
@@ -111,17 +115,67 @@ export const tableChannelType = {
       targetChannelId: z.string().min(1).optional(),
       type: tableFieldTypeSchema,
       unique: z.boolean().default(false),
-    }), undefined, { kind: 'channel-role', minimumRole: 'admin' }),
+    }), async (input, capabilities) => {
+      if (!('changes' in capabilities)) throw new Error('Table Field creation needs Action capabilities');
+      const fields = await capabilities.state!.tableFields();
+      invariant(!fields.some((field) => field.key === input.key), 'table.field-key-conflict', `Field key already exists: ${input.key}`, 409);
+      const allRecords = await capabilities.state!.tableRecords();
+      const activeRecords = allRecords.filter((record) => record.tombstonedAt === undefined);
+      const isDictionary = input.type === 'dictionary';
+      const isReference = input.type === 'record-reference';
+      invariant(isReference ? input.targetChannelId !== undefined && input.cardinality !== undefined : input.cardinality === undefined, 'table.field-reference-configuration', 'Record Reference Field requires one target Channel and cardinality');
+      invariant(isDictionary ? input.targetChannelId !== undefined : isReference || input.targetChannelId === undefined, 'table.field-dictionary-configuration', 'Dictionary Field requires one target Dictionary Channel');
+      const field: TableField = {
+        ...(input.cardinality === undefined ? {} : { cardinality: input.cardinality }),
+        channelId: input.channelId,
+        ...(input.defaultValue === undefined ? {} : { defaultValue: input.defaultValue }),
+        id: capabilities.newId('field'), key: input.key, label: input.label, required: input.required,
+        ...(input.targetChannelId === undefined ? {} : { targetChannelId: input.targetChannelId }),
+        type: input.type, unique: input.unique, version: 1,
+      };
+      await capabilities.state!.validateTableFieldTarget(field);
+      if (input.defaultValue !== undefined) {
+        invariant(!(input.required && input.defaultValue === null), 'table.record-required-field', `Required Field cannot default to null: ${input.key}`);
+        invariant(input.defaultValue === null || await capabilities.state!.acceptsTableFieldValue(field, input.defaultValue), 'table.field-type', 'Default value does not match Field type');
+      }
+      invariant(!(input.required && input.defaultValue === undefined && activeRecords.length > 0), 'table.field-required-existing-records', 'Required Field needs a default while Records exist', 409);
+      invariant(!(input.unique && input.defaultValue != null && activeRecords.length > 1), 'table.field-unique-default-conflict', 'Unique Field default cannot be applied to multiple Records', 409);
+      if (input.defaultValue !== undefined) for (const record of allRecords) capabilities.changes.updateTableRecord!({ expectedVersions: { [input.key]: 0 }, recordId: record.id, values: { [input.key]: input.defaultValue } });
+      capabilities.changes.addTableField!(field);
+      return capabilities.commit();
+    }, { kind: 'channel-role', minimumRole: 'admin' }, ['addTableField', 'updateTableRecord']),
     contract('table.field.tombstone', z.object({
       channelId: channelIdSchema,
       fieldId: z.string().min(1),
       observedVersion: z.number().int().positive(),
-    }), undefined, { kind: 'channel-role', minimumRole: 'admin' }),
+    }), async (input, capabilities) => {
+      if (!('changes' in capabilities)) throw new Error('Table Field tombstone needs Action capabilities');
+      const field = (await capabilities.state!.tableFields()).find((candidate) => candidate.id === input.fieldId);
+      invariant(field, 'table.field-not-found', 'Table Field not found', 404);
+      invariant(field.tombstonedAt === undefined, 'table.field-already-tombstoned', 'Table Field is already tombstoned', 409);
+      invariant(field.version === input.observedVersion, 'table.field-conflict', 'Table Field changed after observation', 409);
+      capabilities.changes.updateTableField!({ ...field, tombstonedAt: capabilities.now(), tombstonedBy: capabilities.actorId, version: field.version + 1 }, field);
+      if (await capabilities.state!.displayFieldId() === field.id) await capabilities.changes.setTableDisplayField!(null);
+      return capabilities.commit();
+    }, { kind: 'channel-role', minimumRole: 'admin' }, ['updateTableField', 'setTableDisplayField']),
     contract('table.field.restore', z.object({
       channelId: channelIdSchema,
       fieldId: z.string().min(1),
       observedVersion: z.number().int().positive(),
-    }), undefined, { kind: 'channel-role', minimumRole: 'admin' }),
+    }), async (input, capabilities) => {
+      if (!('changes' in capabilities)) throw new Error('Table Field restoration needs Action capabilities');
+      const field = (await capabilities.state!.tableFields()).find((candidate) => candidate.id === input.fieldId);
+      invariant(field, 'table.field-not-found', 'Table Field not found', 404);
+      invariant(field.tombstonedAt !== undefined, 'table.field-not-tombstoned', 'Table Field is not tombstoned', 409);
+      invariant(field.version === input.observedVersion, 'table.field-conflict', 'Table Field changed after observation', 409);
+      const { tombstonedAt: _at, tombstonedBy: _by, ...active } = field;
+      const next: TableField = { ...active, version: field.version + 1 };
+      const fields = (await capabilities.state!.tableFields()).map((candidate) => candidate.id === field.id ? next : candidate);
+      const records = await capabilities.state!.tableRecords();
+      for (const record of records.filter((candidate) => candidate.tombstonedAt === undefined)) await capabilities.state!.validateTableRecordValues(fields, records, record.values, record.id, true, []);
+      capabilities.changes.updateTableField!(next, field);
+      return capabilities.commit();
+    }, { kind: 'channel-role', minimumRole: 'admin' }, ['updateTableField']),
     contract('table.field.convert', z.object({
       cardinality: recordReferenceCardinalitySchema.optional(),
       cancel: z.boolean().default(false),
@@ -132,12 +186,84 @@ export const tableChannelType = {
       resolutions: z.array(conversionResolutionSchema).default([]),
       targetChannelId: z.string().min(1).optional(),
       targetType: tableFieldTypeSchema,
-    }), undefined, { kind: 'channel-role', minimumRole: 'admin' }),
+    }), async (input, capabilities) => {
+      if (!('changes' in capabilities)) throw new Error('Table Field conversion needs Action capabilities');
+      const field = (await capabilities.state!.tableFields()).find((candidate) => candidate.id === input.fieldId);
+      invariant(field, 'table.field-not-found', 'Table Field not found', 404);
+      invariant(field.tombstonedAt === undefined, 'table.field-tombstoned', 'Table Field is tombstoned', 409);
+      invariant(field.version === input.observedVersion, 'table.field-conflict', 'Table Field changed after observation', 409);
+      invariant(field.type !== input.targetType, 'table.field-type-unchanged', 'Target Field type must differ', 409);
+      const isDictionary = input.targetType === 'dictionary';
+      const isReference = input.targetType === 'record-reference';
+      invariant(isReference ? input.targetChannelId !== undefined && input.cardinality !== undefined : input.cardinality === undefined, 'table.field-reference-configuration', 'Record Reference Field requires one target Channel and cardinality');
+      invariant(isDictionary ? input.targetChannelId !== undefined : isReference || input.targetChannelId === undefined, 'table.field-dictionary-configuration', 'Dictionary Field requires one target Dictionary Channel');
+      const { cardinality: _oldCardinality, targetChannelId: _oldTarget, ...fieldBase } = field;
+      const convertedField: TableField = { ...fieldBase, ...(input.cardinality === undefined ? {} : { cardinality: input.cardinality }), ...(input.targetChannelId === undefined ? {} : { targetChannelId: input.targetChannelId }), type: input.targetType };
+      await capabilities.state!.validateTableFieldTarget(convertedField);
+      if (input.cancel) {
+        invariant(input.resolutions.length === 0 && input.defaultResolution === undefined, 'table.field-conversion-cancelled', 'Cancelled conversion cannot include resolutions');
+        return capabilities.cancel!({ id: field.id, kind: 'field' });
+      }
+      const records = await capabilities.state!.tableRecords();
+      const failures = (await Promise.all(records.map(async (record) => {
+        const value = record.values[field.key];
+        return value !== undefined && value !== null && !(await capabilities.state!.acceptsTableFieldValue(convertedField, value)) ? record : null;
+      }))).filter((record): record is TableRecord => record !== null);
+      const defaultFails = field.defaultValue !== undefined && field.defaultValue !== null && !(await capabilities.state!.acceptsTableFieldValue(convertedField, field.defaultValue));
+      invariant(defaultFails === (input.defaultResolution !== undefined), 'table.field-conversion-default-unresolved', defaultFails ? 'Incompatible default value needs one explicit resolution' : 'Default resolution does not match an incompatible default', 409);
+      let nextDefault = field.defaultValue;
+      if (input.defaultResolution) {
+        if (input.defaultResolution.kind === 'null') {
+          invariant(!field.required, 'table.field-conversion-null-required', 'Required Field cannot be explicitly nulled');
+          invariant(input.defaultResolution.value === undefined, 'table.field-conversion-resolution-invalid', 'Null resolution cannot include a value');
+          nextDefault = null;
+        } else {
+          invariant(input.defaultResolution.value !== undefined && input.defaultResolution.value !== null, 'table.field-conversion-resolution-required', 'Correction or mapping needs a replacement value');
+          invariant(await capabilities.state!.acceptsTableFieldValue(convertedField, input.defaultResolution.value), 'table.field-conversion-resolution-invalid', 'Replacement value is incompatible with target Field');
+          nextDefault = input.defaultResolution.value;
+        }
+      }
+      const resolutions = new Map(input.resolutions.map((resolution) => [resolution.recordId, resolution]));
+      invariant(resolutions.size === input.resolutions.length, 'table.field-conversion-resolution-duplicate', 'Each Record may have one conversion resolution');
+      invariant(failures.every((record) => resolutions.has(record.id)) && resolutions.size === failures.length, 'table.field-conversion-unresolved', 'Every incompatible value needs one explicit resolution', 409);
+      const updates = await Promise.all(failures.map(async (record) => {
+        const resolution = resolutions.get(record.id)!;
+        let value: JsonValue;
+        if (resolution.kind === 'null') {
+          invariant(!field.required, 'table.field-conversion-null-required', 'Required Field cannot be explicitly nulled');
+          invariant(resolution.value === undefined, 'table.field-conversion-resolution-invalid', 'Null resolution cannot include a value');
+          value = null;
+        } else {
+          invariant(resolution.value !== undefined && resolution.value !== null, 'table.field-conversion-resolution-required', 'Correction or mapping needs a replacement value');
+          invariant(await capabilities.state!.acceptsTableFieldValue(convertedField, resolution.value), 'table.field-conversion-resolution-invalid', 'Replacement value is incompatible with target Field');
+          value = resolution.value;
+        }
+        return { record, value };
+      }));
+      const next: TableField = { ...convertedField, ...(nextDefault === undefined ? {} : { defaultValue: nextDefault }), version: field.version + 1 };
+      const nextFields = (await capabilities.state!.tableFields()).map((candidate) => candidate.id === field.id ? next : candidate);
+      const nextRecords = records.map((record) => {
+        const update = updates.find((candidate) => candidate.record.id === record.id);
+        return update ? { ...record, values: { ...record.values, [field.key]: update.value } } : record;
+      });
+      for (const record of nextRecords.filter((candidate) => candidate.tombstonedAt === undefined)) await capabilities.state!.validateTableRecordValues(nextFields, nextRecords, record.values, record.id, true, [field.key]);
+      for (const { record, value } of updates) capabilities.changes.updateTableRecord!({ expectedVersions: { [field.key]: record.fieldVersions[field.key] ?? 0 }, previousValues: [{ existed: true, key: field.key, value: record.values[field.key]! }], recordId: record.id, values: { [field.key]: value } });
+      capabilities.changes.updateTableField!(next, field);
+      return capabilities.commit();
+    }, { kind: 'channel-role', minimumRole: 'admin' }, ['cancel', 'updateTableField', 'updateTableRecord']),
     contract('table.field.purge', z.object({
       channelId: channelIdSchema,
       fieldId: z.string().min(1),
       observedVersion: z.number().int().positive(),
-    }), undefined, { kind: 'channel-role', minimumRole: 'admin' }),
+    }), async (input, capabilities) => {
+      if (!('changes' in capabilities)) throw new Error('Table Field purge needs Action capabilities');
+      const field = (await capabilities.state!.tableFields()).find((candidate) => candidate.id === input.fieldId);
+      invariant(field, 'table.field-not-found', 'Table Field not found', 404);
+      invariant(field.tombstonedAt !== undefined, 'table.field-not-tombstoned', 'Table Field must be tombstoned before purge', 409);
+      invariant(field.version === input.observedVersion, 'table.field-conflict', 'Table Field changed after observation', 409);
+      capabilities.changes.purgeTableField!(field);
+      return capabilities.commit();
+    }, { kind: 'channel-role', minimumRole: 'admin' }, ['purgeTableField']),
     contract('table.record.create', z.object({
       channelId: channelIdSchema,
       values: z.record(z.string(), jsonValueSchema),
@@ -145,7 +271,7 @@ export const tableChannelType = {
       if (!('changes' in capabilities)) throw new Error('Table Record creation needs Action capabilities');
       await capabilities.changes.createTableRecord!(input.values);
       return capabilities.commit();
-    }, { kind: 'channel-role', minimumRole: 'contributor' }, ['table.record.create']),
+    }, { kind: 'channel-role', minimumRole: 'contributor' }, ['createTableRecord']),
     contract('table.display-field.set', z.object({
       channelId: channelIdSchema,
       fieldId: z.string().min(1).nullable(),
@@ -153,21 +279,55 @@ export const tableChannelType = {
       if (!('changes' in capabilities)) throw new Error('Display Field selection needs Action capabilities');
       await capabilities.changes.setTableDisplayField!(input.fieldId);
       return capabilities.commit();
-    }, { kind: 'channel-role', minimumRole: 'admin' }, ['table.display-field.set']),
+    }, { kind: 'channel-role', minimumRole: 'admin' }, ['setTableDisplayField']),
     contract('table.record.edit', z.object({
       channelId: channelIdSchema,
       observedVersions: z.record(z.string(), z.number().int().nonnegative()),
       recordId: z.string().min(1),
       values: z.record(z.string(), jsonValueSchema),
-    }), undefined, { kind: 'channel-role', minimumRole: 'contributor' }),
+    }), async (input, capabilities) => {
+      if (!('changes' in capabilities)) throw new Error('Table Record edit needs Action capabilities');
+      const record = await capabilities.state!.tableRecord(input.recordId);
+      invariant(record?.channelId === input.channelId, 'table.record-not-found', 'Table Record not found', 404);
+      invariant(record.tombstonedAt === undefined, 'table.record-tombstoned', 'Table Record is tombstoned', 409);
+      const changedKeys = Object.keys(input.values);
+      invariant(changedKeys.length > 0, 'table.record-empty-edit', 'Table Record edit needs at least one Field');
+      invariant(changedKeys.every((key) => input.observedVersions[key] !== undefined), 'table.record-observed-version-required', 'Observed version is required for every edited Field');
+      for (const key of changedKeys) invariant((record.fieldVersions[key] ?? 0) === input.observedVersions[key], 'table.record-edit-conflict', `Table Field value changed after observation: ${key}`, 409);
+      const fields = await capabilities.state!.tableFields();
+      const records = await capabilities.state!.tableRecords();
+      const values = await capabilities.state!.validateTableRecordValues(fields, records, { ...record.values, ...input.values }, record.id, true, changedKeys);
+      capabilities.changes.updateTableRecord!({
+        expectedVersions: Object.fromEntries(changedKeys.map((key) => [key, input.observedVersions[key]!])),
+        previousValues: changedKeys.map((key) => ({ existed: Object.hasOwn(record.values, key), key, ...(Object.hasOwn(record.values, key) ? { value: record.values[key] } : {}) })),
+        recordId: record.id,
+        values: Object.fromEntries(changedKeys.map((key) => [key, values[key]!])),
+      });
+      return capabilities.commit();
+    }, { kind: 'channel-role', minimumRole: 'contributor' }, ['updateTableRecord']),
     contract('table.record.tombstone', z.object({
       channelId: channelIdSchema,
       recordId: z.string().min(1),
-    }), undefined, { kind: 'channel-role', minimumRole: 'contributor' }),
+    }), async (input, capabilities) => {
+      if (!('changes' in capabilities)) throw new Error('Table Record tombstone needs Action capabilities');
+      const record = await capabilities.state!.tableRecord(input.recordId);
+      invariant(record?.channelId === input.channelId, 'table.record-not-found', 'Table Record not found', 404);
+      invariant(record.tombstonedAt === undefined, 'table.record-already-tombstoned', 'Table Record is already tombstoned', 409);
+      capabilities.changes.tombstoneTableRecord!(record.id, record.updatedAt ?? null);
+      return capabilities.commit();
+    }, { kind: 'channel-role', minimumRole: 'contributor' }, ['tombstoneTableRecord']),
     contract('table.record.restore', z.object({
       channelId: channelIdSchema,
       recordId: z.string().min(1),
-    }), undefined, { kind: 'channel-role', minimumRole: 'contributor' }),
+    }), async (input, capabilities) => {
+      if (!('changes' in capabilities)) throw new Error('Table Record restoration needs Action capabilities');
+      const record = await capabilities.state!.tableRecord(input.recordId);
+      invariant(record?.channelId === input.channelId, 'table.record-not-found', 'Table Record not found', 404);
+      invariant(record.tombstonedAt !== undefined, 'table.record-not-tombstoned', 'Table Record is not tombstoned', 409);
+      await capabilities.state!.validateTableRecordValues(await capabilities.state!.tableFields(), await capabilities.state!.tableRecords(), record.values, record.id, false);
+      capabilities.changes.restoreTableRecord!(record.id, record.tombstonedAt);
+      return capabilities.commit();
+    }, { kind: 'channel-role', minimumRole: 'contributor' }, ['restoreTableRecord']),
     contract('table.view.create', z.object({
       channelId: channelIdSchema,
       filters: z.array(tableViewFilterSchema).default([]),
@@ -191,7 +351,7 @@ export const tableChannelType = {
         visibleFieldIds: input.visibleFieldIds,
       });
       return capabilities.commit();
-    }, { kind: 'channel-role', minimumRole: 'viewer' }, ['table.view.create']),
+    }, { kind: 'channel-role', minimumRole: 'viewer' }, ['createTableView']),
     ...discussionActions,
   ],
   activityFor: (changes) => {
@@ -223,6 +383,22 @@ export const tableChannelType = {
     contract('table.describe', z.object({
       channelId: channelIdSchema,
       includeTombstoned: z.boolean().default(false),
+    }), async (input, capabilities) => ({
+      data: (await capabilities.state!.tableFields())
+        .filter((field) => input.includeTombstoned || field.tombstonedAt === undefined)
+        .map((field) => ({
+          ...(field.cardinality === undefined ? {} : { cardinality: field.cardinality }),
+          id: field.id,
+          key: field.key,
+          label: field.label,
+          required: field.required,
+          ...(field.targetChannelId === undefined ? {} : { targetChannelId: field.targetChannelId }),
+          ...(field.tombstonedAt === undefined ? {} : { tombstonedAt: field.tombstonedAt }),
+          type: field.type,
+          unique: field.unique,
+          version: field.version,
+        })),
+      view: pendingView(),
     })),
     contract('table.field.conversion.preview', z.object({
       cardinality: recordReferenceCardinalitySchema.optional(),
@@ -230,18 +406,102 @@ export const tableChannelType = {
       fieldId: z.string().min(1),
       targetChannelId: z.string().min(1).optional(),
       targetType: tableFieldTypeSchema,
-    }), undefined, { kind: 'channel-role', minimumRole: 'admin' }),
-    contract('table.configuration', z.object({ channelId: channelIdSchema })),
+    }), async (input, capabilities) => {
+      const field = (await capabilities.state!.tableFields()).find((candidate) => candidate.id === input.fieldId);
+      invariant(field, 'table.field-not-found', 'Table Field not found', 404);
+      invariant(field.tombstonedAt === undefined, 'table.field-tombstoned', 'Table Field is tombstoned', 409);
+      const isDictionary = input.targetType === 'dictionary';
+      const isRecordReference = input.targetType === 'record-reference';
+      invariant(isRecordReference ? input.targetChannelId !== undefined && input.cardinality !== undefined : input.cardinality === undefined, 'table.field-reference-configuration', 'Record Reference Field requires one target Channel and cardinality');
+      invariant(isDictionary ? input.targetChannelId !== undefined : isRecordReference || input.targetChannelId === undefined, 'table.field-dictionary-configuration', 'Dictionary Field requires one target Dictionary Channel');
+      const { cardinality: _oldCardinality, targetChannelId: _oldTarget, ...fieldBase } = field;
+      const convertedField: TableField = {
+        ...fieldBase,
+        ...(input.cardinality === undefined ? {} : { cardinality: input.cardinality }),
+        ...(input.targetChannelId === undefined ? {} : { targetChannelId: input.targetChannelId }),
+        type: input.targetType,
+      };
+      await capabilities.state!.validateTableFieldTarget(convertedField);
+      const records = await capabilities.state!.tableRecords();
+      return {
+        data: {
+          defaultFailure: field.defaultValue !== undefined && field.defaultValue !== null && !(await capabilities.state!.acceptsTableFieldValue(convertedField, field.defaultValue)) ? field.defaultValue : null,
+          failures: (await Promise.all(records.map(async (record) => {
+            const value = record.values[field.key];
+            return value !== undefined && value !== null && !(await capabilities.state!.acceptsTableFieldValue(convertedField, value)) ? { originalValue: value, recordId: record.id } : null;
+          }))).filter((failure) => failure !== null),
+          fieldId: field.id,
+          observedVersion: field.version,
+          targetType: input.targetType,
+        },
+        view: pendingView(),
+      };
+    }, { kind: 'channel-role', minimumRole: 'admin' }),
+    contract('table.configuration', z.object({ channelId: channelIdSchema }), async (_input, capabilities) => ({
+      data: { displayFieldId: await capabilities.state!.displayFieldId() },
+      view: pendingView(),
+    })),
     contract('table.records.list', z.object({
       channelId: channelIdSchema,
       includeTombstonedFields: z.boolean().default(false),
       includeTombstoned: z.boolean().default(false),
-    })),
+    }), async (input, capabilities) => {
+      const records = (await capabilities.state!.tableRecords()).filter((record) => input.includeTombstoned || record.tombstonedAt === undefined);
+      const fields = await capabilities.state!.tableFields();
+      const visibleKeys = new Set(fields.filter((field) => input.includeTombstonedFields || field.tombstonedAt === undefined).map((field) => field.key));
+      return {
+        data: await Promise.all(records.map(async (record) => ({
+          fieldVersions: Object.fromEntries(Object.entries(record.fieldVersions).filter(([key]) => visibleKeys.has(key))),
+          id: record.id,
+          ...(record.tombstonedAt === undefined ? {} : { tombstonedAt: record.tombstonedAt }),
+          values: await capabilities.state!.resolveTableValues(
+            fields.filter((field) => visibleKeys.has(field.key)),
+            Object.fromEntries(Object.entries(record.values).filter(([key]) => visibleKeys.has(key))),
+          ),
+        }))),
+        view: pendingView(),
+      };
+    }),
     contract('table.view.open', z.object({
       channelId: channelIdSchema,
       viewId: z.string().min(1),
+    }), async (input, capabilities) => {
+      if (!('read' in capabilities)) throw new Error('Table View opening needs Query capabilities');
+      const definition = (await capabilities.state!.tableViews()).find((view) => view.id === input.viewId);
+      invariant(definition, 'table.view-not-found', 'Table View does not exist or is not available', 404);
+      const fields = await capabilities.state!.tableFields();
+      const keys = new Map(fields.map((field) => [field.id, field.key]));
+      const visibleKeys = new Set(definition.visibleFieldIds.map((fieldId) => keys.get(fieldId)).filter((key): key is string => key !== undefined));
+      const records = await capabilities.read('table.records.list', { channelId: input.channelId });
+      let current: QueryResult = {
+        data: (records.data as JsonValue[]).map((record) => {
+          if (record === null || Array.isArray(record) || typeof record !== 'object') return record;
+          const values = record.values;
+          return { ...record, values: values !== null && !Array.isArray(values) && typeof values === 'object' ? Object.fromEntries(Object.entries(values).filter(([key]) => visibleKeys.has(key))) : (values ?? null) };
+        }),
+        view: pendingView(),
+      };
+      current = capabilities.transform(current, { filters: definition.filters.map((filter) => ({ field: keys.get(filter.fieldId) ?? filter.fieldId, operator: filter.operator, ...(filter.value === undefined ? {} : { value: filter.value }) })), kind: 'filter' });
+      if (Array.isArray(current.data) && definition.sorting.length > 0) {
+        const valueAt = (row: JsonValue, key: string): JsonValue | undefined => row !== null && !Array.isArray(row) && typeof row === 'object' && row.values !== null && !Array.isArray(row.values) && typeof row.values === 'object' ? row.values[key] : undefined;
+        current = { ...current, data: [...current.data].sort((left, right) => {
+          for (const sort of definition.sorting) {
+            const compared = (JSON.stringify(valueAt(left, keys.get(sort.fieldId) ?? sort.fieldId)) ?? '').localeCompare(JSON.stringify(valueAt(right, keys.get(sort.fieldId) ?? sort.fieldId)) ?? '');
+            if (compared !== 0) return sort.direction === 'ascending' ? compared : -compared;
+          }
+          return 0;
+        }) };
+      }
+      return definition.grouping.length === 0 ? current : capabilities.transform(current, { fields: definition.grouping.map((fieldId) => keys.get(fieldId) ?? fieldId), kind: 'group' });
+    }),
+    contract('table.views.list', z.object({ channelId: channelIdSchema }), async (_input, capabilities) => ({
+      data: (await capabilities.state!.tableViews()).map((view) => ({
+        filters: [...view.filters], grouping: [...view.grouping], id: view.id, name: view.name,
+        ownerId: view.ownerId, sorting: [...view.sorting], visibility: view.visibility,
+        visibleFieldIds: [...view.visibleFieldIds],
+      })),
+      view: pendingView(),
     })),
-    contract('table.views.list', z.object({ channelId: channelIdSchema })),
     ...discussionQueries,
   ],
   recordKinds: ['table-record', 'discussion-message'],

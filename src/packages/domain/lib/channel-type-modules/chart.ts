@@ -1,7 +1,7 @@
 import * as z from 'zod/v4';
 
 import type { ChannelTypeDefinition } from '../channel-types';
-import { jsonValueSchema } from '../model';
+import { jsonValueSchema, type ChartDefinition } from '../model';
 import { channelIdSchema, contract, produceOwnedView, stateRule } from './contract';
 import { invariant } from '../errors';
 import {
@@ -28,6 +28,7 @@ const chartPresentationSchema = z.object({
   series: z.array(z.string().min(1)).min(1),
   type: z.enum(['bar', 'line', 'pie']),
 });
+const pendingView = () => ({ bindings: {}, commands: [], kind: 'pending', schemaVersion: 'datagram/view@1' as const, title: 'Channel Type View' });
 
 export const chartChannelType = {
   actions: [
@@ -38,8 +39,9 @@ export const chartChannelType = {
       typeVersion: z.string().regex(/^\d+\.\d+\.\d+$/).optional(),
     }), async (input, capabilities) => {
       if (!('changes' in capabilities)) throw new Error('Chart creation needs Action capabilities');
-      return capabilities.changes.createChart!();
-    }, { kind: 'authenticated' }, ['chart.create']),
+      await capabilities.changes.createChart!();
+      return capabilities.commit();
+    }, { kind: 'authenticated' }, ['createChart']),
     contract('chart.definition.update', z.object({
       aggregations: z.array(chartAggregationSchema).min(1),
       channelId: channelIdSchema,
@@ -48,11 +50,38 @@ export const chartChannelType = {
       observedVersion: z.number().int().positive(),
       presentation: chartPresentationSchema,
       sourceChannelId: z.string().min(1),
-    }), undefined, { kind: 'channel-role', minimumRole: 'admin' }),
+    }), async (input, capabilities) => {
+      if (!('changes' in capabilities)) throw new Error('Chart definition update needs Action capabilities');
+      const current = await capabilities.state!.chartDefinition();
+      invariant(current, 'chart.definition-not-found', 'Chart definition not found', 404);
+      invariant(current.version === input.observedVersion, 'chart.definition-conflict', 'Chart definition changed after observation', 409);
+      const definition: ChartDefinition = {
+        aggregations: input.aggregations.map((aggregation) => ({ as: aggregation.as, ...(aggregation.field === undefined ? {} : { field: aggregation.field }), operator: aggregation.operator })),
+        channelId: input.channelId,
+        filters: input.filters.map((filter) => ({ field: filter.field, operator: filter.operator, ...(filter.value === undefined ? {} : { value: filter.value }) })),
+        grouping: input.grouping,
+        presentation: { ...(input.presentation.categoryField === undefined ? {} : { categoryField: input.presentation.categoryField }), series: input.presentation.series, type: input.presentation.type },
+        sourceChannelId: input.sourceChannelId,
+        version: current.version + 1,
+      };
+      await capabilities.state!.validateChartDefinition(definition);
+      capabilities.changes.setChartDefinition!(definition, current.version);
+      return capabilities.commit();
+    }, { kind: 'channel-role', minimumRole: 'admin' }, ['setChartDefinition']),
     contract('chart.event.record', z.object({
       channelId: channelIdSchema,
       kind: z.enum(['insight', 'report', 'threshold']),
-    }), undefined, { kind: 'channel-role', minimumRole: 'contributor' }),
+    }), async (input, capabilities) => {
+      if (!('changes' in capabilities)) throw new Error('Chart event recording needs Action capabilities');
+      capabilities.changes.recordChartEvent!(
+        input.kind === 'insight'
+          ? 'chart.insight-produced'
+          : input.kind === 'report'
+            ? 'chart.report-produced'
+            : 'chart.threshold-crossed',
+      );
+      return capabilities.commit();
+    }, { kind: 'channel-role', minimumRole: 'contributor' }, ['recordChartEvent']),
     ...discussionActions,
   ],
   activityFor: (changes) => {
@@ -72,7 +101,17 @@ export const chartChannelType = {
     ...discussionActivityKinds,
   ],
   id: 'chart',
-  queries: [contract('chart.open', z.object({ channelId: channelIdSchema })), ...discussionQueries],
+  queries: [contract('chart.open', z.object({ channelId: channelIdSchema }), async (_input, capabilities) => {
+    if (!('read' in capabilities)) throw new Error('Chart opening needs Query capabilities');
+    const definition = await capabilities.state!.chartDefinition();
+    invariant(definition, 'chart.definition-not-found', 'Chart definition not found', 404);
+    await capabilities.state!.validateChartDefinition(definition);
+    let current = await capabilities.readSourceTable(definition.sourceChannelId);
+    if (definition.filters.length > 0) current = capabilities.transform(current, { filters: definition.filters, kind: 'filter' });
+    if (definition.grouping.length > 0) current = capabilities.transform(current, { fields: definition.grouping, kind: 'group' });
+    current = capabilities.transform(current, { aggregations: definition.aggregations, kind: 'aggregate' });
+    return { data: { presentation: definition.presentation, series: current.data }, view: pendingView() };
+  }), ...discussionQueries],
   recordKinds: ['discussion-message'],
   stateRules: [
     stateRule('aggregation-names-are-unique', (name, rawInput) => {

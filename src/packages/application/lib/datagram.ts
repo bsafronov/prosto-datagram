@@ -42,10 +42,8 @@ import type { DatagramStore } from './store';
 import type { ChannelActionCapabilities } from '../../domain/lib/channel-type-modules/contract';
 import { ActionRegistry, QueryRegistry, defineAction, defineQuery } from './contracts';
 import type {
-  ActionDefinition,
   ChannelTypeContractSelector,
   ExecutionContext,
-  QueryDefinition,
 } from './contracts';
 import { ResultHandleBroker, transformResult } from './result-handles';
 import type {
@@ -63,62 +61,7 @@ const roleRank: Readonly<Record<ChannelRole, number>> = {
   viewer: 0,
 };
 
-const optionalJsonValueSchema = jsonValueSchema.optional();
-
-const dictionaryLabelSchema = z
-  .string()
-  .transform(normalizeDictionaryLabel)
-  .pipe(z.string().min(1).max(160));
-
-const tableViewFilterSchema = z.object({
-  fieldId: z.string().min(1),
-  operator: z.enum(['contains', 'equals', 'greater-than', 'is-empty', 'less-than']),
-  value: optionalJsonValueSchema,
-});
-
-const tableViewSortSchema = z.object({
-  direction: z.enum(['ascending', 'descending']),
-  fieldId: z.string().min(1),
-});
-
-const chartFilterSchema = z.object({
-  field: z.string().min(1),
-  operator: z.enum(['contains', 'equals', 'greater-than', 'is-empty', 'less-than']),
-  value: optionalJsonValueSchema,
-});
-
-const chartAggregationSchema = z.object({
-  as: z.string().trim().min(1).max(120),
-  field: z.string().min(1).optional(),
-  operator: z.enum(['average', 'count', 'maximum', 'minimum', 'sum']),
-});
-
-const chartPresentationSchema = z.object({
-  categoryField: z.string().min(1).optional(),
-  series: z.array(z.string().min(1)).min(1),
-  type: z.enum(['bar', 'line', 'pie']),
-});
-
-const fieldConversionResolutionSchema = z.object({
-  kind: z.enum(['correct', 'map', 'null']),
-  recordId: z.string().min(1),
-  value: optionalJsonValueSchema,
-});
-
-const fieldDefaultConversionResolutionSchema = z.object({
-  kind: z.enum(['correct', 'map', 'null']),
-  value: optionalJsonValueSchema,
-});
-
 const toJson = (value: unknown): JsonValue => jsonValueSchema.parse(value);
-
-const pendingChannelTypeView = (): QueryResult['view'] => ({
-  bindings: {},
-  commands: [],
-  kind: 'channel-type',
-  schemaVersion: 'datagram/view@1',
-  title: 'Channel Type View',
-});
 
 const immutableInput = <T>(value: T): T => {
   if (value === null || typeof value !== 'object' || Object.isFrozen(value)) return value;
@@ -127,8 +70,6 @@ const immutableInput = <T>(value: T): T => {
 };
 
 export class DatagramApplication {
-  readonly #typeActions: ReadonlyMap<string, ActionDefinition>;
-  readonly #typeQueries: ReadonlyMap<string, QueryDefinition>;
   readonly actions: ActionRegistry;
   readonly queries: QueryRegistry;
   readonly handles: ResultHandleBroker;
@@ -150,14 +91,6 @@ export class DatagramApplication {
       this.channelTypes.list().flatMap((definition) =>
         definition.queries.map((contract) => contract.name),
       ),
-    );
-    this.#typeActions = new Map(
-      actions.filter((definition) => channelActionNames.has(definition.name))
-        .map((definition) => [definition.name, definition]),
-    );
-    this.#typeQueries = new Map(
-      queries.filter((definition) => channelQueryNames.has(definition.name))
-        .map((definition) => [definition.name, definition]),
     );
     this.actions = new ActionRegistry(
       actions.filter((definition) => !channelActionNames.has(definition.name)),
@@ -264,18 +197,9 @@ export class DatagramApplication {
       }
       const pendingChanges: DomainChange[] = [];
       let pendingSubject: ActionReceipt['subject'];
-      const operationBuilders: Readonly<Record<string, keyof ChannelActionCapabilities['changes']>> = {
-        'channel.create': 'createChannel',
-        'chart.create': 'createChart',
-        'dictionary.entry.create': 'createDictionaryEntry',
-        'table.display-field.set': 'setTableDisplayField',
-        'table.record.create': 'createTableRecord',
-        'table.view.create': 'createTableView',
-      };
+      let pendingActivityKind: string | undefined;
       const allowedBuilderNames = new Set(
-        this.channelTypes
-          .requireAllowedOperations(contract.typeId, contract.typeVersion, name)
-          .map((operation) => operationBuilders[operation]),
+        this.channelTypes.requireAllowedOperations(contract.typeId, contract.typeVersion, name),
       );
       return this.channelTypes.executeAction(
         contract.typeId,
@@ -283,17 +207,6 @@ export class DatagramApplication {
         name,
         selectedInput,
         {
-          actions: {
-            [name]: async () => {
-              const implementation = this.#typeActions.get(name);
-              invariant(
-                implementation,
-                'channel-type.implementation-missing',
-                `Channel Type Action implementation is unavailable: ${name}`,
-              );
-              return implementation.run({ actorId, origin }, parsedInput);
-            },
-          },
           actorId,
           changes: Object.fromEntries(Object.entries({
             createChannel: (title) => {
@@ -325,9 +238,32 @@ export class DatagramApplication {
               return selectedChannelId;
             },
             createChart: async () => {
-              const implementation = this.#typeActions.get('chart.create');
-              invariant(implementation, 'channel-type.implementation-missing', 'Chart creation implementation is unavailable');
-              return implementation.run({ actorId, origin }, parsedInput);
+              invariant(contract.typeId === 'chart' && selectedChannelId === undefined, 'channel-type.capability-denied', 'Only Chart creation may consume a Chart Handle', 403);
+              const chartInput = parsedInput as {
+                handleId: string;
+                presentation: ChartDefinition['presentation'];
+                title: string;
+              };
+              const durable = await this.handles.consumeDefinition(this.handles.serviceId, actorId, chartInput.handleId, 'chart.create');
+              selectedChannelId = newId('channel');
+              const definition = await this.#chartDefinitionFromResult(actorId, selectedChannelId, durable, chartInput.presentation, 1);
+              const occurredAt = nowIso();
+              pendingChanges.push(
+                { channel: { createdAt: occurredAt, id: selectedChannelId, ownerId: actorId, title: chartInput.title, typeId: contract.typeId, typeVersion: contract.typeVersion, updatedAt: occurredAt }, kind: 'channel.created' },
+                { kind: 'membership.granted', membership: { channelId: selectedChannelId, personId: actorId, role: 'owner' } },
+                { definition, kind: 'chart.definition-set' },
+              );
+              pendingSubject = { id: selectedChannelId, kind: 'channel' };
+            },
+            setChartDefinition: (definition, expectedVersion) => {
+              invariant(contract.typeId === 'chart' && selectedChannelId === definition.channelId, 'channel-type.capability-denied', 'This Channel Type cannot emit Chart transitions', 403);
+              pendingChanges.push({ definition, kind: 'chart.definition-set', ...(expectedVersion === undefined ? {} : { expectedVersion }) });
+              pendingSubject = { id: definition.channelId, kind: 'channel' };
+            },
+            recordChartEvent: (kind) => {
+              invariant(contract.typeId === 'chart' && selectedChannelId, 'channel-type.capability-denied', 'This Channel Type cannot emit Chart events', 403);
+              pendingActivityKind = kind;
+              pendingSubject = { id: selectedChannelId, kind: 'channel' };
             },
             createDictionaryEntry: async (label) => {
               invariant(
@@ -359,6 +295,58 @@ export class DatagramApplication {
               });
               pendingSubject = { id: entryId, kind: 'dictionary-entry' };
               return entryId;
+            },
+            renameDictionaryEntry: (change) => {
+              invariant(contract.typeId === 'dictionary' && selectedChannelId, 'channel-type.capability-denied', 'This Channel Type cannot emit Dictionary transitions', 403);
+              pendingChanges.push({ kind: 'dictionary.entry-renamed', ...change });
+              pendingSubject = { id: change.entryId, kind: 'dictionary-entry' };
+            },
+            restoreDictionaryEntry: (entryId, restoredAt) => {
+              invariant(contract.typeId === 'dictionary' && selectedChannelId, 'channel-type.capability-denied', 'This Channel Type cannot emit Dictionary transitions', 403);
+              pendingChanges.push({ entryId, kind: 'dictionary.entry-restored', restoredAt });
+              pendingSubject = { id: entryId, kind: 'dictionary-entry' };
+            },
+            retireDictionaryEntry: (entryId, retiredAt) => {
+              invariant(contract.typeId === 'dictionary' && selectedChannelId, 'channel-type.capability-denied', 'This Channel Type cannot emit Dictionary transitions', 403);
+              pendingChanges.push({ actorId, entryId, kind: 'dictionary.entry-retired', retiredAt });
+              pendingSubject = { id: entryId, kind: 'dictionary-entry' };
+            },
+            editDiscussionMessage: (messageId, text) => {
+              invariant(selectedChannelId, 'channel-type.capability-denied', 'Discussion transition requires a Channel', 403);
+              pendingChanges.push({
+                kind: 'discussion.message-edited',
+                messageId,
+                revision: { createdAt: nowIso(), editorId: actorId, id: newId('revision'), text },
+              });
+              pendingSubject = { id: messageId, kind: 'message' };
+            },
+            postDiscussionMessage: (messageInput) => {
+              invariant(selectedChannelId, 'channel-type.capability-denied', 'Discussion transition requires a Channel', 403);
+              const messageId = newId('message');
+              const createdAt = nowIso();
+              pendingChanges.push({
+                kind: 'discussion.message-posted',
+                message: {
+                  authorId: actorId,
+                  channelId: selectedChannelId,
+                  createdAt,
+                  id: messageId,
+                  recordReferences: messageInput.recordReferences,
+                  ...(messageInput.replyToMessageId ? { replyToMessageId: messageInput.replyToMessageId } : {}),
+                  revisions: [{ createdAt, editorId: actorId, id: newId('revision'), text: messageInput.text }],
+                  text: messageInput.text,
+                },
+              });
+              pendingSubject = { id: messageId, kind: 'message' };
+              return messageId;
+            },
+            restoreDiscussionMessage: (messageId) => {
+              pendingChanges.push({ kind: 'discussion.message-restored', messageId, restoredBy: actorId });
+              pendingSubject = { id: messageId, kind: 'message' };
+            },
+            tombstoneDiscussionMessage: (messageId) => {
+              pendingChanges.push({ actorId, kind: 'discussion.message-tombstoned', messageId, tombstonedAt: nowIso() });
+              pendingSubject = { id: messageId, kind: 'message' };
             },
             createTableRecord: async (values) => {
               invariant(
@@ -465,6 +453,34 @@ export class DatagramApplication {
                 kind: 'table.display-field-set',
               });
             },
+            addTableField: (field) => {
+              invariant(contract.typeId === 'table' && selectedChannelId === field.channelId, 'channel-type.capability-denied', 'This Channel Type cannot emit Table transitions', 403);
+              pendingChanges.push({ field, kind: 'table.field-added' });
+              pendingSubject = { id: field.id, kind: 'field' };
+            },
+            purgeTableField: (field) => {
+              invariant(contract.typeId === 'table' && selectedChannelId === field.channelId, 'channel-type.capability-denied', 'This Channel Type cannot emit Table transitions', 403);
+              pendingChanges.push({ channelId: field.channelId, expectedVersion: field.version, fieldId: field.id, fieldKey: field.key, kind: 'table.field-purged' });
+              pendingSubject = { id: field.id, kind: 'field' };
+            },
+            updateTableField: (field, previousField) => {
+              invariant(contract.typeId === 'table' && selectedChannelId === field.channelId && previousField.channelId === selectedChannelId, 'channel-type.capability-denied', 'This Channel Type cannot emit Table transitions', 403);
+              pendingChanges.push({ expectedVersion: previousField.version, field, kind: 'table.field-updated', previousField });
+              pendingSubject = { id: field.id, kind: 'field' };
+            },
+            updateTableRecord: (recordInput) => {
+              invariant(contract.typeId === 'table' && selectedChannelId, 'channel-type.capability-denied', 'This Channel Type cannot emit Table transitions', 403);
+              pendingChanges.push({ kind: 'table.record-updated', recordId: recordInput.recordId, updatedAt: nowIso(), values: recordInput.values, ...(recordInput.expectedVersions ? { expectedVersions: recordInput.expectedVersions } : {}), ...(recordInput.previousValues ? { previousValues: recordInput.previousValues } : {}), ...(recordInput.removedKeys ? { removedKeys: recordInput.removedKeys } : {}) });
+              pendingSubject = { id: recordInput.recordId, kind: 'record' };
+            },
+            restoreTableRecord: (recordId, expectedTombstonedAt) => {
+              pendingChanges.push({ kind: 'table.record-restored', recordId, restoredAt: nowIso(), ...(expectedTombstonedAt ? { expectedTombstonedAt } : {}) });
+              pendingSubject = { id: recordId, kind: 'record' };
+            },
+            tombstoneTableRecord: (recordId, expectedUpdatedAt) => {
+              pendingChanges.push({ actorId, kind: 'table.record-tombstoned', recordId, tombstonedAt: nowIso(), ...(expectedUpdatedAt === undefined ? {} : { expectedUpdatedAt }) });
+              pendingSubject = { id: recordId, kind: 'record' };
+            },
           } satisfies Required<ChannelActionCapabilities['changes']>).filter(([builder]) => allowedBuilderNames.has(
             builder as keyof ChannelActionCapabilities['changes'],
           ))) as ChannelActionCapabilities['changes'],
@@ -474,7 +490,7 @@ export class DatagramApplication {
                 ? (selectedInput as Record<string, unknown>).channelId
                 : undefined;
             invariant(
-              authorization.kind !== 'channel-role'
+              authorization.kind === 'authenticated' || authorization.kind === 'operator'
                 ? requestedChannelId === undefined
                 : requestedChannelId === selectedChannelId,
               'channel-type.capability-denied',
@@ -482,12 +498,12 @@ export class DatagramApplication {
               403,
             );
             invariant(
-              pendingChanges.length > 0,
+              pendingChanges.length > 0 || pendingActivityKind !== undefined,
               'channel-type.capability-denied',
               'Channel Type handler did not build a transition',
               403,
             );
-            const activityKind = this.channelTypes.activityFor(
+            const activityKind = pendingActivityKind ?? this.channelTypes.activityFor(
               contract.typeId,
               contract.typeVersion,
               pendingChanges,
@@ -529,8 +545,50 @@ export class DatagramApplication {
               pendingSubject,
             );
           },
+          ...(allowedBuilderNames.has('cancel') ? {
+            cancel: (subject: ActionReceipt['subject']) => this.#commit({ actorId, origin }, name, selectedChannelId, () => [], subject),
+          } : {}),
           newId,
           now: nowIso,
+          ...(selectedChannelId ? {
+            state: {
+              acceptsTableFieldValue: (field, value) => this.#fieldAccepts(actorId, field, value),
+              channel: (await this.#requireChannel(selectedChannelId)),
+              chartDefinition: () => this.store.getChartDefinition(selectedChannelId!),
+              validateChartDefinition: (definition) => this.#validateChartDefinition(actorId, definition),
+              dictionaryEntries: () => this.store.listDictionaryEntries(selectedChannelId!),
+              dictionaryEntry: async (entryId) => {
+                const entry = await this.store.getDictionaryEntry(entryId);
+                return entry?.channelId === selectedChannelId ? entry : null;
+              },
+              displayFieldId: () => this.store.getTableDisplayFieldId(selectedChannelId!),
+              message: async (messageId) => {
+                const message = await this.store.getMessage(messageId);
+                return message?.channelId === selectedChannelId ? message : null;
+              },
+              messages: () => this.store.listMessages(selectedChannelId!),
+              resolveRecordReference: (recordId) => this.#resolveChannelRecordId(actorId, recordId),
+              resolveTableValues: (fields, values) => this.#resolveTableValues(actorId, fields, values),
+              validateTableFieldTarget: async (field) => {
+                if (field.type === 'record-reference') {
+                  const target = await this.#requireChannel(field.targetChannelId!);
+                  invariant(this.channelTypes.require(target.typeId, target.typeVersion).recordKinds.length > 0, 'table.record-reference-invalid', 'Target Channel Type does not expose Channel Records');
+                  await this.#requireRole(actorId, target.id, 'viewer');
+                } else if (field.type === 'dictionary') {
+                  await this.#requireChannel(field.targetChannelId!, 'dictionary');
+                  await this.#requireRole(actorId, field.targetChannelId!, 'viewer');
+                }
+              },
+              validateTableRecordValues: (fields, records, values, currentRecordId, applyDefaults, changedKeys) => this.#validatedRecordValues(actorId, fields, records, values, currentRecordId, applyDefaults, changedKeys ? new Set(changedKeys) : undefined),
+              tableFields: () => this.store.listTableFields(selectedChannelId!),
+              tableRecord: async (recordId) => {
+                const record = await this.store.getTableRecord(recordId);
+                return record?.channelId === selectedChannelId ? record : null;
+              },
+              tableRecords: () => this.store.listTableRecords(selectedChannelId!),
+              tableViews: () => this.store.listTableViews(selectedChannelId!, actorId),
+            },
+          } : {}),
         },
       );
     }
@@ -615,20 +673,6 @@ export class DatagramApplication {
           input,
           {
             actorId,
-            queries: {
-              [name]: async () => {
-                const implementation = this.#typeQueries.get(name);
-                invariant(
-                  implementation,
-                  'channel-type.implementation-missing',
-                  `Channel Type Query implementation is unavailable: ${name}`,
-                );
-                return implementation.run(
-                  { actorId, origin },
-                  immutableInput(contract.schema.parse(input)),
-                );
-              },
-            },
             read: async (query, readInput) => {
               const selectedChannelId = (input as { channelId: string }).channelId;
               invariant(
@@ -665,6 +709,18 @@ export class DatagramApplication {
                 nextQueryStack,
               );
             },
+            readSourceTable: async (channelId) => {
+              const source = await this.#requireChannel(channelId, 'table');
+              return this.executeQuery(
+                actorId,
+                origin,
+                'table.records.list',
+                { channelId },
+                { typeId: source.typeId, typeVersion: source.typeVersion },
+                nextQueryStack,
+              );
+            },
+            transform: (source, definition) => transformResult(source, definition),
             ...(typeof (input as { channelId?: unknown }).channelId === 'string'
               ? {
                   role: await this.#requireRole(
@@ -672,6 +728,43 @@ export class DatagramApplication {
                     (input as { channelId: string }).channelId,
                     'viewer',
                   ),
+                  state: {
+                    acceptsTableFieldValue: (field, value) => this.#fieldAccepts(actorId, field, value),
+                    channel: await this.#requireChannel((input as { channelId: string }).channelId),
+                    chartDefinition: () => this.store.getChartDefinition((input as { channelId: string }).channelId),
+                    validateChartDefinition: (definition) => this.#validateChartDefinition(actorId, definition),
+                    dictionaryEntries: () => this.store.listDictionaryEntries((input as { channelId: string }).channelId),
+                    dictionaryEntry: async (entryId: string) => {
+                      const entry = await this.store.getDictionaryEntry(entryId);
+                      return entry?.channelId === (input as { channelId: string }).channelId ? entry : null;
+                    },
+                    displayFieldId: () => this.store.getTableDisplayFieldId((input as { channelId: string }).channelId),
+                    message: async (messageId: string) => {
+                      const message = await this.store.getMessage(messageId);
+                      return message?.channelId === (input as { channelId: string }).channelId ? message : null;
+                    },
+                    messages: () => this.store.listMessages((input as { channelId: string }).channelId),
+                    resolveRecordReference: (recordId: string) => this.#resolveChannelRecordId(actorId, recordId),
+                    resolveTableValues: (fields, values) => this.#resolveTableValues(actorId, fields, values),
+                    validateTableFieldTarget: async (field) => {
+                      if (field.type === 'record-reference') {
+                        const target = await this.#requireChannel(field.targetChannelId!);
+                        invariant(this.channelTypes.require(target.typeId, target.typeVersion).recordKinds.length > 0, 'table.record-reference-invalid', 'Target Channel Type does not expose Channel Records');
+                        await this.#requireRole(actorId, target.id, 'viewer');
+                      } else if (field.type === 'dictionary') {
+                        await this.#requireChannel(field.targetChannelId!, 'dictionary');
+                        await this.#requireRole(actorId, field.targetChannelId!, 'viewer');
+                      }
+                    },
+                    validateTableRecordValues: (fields, records, values, currentRecordId, applyDefaults, changedKeys) => this.#validatedRecordValues(actorId, fields, records, values, currentRecordId, applyDefaults, changedKeys ? new Set(changedKeys) : undefined),
+                    tableFields: () => this.store.listTableFields((input as { channelId: string }).channelId),
+                    tableRecord: async (recordId: string) => {
+                      const record = await this.store.getTableRecord(recordId);
+                      return record?.channelId === (input as { channelId: string }).channelId ? record : null;
+                    },
+                    tableRecords: () => this.store.listTableRecords((input as { channelId: string }).channelId),
+                    tableViews: () => this.store.listTableViews((input as { channelId: string }).channelId, actorId),
+                  },
                 }
               : {}),
           },
@@ -2155,1526 +2248,7 @@ export class DatagramApplication {
           );
         },
       }),
-      defineAction({
-        description: 'Create a stable Entry in a Dictionary Channel. Contributor role required.',
-        inputSchema: z.object({
-          channelId: z.string().min(1),
-          label: dictionaryLabelSchema,
-        }),
-        name: 'dictionary.entry.create',
-        run: async (context, input) => {
-          await this.#requireChannel(input.channelId, 'dictionary');
-          await this.#requireRole(context.actorId, input.channelId, 'contributor');
-          const normalizedLabel = dictionaryLabelKey(input.label);
-          const entries = await this.store.listDictionaryEntries(input.channelId);
-          invariant(
-            !entries.some((entry) => entry.normalizedLabel === normalizedLabel),
-            'dictionary.entry-label-conflict',
-            'Dictionary Entry label already exists',
-            409,
-          );
-          const entry: DictionaryEntry = {
-            channelId: input.channelId,
-            createdAt: nowIso(),
-            createdBy: context.actorId,
-            id: newId('dictionary_entry'),
-            label: input.label,
-            normalizedLabel,
-          };
-          return this.#commit(
-            context,
-            'dictionary.entry.create',
-            input.channelId,
-            (operationId, occurredAt) => [
-              { entry, kind: 'dictionary.entry-created' },
-              {
-                activity: this.#activity(
-                  context.actorId,
-                  input.channelId,
-                  'dictionary.entry-created',
-                  operationId,
-                  occurredAt,
-                ),
-                kind: 'activity.appended',
-              },
-            ],
-            { id: entry.id, kind: 'dictionary-entry' },
-          );
-        },
-      }),
-      defineAction({
-        description: 'Rename a Dictionary Entry without changing identity. Contributor role required.',
-        inputSchema: z.object({
-          channelId: z.string().min(1),
-          entryId: z.string().min(1),
-          label: dictionaryLabelSchema,
-        }),
-        name: 'dictionary.entry.rename',
-        run: async (context, input) => {
-          await this.#requireChannel(input.channelId, 'dictionary');
-          await this.#requireRole(context.actorId, input.channelId, 'contributor');
-          const entry = await this.#requireDictionaryEntry(input.channelId, input.entryId);
-          const normalizedLabel = dictionaryLabelKey(input.label);
-          const entries = await this.store.listDictionaryEntries(input.channelId);
-          invariant(
-            !entries.some(
-              (candidate) =>
-                candidate.id !== entry.id && candidate.normalizedLabel === normalizedLabel,
-            ),
-            'dictionary.entry-label-conflict',
-            'Dictionary Entry label already exists',
-            409,
-          );
-          return this.#commit(
-            context,
-            'dictionary.entry.rename',
-            input.channelId,
-            (operationId, occurredAt) => [
-              {
-                entryId: entry.id,
-                kind: 'dictionary.entry-renamed',
-                label: input.label,
-                normalizedLabel,
-                updatedAt: occurredAt,
-              },
-              {
-                activity: this.#activity(
-                  context.actorId,
-                  input.channelId,
-                  'dictionary.entry-renamed',
-                  operationId,
-                  occurredAt,
-                ),
-                kind: 'activity.appended',
-              },
-            ],
-            { id: entry.id, kind: 'dictionary-entry' },
-          );
-        },
-      }),
-      defineAction({
-        description: 'Retire a Dictionary Entry from new selection. Contributor role required.',
-        inputSchema: z.object({
-          channelId: z.string().min(1),
-          entryId: z.string().min(1),
-        }),
-        name: 'dictionary.entry.retire',
-        run: async (context, input) => {
-          await this.#requireChannel(input.channelId, 'dictionary');
-          await this.#requireRole(context.actorId, input.channelId, 'contributor');
-          const entry = await this.#requireDictionaryEntry(input.channelId, input.entryId);
-          invariant(
-            entry.retiredAt === undefined,
-            'dictionary.entry-retired',
-            'Dictionary Entry is already retired',
-            409,
-          );
-          return this.#commit(
-            context,
-            'dictionary.entry.retire',
-            input.channelId,
-            (operationId, occurredAt) => [
-              {
-                actorId: context.actorId,
-                entryId: entry.id,
-                kind: 'dictionary.entry-retired',
-                retiredAt: occurredAt,
-              },
-              {
-                activity: this.#activity(
-                  context.actorId,
-                  input.channelId,
-                  'dictionary.entry-retired',
-                  operationId,
-                  occurredAt,
-                ),
-                kind: 'activity.appended',
-              },
-            ],
-            { id: entry.id, kind: 'dictionary-entry' },
-          );
-        },
-      }),
-      defineAction({
-        description: 'Restore a retired Dictionary Entry. Contributor role required.',
-        inputSchema: z.object({
-          channelId: z.string().min(1),
-          entryId: z.string().min(1),
-        }),
-        name: 'dictionary.entry.restore',
-        run: async (context, input) => {
-          await this.#requireChannel(input.channelId, 'dictionary');
-          await this.#requireRole(context.actorId, input.channelId, 'contributor');
-          const entry = await this.#requireDictionaryEntry(input.channelId, input.entryId);
-          invariant(
-            entry.retiredAt !== undefined,
-            'dictionary.entry-active',
-            'Dictionary Entry is not retired',
-            409,
-          );
-          return this.#commit(
-            context,
-            'dictionary.entry.restore',
-            input.channelId,
-            (operationId, occurredAt) => [
-              {
-                entryId: entry.id,
-                kind: 'dictionary.entry-restored',
-                restoredAt: occurredAt,
-              },
-              {
-                activity: this.#activity(
-                  context.actorId,
-                  input.channelId,
-                  'dictionary.entry-restored',
-                  operationId,
-                  occurredAt,
-                ),
-                kind: 'activity.appended',
-              },
-            ],
-            { id: entry.id, kind: 'dictionary-entry' },
-          );
-        },
-      }),
-      defineAction({
-        description: 'Add a typed Field to a Table Channel. Admin role required.',
-        inputSchema: z.object({
-          cardinality: recordReferenceCardinalitySchema.optional(),
-          channelId: z.string().min(1),
-          defaultValue: optionalJsonValueSchema,
-          key: z.string().regex(/^[a-z][a-z0-9_]*$/),
-          label: z.string().trim().min(1).max(120),
-          required: z.boolean().default(false),
-          targetChannelId: z.string().min(1).optional(),
-          type: tableFieldTypeSchema,
-          unique: z.boolean().default(false),
-        }),
-        name: 'table.field.add',
-        run: async (context, input) => {
-          await this.#requireChannel(input.channelId, 'table');
-          await this.#requireRole(context.actorId, input.channelId, 'admin');
-          const fields = await this.store.listTableFields(input.channelId);
-          invariant(
-            !fields.some((field) => field.key === input.key),
-            'table.field-key-conflict',
-            `Field key already exists: ${input.key}`,
-            409,
-          );
-          const allRecords = await this.store.listTableRecords(input.channelId);
-          const records = allRecords.filter(
-            (record) => record.tombstonedAt === undefined,
-          );
-          const isDictionary = input.type === 'dictionary';
-          const isRecordReference = input.type === 'record-reference';
-          invariant(
-            isRecordReference
-              ? input.targetChannelId !== undefined && input.cardinality !== undefined
-              : input.cardinality === undefined,
-            'table.field-reference-configuration',
-            'Record Reference Field requires one target Channel and cardinality',
-          );
-          invariant(
-            isDictionary
-              ? input.targetChannelId !== undefined
-              : isRecordReference || input.targetChannelId === undefined,
-            'table.field-dictionary-configuration',
-            'Dictionary Field requires one target Dictionary Channel',
-          );
-          if (isRecordReference) {
-            const target = await this.#requireChannel(input.targetChannelId!);
-            invariant(
-              this.channelTypes.require(target.typeId, target.typeVersion).recordKinds.length > 0,
-              'table.record-reference-invalid',
-              'Target Channel Type does not expose Channel Records',
-            );
-            await this.#requireRole(context.actorId, input.targetChannelId!, 'viewer');
-          } else if (isDictionary) {
-            await this.#requireChannel(input.targetChannelId!, 'dictionary');
-            await this.#requireRole(context.actorId, input.targetChannelId!, 'viewer');
-          }
-          if (input.defaultValue !== undefined) {
-            invariant(
-              !(input.required && input.defaultValue === null),
-              'table.record-required-field',
-              `Required Field cannot default to null: ${input.key}`,
-            );
-            if (input.defaultValue !== null) {
-              const candidateField: TableField = {
-                ...(input.cardinality === undefined ? {} : { cardinality: input.cardinality }),
-                channelId: input.channelId,
-                id: 'candidate',
-                key: input.key,
-                label: input.label,
-                required: input.required,
-                ...(input.targetChannelId === undefined
-                  ? {}
-                  : { targetChannelId: input.targetChannelId }),
-                type: input.type,
-                unique: input.unique,
-                version: 1,
-              };
-              this.#validateFieldValue(candidateField, input.defaultValue);
-              await this.#validateRecordReferenceTargets(
-                context.actorId,
-                candidateField,
-                input.defaultValue,
-              );
-              await this.#validateDictionaryEntry(
-                context.actorId,
-                candidateField,
-                input.defaultValue,
-              );
-            }
-          }
-          invariant(
-            !(input.required && input.defaultValue === undefined && records.length > 0),
-            'table.field-required-existing-records',
-            'Required Field needs a default while Records exist',
-            409,
-          );
-          invariant(
-            !(input.unique && input.defaultValue != null && records.length > 1),
-            'table.field-unique-default-conflict',
-            'Unique Field default cannot be applied to multiple Records',
-            409,
-          );
-          const field: TableField = {
-            ...(input.cardinality === undefined ? {} : { cardinality: input.cardinality }),
-            channelId: input.channelId,
-            ...(input.defaultValue === undefined ? {} : { defaultValue: input.defaultValue }),
-            id: newId('field'),
-            key: input.key,
-            label: input.label,
-            required: input.required,
-            ...(input.targetChannelId === undefined
-              ? {}
-              : { targetChannelId: input.targetChannelId }),
-            type: input.type,
-            unique: input.unique,
-            version: 1,
-          };
-          return this.#commit(
-            context,
-            'table.field.add',
-            input.channelId,
-            (operationId, occurredAt) => [
-              { field, kind: 'table.field-added' },
-              ...(input.defaultValue === undefined
-                ? []
-                : allRecords.map((record) => ({
-                    expectedVersions: { [input.key]: 0 },
-                    kind: 'table.record-updated' as const,
-                    recordId: record.id,
-                    updatedAt: occurredAt,
-                    values: { [input.key]: input.defaultValue! },
-                  }))),
-              {
-                activity: this.#activity(
-                  context.actorId,
-                  input.channelId,
-                  'table.schema-changed',
-                  operationId,
-                  occurredAt,
-                ),
-                kind: 'activity.appended',
-              },
-            ],
-            { id: field.id, kind: 'field' },
-          );
-        },
-      }),
-      defineAction({
-        description: 'Tombstone one Table Field while retaining its definition and values.',
-        inputSchema: z.object({
-          channelId: z.string().min(1),
-          fieldId: z.string().min(1),
-          observedVersion: z.number().int().positive(),
-        }),
-        name: 'table.field.tombstone',
-        run: async (context, input) => {
-          await this.#requireChannel(input.channelId, 'table');
-          await this.#requireRole(context.actorId, input.channelId, 'admin');
-          const field = await this.#requireTableField(input.channelId, input.fieldId);
-          invariant(
-            field.tombstonedAt === undefined,
-            'table.field-already-tombstoned',
-            'Table Field is already tombstoned',
-            409,
-          );
-          invariant(
-            field.version === input.observedVersion,
-            'table.field-conflict',
-            'Table Field changed after observation',
-            409,
-          );
-          const occurredAt = nowIso();
-          const next: TableField = {
-            ...field,
-            tombstonedAt: occurredAt,
-            tombstonedBy: context.actorId,
-            version: field.version + 1,
-          };
-          const displayFieldId = await this.store.getTableDisplayFieldId(input.channelId);
-          return this.#commit(
-            context,
-            'table.field.tombstone',
-            input.channelId,
-            (operationId) => [
-              {
-                expectedVersion: field.version,
-                field: next,
-                kind: 'table.field-updated',
-                previousField: field,
-              },
-              ...(displayFieldId === field.id
-                ? [
-                    {
-                      channelId: input.channelId,
-                      kind: 'table.display-field-set' as const,
-                    },
-                  ]
-                : []),
-              {
-                activity: this.#activity(
-                  context.actorId,
-                  input.channelId,
-                  'table.schema-changed',
-                  operationId,
-                  occurredAt,
-                ),
-                kind: 'activity.appended',
-              },
-            ],
-            { id: field.id, kind: 'field' },
-          );
-        },
-      }),
-      defineAction({
-        description: 'Restore one tombstoned Table Field and its retained values.',
-        inputSchema: z.object({
-          channelId: z.string().min(1),
-          fieldId: z.string().min(1),
-          observedVersion: z.number().int().positive(),
-        }),
-        name: 'table.field.restore',
-        run: async (context, input) => {
-          await this.#requireChannel(input.channelId, 'table');
-          await this.#requireRole(context.actorId, input.channelId, 'admin');
-          const field = await this.#requireTableField(input.channelId, input.fieldId);
-          invariant(
-            field.tombstonedAt !== undefined,
-            'table.field-not-tombstoned',
-            'Table Field is not tombstoned',
-            409,
-          );
-          invariant(
-            field.version === input.observedVersion,
-            'table.field-conflict',
-            'Table Field changed after observation',
-            409,
-          );
-          const { tombstonedAt: _at, tombstonedBy: _by, ...active } = field;
-          const next: TableField = { ...active, version: field.version + 1 };
-          const fields = (await this.store.listTableFields(input.channelId)).map((candidate) =>
-            candidate.id === field.id ? next : candidate,
-          );
-          const records = await this.store.listTableRecords(input.channelId);
-          for (const record of records.filter(
-            (candidate) => candidate.tombstonedAt === undefined,
-          )) {
-            await this.#validatedRecordValues(
-              context.actorId,
-              fields,
-              records,
-              record.values,
-              record.id,
-              true,
-              new Set(),
-            );
-          }
-          const occurredAt = nowIso();
-          return this.#commit(
-            context,
-            'table.field.restore',
-            input.channelId,
-            (operationId) => [
-              {
-                expectedVersion: field.version,
-                field: next,
-                kind: 'table.field-updated',
-                previousField: field,
-              },
-              {
-                activity: this.#activity(
-                  context.actorId,
-                  input.channelId,
-                  'table.schema-changed',
-                  operationId,
-                  occurredAt,
-                ),
-                kind: 'activity.appended',
-              },
-            ],
-            { id: field.id, kind: 'field' },
-          );
-        },
-      }),
-      defineAction({
-        description: 'Permanently purge one tombstoned Table Field and its retained values.',
-        inputSchema: z.object({
-          channelId: z.string().min(1),
-          fieldId: z.string().min(1),
-          observedVersion: z.number().int().positive(),
-        }),
-        name: 'table.field.purge',
-        run: async (context, input) => {
-          await this.#requireChannel(input.channelId, 'table');
-          await this.#requireRole(context.actorId, input.channelId, 'admin');
-          const field = await this.#requireTableField(input.channelId, input.fieldId);
-          invariant(
-            field.tombstonedAt !== undefined,
-            'table.field-not-tombstoned',
-            'Table Field must be tombstoned before purge',
-            409,
-          );
-          invariant(
-            field.version === input.observedVersion,
-            'table.field-conflict',
-            'Table Field changed after observation',
-            409,
-          );
-          const occurredAt = nowIso();
-          return this.#commit(context, 'table.field.purge', input.channelId, (operationId) => [
-            {
-              channelId: input.channelId,
-              expectedVersion: field.version,
-              fieldId: field.id,
-              fieldKey: field.key,
-              kind: 'table.field-purged',
-            },
-            {
-              activity: this.#activity(
-                context.actorId,
-                input.channelId,
-                'table.schema-changed',
-                operationId,
-                occurredAt,
-              ),
-              kind: 'activity.appended',
-            },
-          ]);
-        },
-      }),
-      defineAction({
-        description: 'Convert a Table Field only after resolving every incompatible value.',
-        inputSchema: z.object({
-          cardinality: recordReferenceCardinalitySchema.optional(),
-          cancel: z.boolean().default(false),
-          channelId: z.string().min(1),
-          defaultResolution: fieldDefaultConversionResolutionSchema.optional(),
-          fieldId: z.string().min(1),
-          observedVersion: z.number().int().positive(),
-          resolutions: z.array(fieldConversionResolutionSchema).default([]),
-          targetChannelId: z.string().min(1).optional(),
-          targetType: tableFieldTypeSchema,
-        }),
-        name: 'table.field.convert',
-        run: async (context, input) => {
-          await this.#requireChannel(input.channelId, 'table');
-          await this.#requireRole(context.actorId, input.channelId, 'admin');
-          const field = await this.#requireTableField(input.channelId, input.fieldId);
-          invariant(
-            field.tombstonedAt === undefined,
-            'table.field-tombstoned',
-            'Table Field is tombstoned',
-            409,
-          );
-          invariant(
-            field.version === input.observedVersion,
-            'table.field-conflict',
-            'Table Field changed after observation',
-            409,
-          );
-          invariant(
-            field.type !== input.targetType,
-            'table.field-type-unchanged',
-            'Target Field type must differ',
-            409,
-          );
-          const isDictionary = input.targetType === 'dictionary';
-          const isRecordReference = input.targetType === 'record-reference';
-          invariant(
-            isRecordReference
-              ? input.targetChannelId !== undefined && input.cardinality !== undefined
-              : input.cardinality === undefined,
-            'table.field-reference-configuration',
-            'Record Reference Field requires one target Channel and cardinality',
-          );
-          invariant(
-            isDictionary
-              ? input.targetChannelId !== undefined
-              : isRecordReference || input.targetChannelId === undefined,
-            'table.field-dictionary-configuration',
-            'Dictionary Field requires one target Dictionary Channel',
-          );
-          if (isRecordReference) {
-            const target = await this.#requireChannel(input.targetChannelId!);
-            invariant(
-              this.channelTypes.require(target.typeId, target.typeVersion).recordKinds.length > 0,
-              'table.record-reference-invalid',
-              'Target Channel Type does not expose Channel Records',
-            );
-            await this.#requireRole(context.actorId, input.targetChannelId!, 'viewer');
-          } else if (isDictionary) {
-            await this.#requireChannel(input.targetChannelId!, 'dictionary');
-            await this.#requireRole(context.actorId, input.targetChannelId!, 'viewer');
-          }
-          const {
-            cardinality: _previousCardinality,
-            targetChannelId: _previousTargetChannelId,
-            ...fieldWithoutReference
-          } = field;
-          const convertedField: TableField = {
-            ...fieldWithoutReference,
-            ...(input.cardinality === undefined ? {} : { cardinality: input.cardinality }),
-            ...(input.targetChannelId === undefined
-              ? {}
-              : { targetChannelId: input.targetChannelId }),
-            type: input.targetType,
-          };
-          const occurredAt = nowIso();
-          if (input.cancel) {
-            invariant(
-              input.resolutions.length === 0 && input.defaultResolution === undefined,
-              'table.field-conversion-cancelled',
-              'Cancelled conversion cannot include resolutions',
-            );
-            return this.#commit(context, 'table.field.convert', input.channelId, () => [], {
-              id: field.id,
-              kind: 'field',
-            });
-          }
-          const records = await this.store.listTableRecords(input.channelId);
-          const failures = (
-            await Promise.all(
-              records.map(async (record) => {
-                const value = record.values[field.key];
-                return value !== undefined &&
-                  value !== null &&
-                  !(await this.#fieldAccepts(context.actorId, convertedField, value))
-                  ? record
-                  : null;
-              }),
-            )
-          ).filter((record): record is TableRecord => record !== null);
-          const defaultFails =
-            field.defaultValue !== undefined &&
-            field.defaultValue !== null &&
-            !(await this.#fieldAccepts(context.actorId, convertedField, field.defaultValue));
-          invariant(
-            defaultFails === (input.defaultResolution !== undefined),
-            'table.field-conversion-default-unresolved',
-            defaultFails
-              ? 'Incompatible default value needs one explicit resolution'
-              : 'Default resolution does not match an incompatible default',
-            409,
-          );
-          let nextDefault = field.defaultValue;
-          if (input.defaultResolution !== undefined) {
-            if (input.defaultResolution.kind === 'null') {
-              invariant(
-                !field.required,
-                'table.field-conversion-null-required',
-                'Required Field cannot be explicitly nulled',
-              );
-              invariant(
-                input.defaultResolution.value === undefined,
-                'table.field-conversion-resolution-invalid',
-                'Null resolution cannot include a value',
-              );
-              nextDefault = null;
-            } else {
-              invariant(
-                input.defaultResolution.value !== undefined &&
-                  input.defaultResolution.value !== null,
-                'table.field-conversion-resolution-required',
-                'Correction or mapping needs a replacement value',
-              );
-              const value = this.#validateFieldValue(
-                convertedField,
-                input.defaultResolution.value,
-              );
-              invariant(
-                await this.#fieldAccepts(context.actorId, convertedField, value),
-                'table.field-conversion-resolution-invalid',
-                'Replacement value is incompatible with target Field',
-              );
-              nextDefault = value;
-            }
-          }
-          const resolutions = new Map(
-            input.resolutions.map((resolution) => [resolution.recordId, resolution]),
-          );
-          invariant(
-            resolutions.size === input.resolutions.length,
-            'table.field-conversion-resolution-duplicate',
-            'Each Record may have one conversion resolution',
-          );
-          invariant(
-            failures.every((record) => resolutions.has(record.id)) &&
-              resolutions.size === failures.length,
-            'table.field-conversion-unresolved',
-            'Every incompatible value needs one explicit resolution',
-            409,
-          );
-          const updates = await Promise.all(failures.map(async (record) => {
-            const resolution = resolutions.get(record.id)!;
-            let value: JsonValue;
-            if (resolution.kind === 'null') {
-              invariant(
-                !field.required,
-                'table.field-conversion-null-required',
-                'Required Field cannot be explicitly nulled',
-              );
-              invariant(
-                resolution.value === undefined,
-                'table.field-conversion-resolution-invalid',
-                'Null resolution cannot include a value',
-              );
-              value = null;
-            } else {
-              invariant(
-                resolution.value !== undefined && resolution.value !== null,
-                'table.field-conversion-resolution-required',
-                'Correction or mapping needs a replacement value',
-              );
-              value = this.#validateFieldValue(
-                convertedField,
-                resolution.value,
-              );
-              invariant(
-                await this.#fieldAccepts(context.actorId, convertedField, value),
-                'table.field-conversion-resolution-invalid',
-                'Replacement value is incompatible with target Field',
-              );
-            }
-            return { record, value };
-          }));
-          const next: TableField = {
-            ...convertedField,
-            ...(nextDefault === undefined ? {} : { defaultValue: nextDefault }),
-            version: field.version + 1,
-          };
-          const nextFields = (await this.store.listTableFields(input.channelId)).map((candidate) =>
-            candidate.id === field.id ? next : candidate,
-          );
-          const nextRecords = records.map((record) => {
-            const update = updates.find((candidate) => candidate.record.id === record.id);
-            return update
-              ? {
-                  ...record,
-                  values: { ...record.values, [field.key]: update.value },
-                }
-              : record;
-          });
-          for (const record of nextRecords.filter(
-            (candidate) => candidate.tombstonedAt === undefined,
-          )) {
-            await this.#validatedRecordValues(
-              context.actorId,
-              nextFields,
-              nextRecords,
-              record.values,
-              record.id,
-              true,
-              new Set([field.key]),
-            );
-          }
-          return this.#commit(
-            context,
-            'table.field.convert',
-            input.channelId,
-            (operationId) => [
-              {
-                expectedVersion: field.version,
-                field: next,
-                kind: 'table.field-updated',
-                previousField: field,
-              },
-              ...updates.map(({ record, value }) => ({
-                expectedVersions: {
-                  [field.key]: record.fieldVersions[field.key] ?? 0,
-                },
-                kind: 'table.record-updated' as const,
-                previousValues: [
-                  {
-                    existed: true,
-                    key: field.key,
-                    value: record.values[field.key]!,
-                  },
-                ],
-                recordId: record.id,
-                updatedAt: occurredAt,
-                values: { [field.key]: value },
-              })),
-              {
-                activity: this.#activity(
-                  context.actorId,
-                  input.channelId,
-                  'table.schema-changed',
-                  operationId,
-                  occurredAt,
-                ),
-                kind: 'activity.appended',
-              },
-            ],
-            { id: field.id, kind: 'field' },
-          );
-        },
-      }),
-      defineAction({
-        description: 'Create a validated Record in a Table Channel. Contributor role required.',
-        inputSchema: z.object({
-          channelId: z.string().min(1),
-          values: z.record(z.string(), jsonValueSchema),
-        }),
-        name: 'table.record.create',
-        run: async (context, input) => {
-          await this.#requireChannel(input.channelId, 'table');
-          await this.#requireRole(context.actorId, input.channelId, 'contributor');
-          const fields = await this.store.listTableFields(input.channelId);
-          const records = await this.store.listTableRecords(input.channelId);
-          const values = await this.#validatedRecordValues(
-            context.actorId,
-            fields,
-            records,
-            input.values,
-          );
-          const occurredAt = nowIso();
-          const recordId = newId('record');
-          return this.#commit(
-            context,
-            'table.record.create',
-            input.channelId,
-            (operationId) => [
-              {
-                kind: 'table.record-created',
-                record: {
-                  channelId: input.channelId,
-                  createdAt: occurredAt,
-                  createdBy: context.actorId,
-                  fieldVersions: Object.fromEntries(Object.keys(values).map((key) => [key, 1])),
-                  id: recordId,
-                  values,
-                },
-              },
-              {
-                activity: this.#activity(
-                  context.actorId,
-                  input.channelId,
-                  'table.record-created',
-                  operationId,
-                  occurredAt,
-                ),
-                kind: 'activity.appended',
-              },
-            ],
-            { id: recordId, kind: 'record' },
-          );
-        },
-      }),
-      defineAction({
-        description: 'Select a Text or Dictionary Field as the Table Display Field. Admin role required.',
-        inputSchema: z.object({
-          channelId: z.string().min(1),
-          fieldId: z.string().min(1).nullable(),
-        }),
-        name: 'table.display-field.set',
-        run: async (context, input) => {
-          await this.#requireChannel(input.channelId, 'table');
-          await this.#requireRole(context.actorId, input.channelId, 'admin');
-          if (input.fieldId !== null) {
-            const fields = await this.store.listTableFields(input.channelId);
-            const field = fields.find((candidate) => candidate.id === input.fieldId);
-            invariant(field, 'table.field-not-found', 'Display Field does not exist', 404);
-            invariant(
-              field.tombstonedAt === undefined,
-              'table.field-tombstoned',
-              'Display Field is tombstoned',
-              409,
-            );
-            invariant(
-              field.type === 'text' || field.type === 'dictionary',
-              'table.display-field-type',
-              'Display Field must be Text or Dictionary',
-            );
-          }
-          return this.#commit(
-            context,
-            'table.display-field.set',
-            input.channelId,
-            (operationId, occurredAt) => [
-              {
-                channelId: input.channelId,
-                ...(input.fieldId === null ? {} : { displayFieldId: input.fieldId }),
-                kind: 'table.display-field-set',
-              },
-              {
-                activity: this.#activity(
-                  context.actorId,
-                  input.channelId,
-                  'table.display-field-changed',
-                  operationId,
-                  occurredAt,
-                ),
-                kind: 'activity.appended',
-              },
-            ],
-          );
-        },
-      }),
-      defineAction({
-        description: 'Edit any active Table Record. Contributor role required.',
-        inputSchema: z.object({
-          channelId: z.string().min(1),
-          observedVersions: z.record(z.string(), z.number().int().nonnegative()),
-          recordId: z.string().min(1),
-          values: z.record(z.string(), jsonValueSchema),
-        }),
-        name: 'table.record.edit',
-        run: async (context, input) => {
-          await this.#requireChannel(input.channelId, 'table');
-          await this.#requireRole(context.actorId, input.channelId, 'contributor');
-          const record = await this.#requireTableRecord(input.channelId, input.recordId);
-          invariant(
-            record.tombstonedAt === undefined,
-            'table.record-tombstoned',
-            'Table Record is tombstoned',
-            409,
-          );
-          const changedKeys = Object.keys(input.values);
-          invariant(
-            changedKeys.length > 0,
-            'table.record-empty-edit',
-            'Table Record edit needs at least one Field',
-          );
-          invariant(
-            changedKeys.every((key) => input.observedVersions[key] !== undefined),
-            'table.record-observed-version-required',
-            'Observed version is required for every edited Field',
-          );
-          for (const key of changedKeys) {
-            invariant(
-              (record.fieldVersions[key] ?? 0) === input.observedVersions[key],
-              'table.record-edit-conflict',
-              `Table Field value changed after observation: ${key}`,
-              409,
-            );
-          }
-          const fields = await this.store.listTableFields(input.channelId);
-          const records = await this.store.listTableRecords(input.channelId);
-          const values = await this.#validatedRecordValues(
-            context.actorId,
-            fields,
-            records,
-            { ...record.values, ...input.values },
-            record.id,
-            true,
-            new Set(Object.keys(input.values)),
-          );
-          const updatedAt = nowIso();
-          return this.#commit(
-            context,
-            'table.record.edit',
-            input.channelId,
-            (operationId) => [
-              {
-                expectedVersions: Object.fromEntries(
-                  changedKeys.map((key) => [key, input.observedVersions[key]!]),
-                ),
-                kind: 'table.record-updated',
-                previousValues: changedKeys.map((key) => ({
-                  existed: Object.hasOwn(record.values, key),
-                  key,
-                  ...(Object.hasOwn(record.values, key) ? { value: record.values[key] } : {}),
-                })),
-                recordId: record.id,
-                updatedAt,
-                values: Object.fromEntries(changedKeys.map((key) => [key, values[key]!])),
-              },
-              {
-                activity: this.#activity(
-                  context.actorId,
-                  input.channelId,
-                  'table.record-edited',
-                  operationId,
-                  updatedAt,
-                ),
-                kind: 'activity.appended',
-              },
-            ],
-            { id: record.id, kind: 'record' },
-          );
-        },
-      }),
-      defineAction({
-        description: 'Tombstone any active Table Record. Contributor role required.',
-        inputSchema: z.object({
-          channelId: z.string().min(1),
-          recordId: z.string().min(1),
-        }),
-        name: 'table.record.tombstone',
-        run: async (context, input) => {
-          await this.#requireChannel(input.channelId, 'table');
-          await this.#requireRole(context.actorId, input.channelId, 'contributor');
-          const record = await this.#requireTableRecord(input.channelId, input.recordId);
-          invariant(
-            record.tombstonedAt === undefined,
-            'table.record-already-tombstoned',
-            'Table Record is already tombstoned',
-            409,
-          );
-          const tombstonedAt = nowIso();
-          return this.#commit(
-            context,
-            'table.record.tombstone',
-            input.channelId,
-            (operationId) => [
-              {
-                actorId: context.actorId,
-                expectedUpdatedAt: record.updatedAt ?? null,
-                kind: 'table.record-tombstoned',
-                recordId: record.id,
-                tombstonedAt,
-              },
-              {
-                activity: this.#activity(
-                  context.actorId,
-                  input.channelId,
-                  'table.record-tombstoned',
-                  operationId,
-                  tombstonedAt,
-                ),
-                kind: 'activity.appended',
-              },
-            ],
-            { id: record.id, kind: 'record' },
-          );
-        },
-      }),
-      defineAction({
-        description: 'Restore a tombstoned Table Record. Contributor role required.',
-        inputSchema: z.object({
-          channelId: z.string().min(1),
-          recordId: z.string().min(1),
-        }),
-        name: 'table.record.restore',
-        run: async (context, input) => {
-          await this.#requireChannel(input.channelId, 'table');
-          await this.#requireRole(context.actorId, input.channelId, 'contributor');
-          const record = await this.#requireTableRecord(input.channelId, input.recordId);
-          invariant(
-            record.tombstonedAt !== undefined,
-            'table.record-not-tombstoned',
-            'Table Record is not tombstoned',
-            409,
-          );
-          const fields = await this.store.listTableFields(input.channelId);
-          const records = await this.store.listTableRecords(input.channelId);
-          const values = await this.#validatedRecordValues(
-            context.actorId,
-            fields,
-            records,
-            record.values,
-            record.id,
-            false,
-          );
-          const restoredAt = nowIso();
-          return this.#commit(
-            context,
-            'table.record.restore',
-            input.channelId,
-            (operationId) => [
-              {
-                expectedTombstonedAt: record.tombstonedAt!,
-                kind: 'table.record-restored',
-                recordId: record.id,
-                restoredAt,
-              },
-              {
-                activity: this.#activity(
-                  context.actorId,
-                  input.channelId,
-                  'table.record-restored',
-                  operationId,
-                  restoredAt,
-                ),
-                kind: 'activity.appended',
-              },
-            ],
-            { id: record.id, kind: 'record' },
-          );
-        },
-      }),
-      defineAction({
-        description: 'Create a personal or shared semantic Table View.',
-        inputSchema: z.object({
-          channelId: z.string().min(1),
-          filters: z.array(tableViewFilterSchema).default([]),
-          grouping: z.array(z.string().min(1)).default([]),
-          name: z.string().trim().min(1).max(120),
-          sorting: z.array(tableViewSortSchema).default([]),
-          visibility: z.enum(['personal', 'shared']),
-          visibleFieldIds: z.array(z.string().min(1)),
-        }),
-        name: 'table.view.create',
-        run: async (context, input) => {
-          await this.#requireChannel(input.channelId, 'table');
-          await this.#requireRole(
-            context.actorId,
-            input.channelId,
-            input.visibility === 'shared' ? 'admin' : 'viewer',
-          );
-          const fields = await this.store.listTableFields(input.channelId);
-          const knownIds = new Set(fields.map((field) => field.id));
-          const referencedIds = [
-            ...input.visibleFieldIds,
-            ...input.filters.map((filter) => filter.fieldId),
-            ...input.sorting.map((sort) => sort.fieldId),
-            ...input.grouping,
-          ];
-          invariant(
-            referencedIds.every((fieldId) => knownIds.has(fieldId)),
-            'table.view-unknown-field',
-            'Table View references an unknown Field',
-          );
-          invariant(
-            new Set(input.visibleFieldIds).size === input.visibleFieldIds.length,
-            'table.view-duplicate-field',
-            'Visible Fields must be unique',
-          );
-          const view: TableView = {
-            channelId: input.channelId,
-            createdAt: nowIso(),
-            filters: input.filters.map((filter) => ({
-              fieldId: filter.fieldId,
-              operator: filter.operator,
-              ...(filter.value === undefined ? {} : { value: filter.value }),
-            })),
-            grouping: input.grouping,
-            id: newId('view'),
-            name: input.name,
-            ownerId: context.actorId,
-            sorting: input.sorting,
-            visibility: input.visibility,
-            visibleFieldIds: input.visibleFieldIds,
-          };
-          return this.#commit(
-            context,
-            'table.view.create',
-            input.channelId,
-            (operationId, occurredAt) => [
-              { kind: 'table.view-saved', view },
-              {
-                activity: this.#activity(
-                  context.actorId,
-                  input.channelId,
-                  input.visibility === 'shared'
-                    ? 'table.shared-view-created'
-                    : 'table.personal-view-created',
-                  operationId,
-                  occurredAt,
-                ),
-                kind: 'activity.appended',
-              },
-            ],
-          );
-        },
-      }),
-      defineAction({
-        description: 'Create a live Chart Channel from a compatible Result Handle.',
-        inputSchema: z.object({
-          handleId: z.string().min(1),
-          presentation: chartPresentationSchema,
-          title: z.string().trim().min(1).max(160),
-          typeVersion: z.string().regex(/^\d+\.\d+\.\d+$/).optional(),
-        }),
-        name: 'chart.create',
-        run: async (context, input) => {
-          const durable = await this.handles.consumeDefinition(
-            this.handles.serviceId,
-            context.actorId,
-            input.handleId,
-            'chart.create',
-          );
-          const channelId = newId('channel');
-          const definition = await this.#chartDefinitionFromResult(
-            context.actorId,
-            channelId,
-            durable,
-            {
-              ...(input.presentation.categoryField === undefined
-                ? {}
-                : { categoryField: input.presentation.categoryField }),
-              series: input.presentation.series,
-              type: input.presentation.type,
-            },
-            1,
-          );
-          const type = input.typeVersion
-            ? this.channelTypes.require('chart', input.typeVersion)
-            : this.channelTypes.requireCurrent('chart');
-          const occurredAt = nowIso();
-          const channel: Channel = {
-            createdAt: occurredAt,
-            id: channelId,
-            ownerId: context.actorId,
-            title: input.title,
-            typeId: type.id,
-            typeVersion: type.version,
-            updatedAt: occurredAt,
-          };
-          return this.#commit(
-            context,
-            'chart.create',
-            channelId,
-            (operationId) => [
-              { channel, kind: 'channel.created' },
-              {
-                kind: 'membership.granted',
-                membership: {
-                  channelId,
-                  personId: context.actorId,
-                  role: 'owner',
-                },
-              },
-              { definition, kind: 'chart.definition-set' },
-              {
-                activity: this.#activity(
-                  context.actorId,
-                  channelId,
-                  'channel.created',
-                  operationId,
-                  occurredAt,
-                ),
-                kind: 'activity.appended',
-              },
-            ],
-            { id: channelId, kind: 'channel' },
-          );
-        },
-      }),
-      defineAction({
-        description: 'Replace a Chart live query and presentation definition.',
-        inputSchema: z.object({
-          aggregations: z.array(chartAggregationSchema).min(1),
-          channelId: z.string().min(1),
-          filters: z.array(chartFilterSchema).default([]),
-          grouping: z.array(z.string().min(1)).default([]),
-          observedVersion: z.number().int().positive(),
-          presentation: chartPresentationSchema,
-          sourceChannelId: z.string().min(1),
-        }),
-        name: 'chart.definition.update',
-        run: async (context, input) => {
-          await this.#requireChannel(input.channelId, 'chart');
-          await this.#requireRole(context.actorId, input.channelId, 'admin');
-          const current = await this.#requireChartDefinition(input.channelId);
-          invariant(
-            current.version === input.observedVersion,
-            'chart.definition-conflict',
-            'Chart definition changed after observation',
-            409,
-          );
-          const definition: ChartDefinition = {
-            aggregations: input.aggregations.map((aggregation) => ({
-              as: aggregation.as,
-              ...(aggregation.field === undefined ? {} : { field: aggregation.field }),
-              operator: aggregation.operator,
-            })),
-            channelId: input.channelId,
-            filters: input.filters.map((filter) => ({
-              field: filter.field,
-              operator: filter.operator,
-              ...(filter.value === undefined ? {} : { value: filter.value }),
-            })),
-            grouping: input.grouping,
-            presentation: {
-              ...(input.presentation.categoryField === undefined
-                ? {}
-                : { categoryField: input.presentation.categoryField }),
-              series: input.presentation.series,
-              type: input.presentation.type,
-            },
-            sourceChannelId: input.sourceChannelId,
-            version: current.version + 1,
-          };
-          await this.#validateChartDefinition(context.actorId, definition);
-          const occurredAt = nowIso();
-          return this.#commit(
-            context,
-            'chart.definition.update',
-            input.channelId,
-            (operationId) => [
-              {
-                definition,
-                expectedVersion: current.version,
-                kind: 'chart.definition-set',
-              },
-              {
-                activity: this.#activity(
-                  context.actorId,
-                  input.channelId,
-                  'chart.definition-changed',
-                  operationId,
-                  occurredAt,
-                ),
-                kind: 'activity.appended',
-              },
-            ],
-            { id: input.channelId, kind: 'channel' },
-          );
-        },
-      }),
-      defineAction({
-        description: 'Record an explicit meaningful Chart event.',
-        inputSchema: z.object({
-          channelId: z.string().min(1),
-          kind: z.enum(['insight', 'report', 'threshold']),
-        }),
-        name: 'chart.event.record',
-        run: async (context, input) => {
-          await this.#requireChannel(input.channelId, 'chart');
-          await this.#requireRole(context.actorId, input.channelId, 'contributor');
-          const occurredAt = nowIso();
-          const activityKind = {
-            insight: 'chart.insight-produced',
-            report: 'chart.report-produced',
-            threshold: 'chart.threshold-crossed',
-          }[input.kind]!;
-          return this.#commit(
-            context,
-            'chart.event.record',
-            input.channelId,
-            (operationId) => [
-              {
-                activity: this.#activity(
-                  context.actorId,
-                  input.channelId,
-                  activityKind,
-                  operationId,
-                  occurredAt,
-                ),
-                kind: 'activity.appended',
-              },
-            ],
-            { id: input.channelId, kind: 'channel' },
-          );
-        },
-      }),
-      defineAction({
-        description: 'Post a Message in any Channel Discussion. Contributor role required.',
-        inputSchema: z.object({
-          channelId: z.string().min(1),
-          recordReferences: z.array(z.string().min(1)).default([]),
-          replyToMessageId: z.string().min(1).optional(),
-          text: z.string().trim().min(1).max(20_000),
-        }),
-        name: 'discussion.message.post',
-        run: async (context, input) => {
-          await this.#requireChannel(input.channelId);
-          await this.#requireRole(context.actorId, input.channelId, 'contributor');
-          if (input.replyToMessageId !== undefined) {
-            await this.#requireMessage(input.channelId, input.replyToMessageId);
-          }
-          const messageId = newId('message');
-          const revisionId = newId('revision');
-          const occurredAt = nowIso();
-          return this.#commit(
-            context,
-            'discussion.message.post',
-            input.channelId,
-            (operationId) => [
-              {
-                kind: 'discussion.message-posted',
-                message: {
-                  authorId: context.actorId,
-                  channelId: input.channelId,
-                  createdAt: occurredAt,
-                  id: messageId,
-                  recordReferences: input.recordReferences,
-                  ...(input.replyToMessageId === undefined
-                    ? {}
-                    : { replyToMessageId: input.replyToMessageId }),
-                  revisions: [
-                    {
-                      createdAt: occurredAt,
-                      editorId: context.actorId,
-                      id: revisionId,
-                      text: input.text,
-                    },
-                  ],
-                  text: input.text,
-                },
-              },
-              {
-                activity: this.#activity(
-                  context.actorId,
-                  input.channelId,
-                  'discussion.message-posted',
-                  operationId,
-                  occurredAt,
-                ),
-                kind: 'activity.appended',
-              },
-            ],
-            { id: messageId, kind: 'message' },
-          );
-        },
-      }),
-      defineAction({
-        description: 'Edit an active Message while preserving its revision history. Author only.',
-        inputSchema: z.object({
-          channelId: z.string().min(1),
-          messageId: z.string().min(1),
-          text: z.string().trim().min(1).max(20_000),
-        }),
-        name: 'discussion.message.edit',
-        run: async (context, input) => {
-          await this.#requireChannel(input.channelId);
-          const message = await this.#requireMessage(input.channelId, input.messageId);
-          await this.#requireRole(context.actorId, input.channelId, 'contributor');
-          invariant(
-            message.authorId === context.actorId,
-            'permission.denied',
-            'Only the Message author can edit it',
-            403,
-          );
-          invariant(
-            message.tombstonedAt === undefined,
-            'discussion.message-tombstoned',
-            'Tombstoned Message cannot be edited',
-            409,
-          );
-          const occurredAt = nowIso();
-          return this.#commit(
-            context,
-            'discussion.message.edit',
-            input.channelId,
-            (operationId) => [
-              {
-                kind: 'discussion.message-edited',
-                messageId: input.messageId,
-                revision: {
-                  createdAt: occurredAt,
-                  editorId: context.actorId,
-                  id: newId('revision'),
-                  text: input.text,
-                },
-              },
-              {
-                activity: this.#activity(
-                  context.actorId,
-                  input.channelId,
-                  'discussion.message-edited',
-                  operationId,
-                  occurredAt,
-                ),
-                kind: 'activity.appended',
-              },
-            ],
-            { id: input.messageId, kind: 'message' },
-          );
-        },
-      }),
-      defineAction({
-        description: 'Tombstone a Message. Authors may act on their own; Admins may moderate any.',
-        inputSchema: z.object({
-          channelId: z.string().min(1),
-          messageId: z.string().min(1),
-        }),
-        name: 'discussion.message.tombstone',
-        run: async (context, input) => {
-          await this.#requireChannel(input.channelId);
-          const message = await this.#requireMessage(input.channelId, input.messageId);
-          await this.#requireMessageAuthorOrAdmin(context.actorId, message);
-          invariant(
-            message.tombstonedAt === undefined,
-            'discussion.message-already-tombstoned',
-            'Message is already tombstoned',
-            409,
-          );
-          const occurredAt = nowIso();
-          return this.#commit(
-            context,
-            'discussion.message.tombstone',
-            input.channelId,
-            (operationId) => [
-              {
-                actorId: context.actorId,
-                kind: 'discussion.message-tombstoned',
-                messageId: input.messageId,
-                tombstonedAt: occurredAt,
-              },
-              {
-                activity: this.#activity(
-                  context.actorId,
-                  input.channelId,
-                  'discussion.message-tombstoned',
-                  operationId,
-                  occurredAt,
-                ),
-                kind: 'activity.appended',
-              },
-            ],
-            { id: input.messageId, kind: 'message' },
-          );
-        },
-      }),
-      defineAction({
-        description: 'Restore a Message. Authors may act on their own; Admins may moderate any.',
-        inputSchema: z.object({
-          channelId: z.string().min(1),
-          messageId: z.string().min(1),
-        }),
-        name: 'discussion.message.restore',
-        run: async (context, input) => {
-          await this.#requireChannel(input.channelId);
-          const message = await this.#requireMessage(input.channelId, input.messageId);
-          await this.#requireMessageAuthorOrAdmin(context.actorId, message);
-          invariant(
-            message.tombstonedAt !== undefined,
-            'discussion.message-not-tombstoned',
-            'Message is not tombstoned',
-            409,
-          );
-          const occurredAt = nowIso();
-          return this.#commit(
-            context,
-            'discussion.message.restore',
-            input.channelId,
-            (operationId) => [
-              {
-                kind: 'discussion.message-restored',
-                messageId: input.messageId,
-                restoredBy: context.actorId,
-              },
-              {
-                activity: this.#activity(
-                  context.actorId,
-                  input.channelId,
-                  'discussion.message-restored',
-                  operationId,
-                  occurredAt,
-                ),
-                kind: 'activity.appended',
-              },
-            ],
-            { id: input.messageId, kind: 'message' },
-          );
-        },
-      }),
+
     ];
   }
 
@@ -3861,437 +2435,7 @@ export class DatagramApplication {
           };
         },
       }),
-      defineQuery({
-        description: 'List selectable or all Entries in a Dictionary Channel.',
-        inputSchema: z.object({
-          channelId: z.string().min(1),
-          includeRetired: z.boolean().default(false),
-        }),
-        name: 'dictionary.entries.list',
-        run: async (context, input): Promise<QueryResult> => {
-          await this.#requireChannel(input.channelId, 'dictionary');
-          await this.#requireRole(context.actorId, input.channelId, 'viewer');
-          const entries = (await this.store.listDictionaryEntries(input.channelId)).filter(
-            (entry) => input.includeRetired || entry.retiredAt === undefined,
-          );
-          return {
-            data: entries.map((entry) => ({
-              id: entry.id,
-              label: entry.label,
-              ...(entry.retiredAt === undefined ? {} : { retiredAt: entry.retiredAt }),
-            })),
-            view: pendingChannelTypeView(),
-          };
-        },
-      }),
-      defineQuery({
-        description: 'Describe the active Fields in a Table Channel.',
-        inputSchema: z.object({
-          channelId: z.string().min(1),
-          includeTombstoned: z.boolean().default(false),
-        }),
-        name: 'table.describe',
-        run: async (context, input): Promise<QueryResult> => {
-          const channel = await this.#requireChannel(input.channelId, 'table');
-          await this.#requireRole(context.actorId, input.channelId, 'viewer');
-          const fields = await this.store.listTableFields(input.channelId);
-          return {
-            data: fields
-              .filter((field) => input.includeTombstoned || field.tombstonedAt === undefined)
-              .map((field) => ({
-                ...(field.cardinality === undefined ? {} : { cardinality: field.cardinality }),
-                id: field.id,
-                key: field.key,
-                label: field.label,
-                required: field.required,
-                ...(field.targetChannelId === undefined
-                  ? {}
-                  : { targetChannelId: field.targetChannelId }),
-                ...(field.tombstonedAt === undefined ? {} : { tombstonedAt: field.tombstonedAt }),
-                type: field.type,
-                unique: field.unique,
-                version: field.version,
-              })),
-            view: pendingChannelTypeView(),
-          };
-        },
-      }),
-      defineQuery({
-        description: 'Preview every value incompatible with a proposed Table Field type.',
-        inputSchema: z.object({
-          cardinality: recordReferenceCardinalitySchema.optional(),
-          channelId: z.string().min(1),
-          fieldId: z.string().min(1),
-          targetChannelId: z.string().min(1).optional(),
-          targetType: tableFieldTypeSchema,
-        }),
-        name: 'table.field.conversion.preview',
-        run: async (context, input): Promise<QueryResult> => {
-          await this.#requireChannel(input.channelId, 'table');
-          await this.#requireRole(context.actorId, input.channelId, 'admin');
-          const field = await this.#requireTableField(input.channelId, input.fieldId);
-          invariant(
-            field.tombstonedAt === undefined,
-            'table.field-tombstoned',
-            'Table Field is tombstoned',
-            409,
-          );
-          const isDictionary = input.targetType === 'dictionary';
-          const isRecordReference = input.targetType === 'record-reference';
-          invariant(
-            isRecordReference
-              ? input.targetChannelId !== undefined && input.cardinality !== undefined
-              : input.cardinality === undefined,
-            'table.field-reference-configuration',
-            'Record Reference Field requires one target Channel and cardinality',
-          );
-          invariant(
-            isDictionary
-              ? input.targetChannelId !== undefined
-              : isRecordReference || input.targetChannelId === undefined,
-            'table.field-dictionary-configuration',
-            'Dictionary Field requires one target Dictionary Channel',
-          );
-          if (isRecordReference) {
-            const target = await this.#requireChannel(input.targetChannelId!);
-            invariant(
-              this.channelTypes.require(target.typeId, target.typeVersion).recordKinds.length > 0,
-              'table.record-reference-invalid',
-              'Target Channel Type does not expose Channel Records',
-            );
-            await this.#requireRole(context.actorId, input.targetChannelId!, 'viewer');
-          } else if (isDictionary) {
-            await this.#requireChannel(input.targetChannelId!, 'dictionary');
-            await this.#requireRole(context.actorId, input.targetChannelId!, 'viewer');
-          }
-          const {
-            cardinality: _previousCardinality,
-            targetChannelId: _previousTargetChannelId,
-            ...fieldWithoutReference
-          } = field;
-          const convertedField: TableField = {
-            ...fieldWithoutReference,
-            ...(input.cardinality === undefined ? {} : { cardinality: input.cardinality }),
-            ...(input.targetChannelId === undefined
-              ? {}
-              : { targetChannelId: input.targetChannelId }),
-            type: input.targetType,
-          };
-          const records = await this.store.listTableRecords(input.channelId);
-          return {
-            data: {
-              defaultFailure:
-                field.defaultValue !== undefined &&
-                field.defaultValue !== null &&
-                !(await this.#fieldAccepts(
-                  context.actorId,
-                  convertedField,
-                  field.defaultValue,
-                ))
-                  ? field.defaultValue
-                  : null,
-              failures: (
-                await Promise.all(
-                  records.map(async (record) => {
-                    const value = record.values[field.key];
-                    return value !== undefined &&
-                      value !== null &&
-                      !(await this.#fieldAccepts(context.actorId, convertedField, value))
-                      ? { originalValue: value, recordId: record.id }
-                      : null;
-                  }),
-                )
-              ).filter((failure) => failure !== null),
-              fieldId: field.id,
-              observedVersion: field.version,
-              targetType: input.targetType,
-            },
-            view: pendingChannelTypeView(),
-          };
-        },
-      }),
-      defineQuery({
-        description: 'Describe Table display configuration without Record values.',
-        inputSchema: z.object({ channelId: z.string().min(1) }),
-        name: 'table.configuration',
-        run: async (context, input): Promise<QueryResult> => {
-          await this.#requireChannel(input.channelId, 'table');
-          await this.#requireRole(context.actorId, input.channelId, 'viewer');
-          return {
-            data: {
-              displayFieldId: await this.store.getTableDisplayFieldId(input.channelId),
-            },
-            view: pendingChannelTypeView(),
-          };
-        },
-      }),
-      defineQuery({
-        description: 'List current Records in a Table Channel.',
-        inputSchema: z.object({
-          channelId: z.string().min(1),
-          includeTombstonedFields: z.boolean().default(false),
-          includeTombstoned: z.boolean().default(false),
-        }),
-        name: 'table.records.list',
-        run: async (context, input): Promise<QueryResult> => {
-          const channel = await this.#requireChannel(input.channelId, 'table');
-          await this.#requireRole(context.actorId, input.channelId, 'viewer');
-          const records = (await this.store.listTableRecords(input.channelId)).filter(
-            (record) => input.includeTombstoned || record.tombstonedAt === undefined,
-          );
-          const fields = await this.store.listTableFields(input.channelId);
-          const visibleKeys = new Set(
-            fields
-              .filter((field) => input.includeTombstonedFields || field.tombstonedAt === undefined)
-              .map((field) => field.key),
-          );
-          return {
-            data: await Promise.all(
-              records.map(async (record) => ({
-                fieldVersions: Object.fromEntries(
-                  Object.entries(record.fieldVersions).filter(([key]) => visibleKeys.has(key)),
-                ),
-                id: record.id,
-                ...(record.tombstonedAt === undefined
-                  ? {}
-                  : { tombstonedAt: record.tombstonedAt }),
-                values: await this.#resolveTableValues(
-                  context.actorId,
-                  fields.filter((field) => visibleKeys.has(field.key)),
-                  Object.fromEntries(
-                    Object.entries(record.values).filter(([key]) => visibleKeys.has(key)),
-                  ),
-                ),
-              })),
-            ),
-            view: pendingChannelTypeView(),
-          };
-        },
-      }),
-      defineQuery({
-        description: 'Reopen a durable Table View definition against current Records.',
-        inputSchema: z.object({
-          channelId: z.string().min(1),
-          viewId: z.string().min(1),
-        }),
-        name: 'table.view.open',
-        run: async (context, input): Promise<QueryResult> => {
-          await this.#requireChannel(input.channelId, 'table');
-          await this.#requireRole(context.actorId, input.channelId, 'viewer');
-          const definition = (await this.store.listTableViews(input.channelId, context.actorId)).find(
-            (view) => view.id === input.viewId,
-          );
-          invariant(
-            definition,
-            'table.view-not-found',
-            'Table View does not exist or is not available',
-            404,
-          );
-          const fields = await this.store.listTableFields(input.channelId);
-          const keys = new Map(fields.map((field) => [field.id, field.key]));
-          const visibleKeys = new Set(
-            definition.visibleFieldIds.map((fieldId) => keys.get(fieldId)).filter(Boolean),
-          );
-          const records = await this.executeQuery(
-            context.actorId,
-            context.origin,
-            'table.records.list',
-            { channelId: input.channelId },
-          );
-          let current: QueryResult = {
-            data: (records.data as JsonValue[]).map((record) => {
-              if (record === null || Array.isArray(record) || typeof record !== 'object') return record;
-              const values = record.values;
-              return {
-                ...record,
-                values:
-                  values !== null && !Array.isArray(values) && typeof values === 'object'
-                    ? Object.fromEntries(
-                        Object.entries(values).filter(([key]) => visibleKeys.has(key)),
-                      )
-                    : (values ?? null),
-              };
-            }),
-            view: pendingChannelTypeView(),
-          };
-          current = transformResult(current, {
-            filters: definition.filters.map((filter) => ({
-              field: keys.get(filter.fieldId) ?? filter.fieldId,
-              operator: filter.operator,
-              ...(filter.value === undefined ? {} : { value: filter.value }),
-            })),
-            kind: 'filter',
-          });
-          if (Array.isArray(current.data) && definition.sorting.length > 0) {
-            const valueAt = (row: JsonValue, key: string): JsonValue | undefined => {
-              if (row === null || Array.isArray(row) || typeof row !== 'object') return undefined;
-              const values = row.values;
-              return values !== null && !Array.isArray(values) && typeof values === 'object'
-                ? values[key]
-                : undefined;
-            };
-            current = {
-              ...current,
-              data: [...current.data].sort((left, right) => {
-                for (const sort of definition.sorting) {
-                  const key = keys.get(sort.fieldId) ?? sort.fieldId;
-                  const leftValue = valueAt(left, key);
-                  const rightValue = valueAt(right, key);
-                  const compared = (JSON.stringify(leftValue) ?? '').localeCompare(
-                    JSON.stringify(rightValue) ?? '',
-                  );
-                  if (compared !== 0) {
-                    return sort.direction === 'ascending' ? compared : -compared;
-                  }
-                }
-                return 0;
-              }),
-            };
-          }
-          return definition.grouping.length === 0
-            ? current
-            : transformResult(current, {
-                fields: definition.grouping.map((fieldId) => keys.get(fieldId) ?? fieldId),
-                kind: 'group',
-              });
-        },
-      }),
-      defineQuery({
-        description: 'List shared Table Views and the actor personal Views.',
-        inputSchema: z.object({ channelId: z.string().min(1) }),
-        name: 'table.views.list',
-        run: async (context, input): Promise<QueryResult> => {
-          await this.#requireChannel(input.channelId, 'table');
-          await this.#requireRole(context.actorId, input.channelId, 'viewer');
-          const views = await this.store.listTableViews(input.channelId, context.actorId);
-          return {
-            data: toJson(
-              views.map((view) => ({
-                filters: [...view.filters],
-                grouping: [...view.grouping],
-                id: view.id,
-                name: view.name,
-                ownerId: view.ownerId,
-                sorting: [...view.sorting],
-                visibility: view.visibility,
-                visibleFieldIds: [...view.visibleFieldIds],
-              })),
-            ),
-            view: pendingChannelTypeView(),
-          };
-        },
-      }),
-      defineQuery({
-        description: 'Execute and render one live Chart under Chart and source permissions.',
-        inputSchema: z.object({ channelId: z.string().min(1) }),
-        name: 'chart.open',
-        run: async (context, input): Promise<QueryResult> => {
-          const channel = await this.#requireChannel(input.channelId, 'chart');
-          await this.#requireRole(context.actorId, input.channelId, 'viewer');
-          const definition = await this.#requireChartDefinition(input.channelId);
-          await this.#validateChartDefinition(context.actorId, definition);
-          let current = await this.executeQuery(
-            context.actorId,
-            context.origin,
-            'table.records.list',
-            { channelId: definition.sourceChannelId },
-          );
-          if (definition.filters.length > 0) {
-            current = transformResult(current, {
-              filters: definition.filters,
-              kind: 'filter',
-            });
-          }
-          if (definition.grouping.length > 0) {
-            current = transformResult(current, {
-              fields: definition.grouping,
-              kind: 'group',
-            });
-          }
-          current = transformResult(current, {
-            aggregations: definition.aggregations,
-            kind: 'aggregate',
-          });
-          return {
-            data: {
-              presentation: toJson(definition.presentation),
-              series: current.data,
-            },
-            view: pendingChannelTypeView(),
-          };
-        },
-      }),
-      defineQuery({
-        description: 'List Messages in one Channel Discussion.',
-        inputSchema: z.object({
-          channelId: z.string().min(1),
-          includeTombstoned: z.boolean().default(true),
-        }),
-        name: 'discussion.messages.list',
-        run: async (context, input): Promise<QueryResult> => {
-          const channel = await this.#requireChannel(input.channelId);
-          await this.#requireRole(context.actorId, input.channelId, 'viewer');
-          const messages = (await this.store.listMessages(input.channelId)).filter(
-            (message) => input.includeTombstoned || message.tombstonedAt === undefined,
-          );
-          return {
-            data: await Promise.all(
-              messages.map(async (message) => ({
-                authorId: message.authorId,
-                createdAt: message.createdAt,
-                id: message.id,
-                recordReferences:
-                  message.tombstonedAt === undefined
-                    ? await Promise.all(
-                        message.recordReferences.map((recordId) =>
-                          this.#resolveChannelRecordId(context.actorId, recordId),
-                        ),
-                      )
-                    : [],
-                ...(message.replyToMessageId === undefined
-                  ? {}
-                  : { replyToMessageId: message.replyToMessageId }),
-                text: message.tombstonedAt === undefined ? message.text : null,
-                ...(message.tombstonedAt === undefined
-                  ? {}
-                  : { tombstonedAt: message.tombstonedAt }),
-              })),
-            ),
-            view: pendingChannelTypeView(),
-          };
-        },
-      }),
-      defineQuery({
-        description: 'Inspect one Message revision history under Operation History policy.',
-        inputSchema: z.object({
-          channelId: z.string().min(1),
-          messageId: z.string().min(1),
-        }),
-        name: 'discussion.message.revisions',
-        run: async (context, input): Promise<QueryResult> => {
-          const channel = await this.#requireChannel(input.channelId);
-          const message = await this.#requireMessage(input.channelId, input.messageId);
-          const membership = await this.store.getMembership(input.channelId, context.actorId);
-          invariant(membership, 'permission.denied', 'Channel membership is required', 403);
-          invariant(
-            membership.role === 'owner' ||
-              membership.role === 'admin' ||
-              (membership.role === 'contributor' && message.authorId === context.actorId),
-            'permission.denied',
-            'Message revision history is not available',
-            403,
-          );
-          return {
-            data: message.revisions.map((revision) => ({
-              createdAt: revision.createdAt,
-              editorId: revision.editorId,
-              id: revision.id,
-              text: revision.text,
-            })),
-            view: pendingChannelTypeView(),
-          };
-        },
-      }),
+
     ];
   }
 

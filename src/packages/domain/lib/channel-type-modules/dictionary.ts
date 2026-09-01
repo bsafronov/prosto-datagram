@@ -39,22 +39,65 @@ export const dictionaryChannelType = {
       label: dictionaryLabelSchema,
     }), async (input, capabilities) => {
       if (!('changes' in capabilities)) throw new Error('Dictionary creation needs Action capabilities');
+      const normalizedLabel = dictionaryLabelKey(input.label);
+      invariant(
+        !(await capabilities.state!.dictionaryEntries()).some(
+          (entry) => entry.normalizedLabel === normalizedLabel,
+        ),
+        'dictionary.entry-label-conflict',
+        'Dictionary Entry label already exists',
+        409,
+      );
       await capabilities.changes.createDictionaryEntry!(input.label);
       return capabilities.commit();
-    }, { kind: 'channel-role', minimumRole: 'contributor' }, ['dictionary.entry.create']),
+    }, { kind: 'channel-role', minimumRole: 'contributor' }, ['createDictionaryEntry']),
     contract('dictionary.entry.rename', z.object({
       channelId: channelIdSchema,
       entryId: z.string().min(1),
       label: dictionaryLabelSchema,
-    }), undefined, { kind: 'channel-role', minimumRole: 'contributor' }),
+    }), async (input, capabilities) => {
+      if (!('changes' in capabilities)) throw new Error('Dictionary rename needs Action capabilities');
+      const entry = await capabilities.state!.dictionaryEntry(input.entryId);
+      invariant(entry?.channelId === input.channelId, 'dictionary.entry-not-found', 'Dictionary Entry not found', 404);
+      const normalizedLabel = dictionaryLabelKey(input.label);
+      invariant(
+        !(await capabilities.state!.dictionaryEntries()).some(
+          (candidate) => candidate.id !== entry.id && candidate.normalizedLabel === normalizedLabel,
+        ),
+        'dictionary.entry-label-conflict',
+        'Dictionary Entry label already exists',
+        409,
+      );
+      capabilities.changes.renameDictionaryEntry!({
+        entryId: entry.id,
+        label: input.label,
+        normalizedLabel,
+        updatedAt: capabilities.now(),
+      });
+      return capabilities.commit();
+    }, { kind: 'channel-role', minimumRole: 'contributor' }, ['renameDictionaryEntry']),
     contract('dictionary.entry.retire', z.object({
       channelId: channelIdSchema,
       entryId: z.string().min(1),
-    }), undefined, { kind: 'channel-role', minimumRole: 'contributor' }),
+    }), async (input, capabilities) => {
+      if (!('changes' in capabilities)) throw new Error('Dictionary retirement needs Action capabilities');
+      const entry = await capabilities.state!.dictionaryEntry(input.entryId);
+      invariant(entry?.channelId === input.channelId, 'dictionary.entry-not-found', 'Dictionary Entry not found', 404);
+      invariant(entry.retiredAt === undefined, 'dictionary.entry-retired', 'Dictionary Entry is already retired', 409);
+      capabilities.changes.retireDictionaryEntry!(entry.id, capabilities.now());
+      return capabilities.commit();
+    }, { kind: 'channel-role', minimumRole: 'contributor' }, ['retireDictionaryEntry']),
     contract('dictionary.entry.restore', z.object({
       channelId: channelIdSchema,
       entryId: z.string().min(1),
-    }), undefined, { kind: 'channel-role', minimumRole: 'contributor' }),
+    }), async (input, capabilities) => {
+      if (!('changes' in capabilities)) throw new Error('Dictionary restoration needs Action capabilities');
+      const entry = await capabilities.state!.dictionaryEntry(input.entryId);
+      invariant(entry?.channelId === input.channelId, 'dictionary.entry-not-found', 'Dictionary Entry not found', 404);
+      invariant(entry.retiredAt !== undefined, 'dictionary.entry-active', 'Dictionary Entry is not retired', 409);
+      capabilities.changes.restoreDictionaryEntry!(entry.id, capabilities.now());
+      return capabilities.commit();
+    }, { kind: 'channel-role', minimumRole: 'contributor' }, ['restoreDictionaryEntry']),
     ...discussionActions,
   ],
   activityFor: (changes) => {
@@ -78,7 +121,19 @@ export const dictionaryChannelType = {
     contract('dictionary.entries.list', z.object({
       channelId: channelIdSchema,
       includeRetired: z.boolean().default(false),
-    })),
+    }), async (input, capabilities) => {
+      const entries = (await capabilities.state!.dictionaryEntries()).filter(
+        (entry) => input.includeRetired || entry.retiredAt === undefined,
+      );
+      return {
+        data: entries.map((entry) => ({
+          id: entry.id,
+          label: entry.label,
+          ...(entry.retiredAt === undefined ? {} : { retiredAt: entry.retiredAt }),
+        })),
+        view: { bindings: {}, commands: [], kind: 'pending', schemaVersion: 'datagram/view@1', title: 'Channel Type View' },
+      };
+    }),
     ...discussionQueries,
   ],
   recordKinds: ['dictionary-entry', 'discussion-message'],

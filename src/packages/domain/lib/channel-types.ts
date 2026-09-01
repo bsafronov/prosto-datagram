@@ -24,12 +24,13 @@ export type { ChannelViewDeclaration, ChannelViewInput } from './channel-type-mo
 
 const channelContractSchema = z.object({
   allowedOperations: z.array(z.enum([
-    'channel.create',
-    'chart.create',
-    'dictionary.entry.create',
-    'table.display-field.set',
-    'table.record.create',
-    'table.view.create',
+    'addTableField', 'cancel', 'createChannel', 'createChart', 'createDictionaryEntry',
+    'createTableRecord', 'createTableView', 'editDiscussionMessage',
+    'postDiscussionMessage', 'purgeTableField', 'recordChartEvent',
+    'renameDictionaryEntry', 'restoreDictionaryEntry', 'restoreDiscussionMessage',
+    'restoreTableRecord', 'retireDictionaryEntry', 'setChartDefinition',
+    'setTableDisplayField', 'tombstoneDiscussionMessage', 'tombstoneTableRecord',
+    'updateTableField', 'updateTableRecord',
   ])),
   authorization: z.discriminatedUnion('kind', [
     z.object({ kind: z.literal('authenticated') }),
