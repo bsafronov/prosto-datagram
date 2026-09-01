@@ -16,8 +16,9 @@ bun run cli init
 
 `bun run check` always proves PostgreSQL conformance and the same acceptance journey against a
 real Server Store. It uses `DATAGRAM_TEST_POSTGRES_URL` when set; otherwise it provisions an
-ephemeral `postgres:17-alpine` Docker container and removes it after testing. Docker or an explicit
-test URL is required; PostgreSQL verification never skips.
+ephemeral `postgres:17-alpine` Docker container pinned by an immutable multi-platform digest and
+removes it after testing. Docker or an explicit test URL is required; PostgreSQL verification never
+skips.
 
 Run only the PostgreSQL gate against an existing database:
 

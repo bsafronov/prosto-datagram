@@ -106,12 +106,32 @@ const fieldDefaultConversionResolutionSchema = z.object({
 
 const toJson = (value: unknown): JsonValue => jsonValueSchema.parse(value);
 
-const nestedChannelIds = (value: unknown): string[] => {
-  if (Array.isArray(value)) return value.flatMap(nestedChannelIds);
-  if (!value || typeof value !== 'object') return [];
-  return Object.entries(value).flatMap(([key, child]) =>
-    key === 'channelId' && typeof child === 'string' ? [child] : nestedChannelIds(child),
-  );
+const semanticTypeView = (
+  bindings: QueryResult['view']['bindings'],
+  title: string,
+): QueryResult['view'] => ({
+  bindings,
+  commands: [],
+  kind: 'channel-type',
+  schemaVersion: 'datagram/view@1',
+  title,
+});
+
+const typeOwnedActivityKind = (changes: readonly DomainChange[]): string | undefined => {
+  if (changes.some((change) => change.kind === 'channel.created')) return 'channel.created';
+  if (changes.some((change) => change.kind === 'dictionary.entry-created')) {
+    return 'dictionary.entry-created';
+  }
+  if (changes.some((change) => change.kind === 'table.record-created')) {
+    return 'table.record-created';
+  }
+  if (changes.some((change) => change.kind === 'table.display-field-set')) {
+    return 'table.display-field-changed';
+  }
+  if (changes.some((change) => change.kind === 'chart.definition-set')) {
+    return 'chart.definition-changed';
+  }
+  return undefined;
 };
 
 export class DatagramApplication {
@@ -127,10 +147,6 @@ export class DatagramApplication {
     this.handles = handles;
     const actions = this.#actionDefinitions();
     const queries = this.#queryDefinitions();
-    this.channelTypes.assertImplementations(
-      new Set(actions.map((definition) => definition.name)),
-      new Set(queries.map((definition) => definition.name)),
-    );
     const channelActionNames = new Set(
       this.channelTypes.list().flatMap((definition) =>
         definition.actions.map((contract) => contract.name),
@@ -146,12 +162,14 @@ export class DatagramApplication {
       (selector, name) =>
         this.channelTypes.requireAction(selector.typeId, selector.typeVersion, name),
       channelActionNames,
+      (selector) => this.channelTypes.require(selector.typeId, selector.typeVersion).actions,
     );
     this.queries = new QueryRegistry(
       queries,
       (selector, name) =>
         this.channelTypes.requireQuery(selector.typeId, selector.typeVersion, name),
       channelQueryNames,
+      (selector) => this.channelTypes.require(selector.typeId, selector.typeVersion).queries,
     );
   }
 
@@ -167,8 +185,9 @@ export class DatagramApplication {
     input: unknown,
     selectedType?: ChannelTypeContractSelector,
   ): Promise<ActionReceipt> {
-    await this.#requirePerson(actorId);
-    const contract = await this.#channelContract('action', name, input);
+    const actor = await this.#requirePerson(actorId);
+    const selectedInput = this.#applySelectedCreationType(name, input, selectedType);
+    const contract = await this.#channelContract('action', name, selectedInput, selectedType);
     if (selectedType && contract) {
       invariant(
         contract.typeId === selectedType.typeId &&
@@ -179,47 +198,217 @@ export class DatagramApplication {
       );
     }
     if (contract) {
+      const authorization = this.channelTypes.requireAuthorization(
+        contract.typeId,
+        contract.typeVersion,
+        'action',
+        name,
+      );
+      invariant(authorization, 'channel-type.action-undeclared', 'Channel Type Action is not declared');
+      let selectedChannelId =
+        selectedInput && typeof selectedInput === 'object' && !Array.isArray(selectedInput) &&
+        typeof (selectedInput as Record<string, unknown>).channelId === 'string'
+          ? (selectedInput as Record<string, unknown>).channelId as string
+          : undefined;
+      if (authorization.kind === 'channel-role') {
+        invariant(
+          selectedChannelId,
+          'channel-type.capability-denied',
+          'Channel Type Action requires a selected Channel',
+          403,
+        );
+        await this.#requireRole(actorId, selectedChannelId, authorization.minimumRole);
+      } else if (authorization.kind === 'operator') {
+        invariant(
+          actor.isOperator,
+          'permission.denied',
+          'Deployment Operator authority is required',
+          403,
+        );
+      }
+      const pendingChanges: DomainChange[] = [];
       return this.channelTypes.executeAction(
         contract.typeId,
         contract.typeVersion,
         name,
-        input,
+        selectedInput,
         {
           actorId,
-          commit: async (request) => {
+          changes: {
+            createChannel: (title) => {
+              invariant(
+                authorization.kind !== 'channel-role' && selectedChannelId === undefined,
+                'channel-type.capability-denied',
+                'Only a Channel creation contract may create its Channel',
+                403,
+              );
+              selectedChannelId = newId('channel');
+              const createdAt = nowIso();
+              const channel: Channel = {
+                createdAt,
+                id: selectedChannelId,
+                ownerId: actorId,
+                title,
+                typeId: contract.typeId,
+                typeVersion: contract.typeVersion,
+                updatedAt: createdAt,
+              };
+              pendingChanges.push(
+                { channel, kind: 'channel.created' },
+                {
+                  kind: 'membership.granted',
+                  membership: { channelId: selectedChannelId, personId: actorId, role: 'owner' },
+                },
+              );
+              return selectedChannelId;
+            },
+            createDictionaryEntry: async (label) => {
+              invariant(
+                contract.typeId === 'dictionary' && selectedChannelId,
+                'channel-type.capability-denied',
+                'This Channel Type cannot emit Dictionary transitions',
+                403,
+              );
+              const normalizedLabel = dictionaryLabelKey(label);
+              invariant(
+                !(await this.store.listDictionaryEntries(selectedChannelId)).some(
+                  (entry) => entry.retiredAt === undefined && entry.normalizedLabel === normalizedLabel,
+                ),
+                'dictionary.entry-duplicate',
+                'Active Dictionary Entry labels must be unique',
+                409,
+              );
+              const entryId = newId('entry');
+              pendingChanges.push({
+                entry: {
+                  channelId: selectedChannelId,
+                  createdAt: nowIso(),
+                  createdBy: actorId,
+                  id: entryId,
+                  label: normalizeDictionaryLabel(label),
+                  normalizedLabel,
+                },
+                kind: 'dictionary.entry-created',
+              });
+              return entryId;
+            },
+            createTableRecord: async (values) => {
+              invariant(
+                contract.typeId === 'table' && selectedChannelId,
+                'channel-type.capability-denied',
+                'This Channel Type cannot emit Table Record transitions',
+                403,
+              );
+              const fields = await this.store.listTableFields(selectedChannelId);
+              const validatedValues = await this.#validatedRecordValues(
+                actorId,
+                fields,
+                await this.store.listTableRecords(selectedChannelId),
+                values,
+                undefined,
+                true,
+              );
+              const recordId = newId('record');
+              pendingChanges.push({
+                kind: 'table.record-created',
+                record: {
+                  channelId: selectedChannelId,
+                  createdAt: nowIso(),
+                  createdBy: actorId,
+                  fieldVersions: Object.fromEntries(
+                    fields
+                      .filter((field) => field.tombstonedAt === undefined && field.key in validatedValues)
+                      .map((field) => [field.key, field.version]),
+                  ),
+                  id: recordId,
+                  values: validatedValues,
+                },
+              });
+              return recordId;
+            },
+            setChartDefinition: (definition) => {
+              invariant(
+                contract.typeId === 'chart' && selectedChannelId,
+                'channel-type.capability-denied',
+                'This Channel Type cannot emit Chart transitions',
+                403,
+              );
+              pendingChanges.push({
+                definition: { ...definition, channelId: selectedChannelId },
+                kind: 'chart.definition-set',
+              });
+            },
+            setTableDisplayField: (displayFieldId) => {
+              invariant(
+                contract.typeId === 'table',
+                'channel-type.capability-denied',
+                'This Channel Type cannot emit Table transitions',
+                403,
+              );
+              pendingChanges.push({
+                channelId: selectedChannelId!,
+                ...(displayFieldId === null ? {} : { displayFieldId }),
+                kind: 'table.display-field-set',
+              });
+            },
+          },
+          commit: async () => {
             const requestedChannelId =
-              input && typeof input === 'object' && !Array.isArray(input)
-                ? (input as Record<string, unknown>).channelId
+              selectedInput && typeof selectedInput === 'object' && !Array.isArray(selectedInput)
+                ? (selectedInput as Record<string, unknown>).channelId
                 : undefined;
             invariant(
-              requestedChannelId === request.channelId,
+              authorization.kind !== 'channel-role'
+                ? requestedChannelId === undefined
+                : requestedChannelId === selectedChannelId,
               'channel-type.capability-denied',
               'Channel Type handler may only commit to its selected Channel',
               403,
             );
             invariant(
-              request.changes.every((change) => {
-                const channelIds = nestedChannelIds(change);
-                return channelIds.length > 0 && channelIds.every((value) => value === request.channelId);
-              }),
+              pendingChanges.length > 0,
               'channel-type.capability-denied',
-              'Channel Type handler transitions must stay within its selected Channel',
+              'Channel Type handler did not build a transition',
               403,
             );
-            const channel = await this.#requireChannel(request.channelId);
+            const activityKind = typeOwnedActivityKind(pendingChanges);
             invariant(
-              channel.typeId === contract.typeId && channel.typeVersion === contract.typeVersion,
+              activityKind && this.channelTypes
+                .require(contract.typeId, contract.typeVersion)
+                .activityKinds.includes(activityKind),
+              'channel-type.capability-denied',
+              'Channel Type handler did not build a declared transition',
+              403,
+            );
+            const channel =
+              await this.store.getChannel(selectedChannelId!) ??
+              pendingChanges.find((change) => change.kind === 'channel.created')?.channel;
+            invariant(
+              channel?.typeId === contract.typeId && channel.typeVersion === contract.typeVersion,
               'channel-type.version-mismatch',
               'Selected Channel Type version does not own this Channel',
               409,
             );
-            await this.#requireRole(actorId, request.channelId, request.requiredRole);
             return this.#commit(
               { actorId, origin },
               name,
-              request.channelId,
-              () => request.changes,
-              request.subject,
+              selectedChannelId,
+              (operationId, occurredAt) => [
+                ...pendingChanges,
+                {
+                  activity: this.#activity(
+                    actorId,
+                    selectedChannelId!,
+                    activityKind,
+                    operationId,
+                    occurredAt,
+                  ),
+                  kind: 'activity.appended',
+                },
+              ],
+              pendingChanges.some((change) => change.kind === 'channel.created')
+                ? { id: selectedChannelId!, kind: 'channel' }
+                : undefined,
             );
           },
           newId,
@@ -231,7 +420,7 @@ export class DatagramApplication {
     return this.actions.execute(
       name,
       { actorId, origin },
-      input,
+      selectedInput,
     );
   }
 
@@ -253,6 +442,21 @@ export class DatagramApplication {
         409,
       );
     }
+    const queryRole = contract
+      ? this.channelTypes.requireAuthorization(
+          contract.typeId,
+          contract.typeVersion,
+          'query',
+          name,
+        )
+      : undefined;
+    if (queryRole?.kind === 'channel-role') {
+      await this.#requireRole(
+        actorId,
+        (input as { channelId: string }).channelId,
+        queryRole.minimumRole,
+      );
+    }
     const result = contract
       ? await this.channelTypes.executeQuery(
           contract.typeId,
@@ -261,6 +465,17 @@ export class DatagramApplication {
           input,
           {
             actorId,
+            read: async (query, readInput) => {
+              const selectedChannelId = (input as { channelId: string }).channelId;
+              invariant(
+                readInput.channelId === selectedChannelId,
+                'channel-type.capability-denied',
+                'Channel Type Query reads must stay within its selected Channel',
+                403,
+              );
+              await this.#requireRole(actorId, selectedChannelId, 'viewer');
+              return this.queries.execute(query, { actorId, origin }, readInput);
+            },
             role: await this.#requireRole(
               actorId,
               (input as { channelId: string }).channelId,
@@ -284,8 +499,11 @@ export class DatagramApplication {
               channel!.typeId,
               channel!.typeVersion,
               name,
-              result.view,
-              await this.#requireRole(actorId, channelId, 'viewer'),
+              {
+                bindings: result.view.bindings,
+                role: await this.#requireRole(actorId, channelId, 'viewer'),
+                title: result.view.title,
+              },
             ),
           };
         }
@@ -298,6 +516,7 @@ export class DatagramApplication {
     kind: 'action' | 'query',
     name: string,
     rawInput: unknown,
+    selectedType?: ChannelTypeContractSelector,
   ): Promise<
     | { readonly schema: z.ZodType; readonly typeId: string; readonly typeVersion: string }
     | undefined
@@ -318,6 +537,8 @@ export class DatagramApplication {
       const type =
         typeof input.typeVersion === 'string'
           ? this.channelTypes.require(input.typeId, input.typeVersion)
+          : selectedType
+            ? this.channelTypes.require(selectedType.typeId, selectedType.typeVersion)
           : this.channelTypes.requireCurrent(input.typeId);
       typeId = type.id;
       typeVersion = type.version;
@@ -325,6 +546,8 @@ export class DatagramApplication {
       const type =
         typeof input.typeVersion === 'string'
           ? this.channelTypes.require('chart', input.typeVersion)
+          : selectedType
+            ? this.channelTypes.require(selectedType.typeId, selectedType.typeVersion)
           : this.channelTypes.requireCurrent('chart');
       typeId = type.id;
       typeVersion = type.version;
@@ -335,6 +558,42 @@ export class DatagramApplication {
         ? this.channelTypes.requireAction(typeId, typeVersion, name)
         : this.channelTypes.requireQuery(typeId, typeVersion, name);
     return schema ? { schema, typeId, typeVersion } : undefined;
+  }
+
+  #applySelectedCreationType(
+    name: string,
+    rawInput: unknown,
+    selectedType?: ChannelTypeContractSelector,
+  ): unknown {
+    if (
+      !selectedType ||
+      (name !== 'channel.create' && name !== 'chart.create') ||
+      rawInput === null ||
+      Array.isArray(rawInput) ||
+      typeof rawInput !== 'object'
+    ) return rawInput;
+    const input = rawInput as Record<string, unknown>;
+    invariant(
+      name !== 'channel.create' || input.typeId === selectedType.typeId,
+      'channel-type.version-mismatch',
+      'Selected Channel Type does not match creation input',
+      409,
+    );
+    invariant(
+      name !== 'chart.create' || selectedType.typeId === 'chart',
+      'channel-type.version-mismatch',
+      'Selected Channel Type does not match Chart creation',
+      409,
+    );
+    invariant(
+      input.typeVersion === undefined || input.typeVersion === selectedType.typeVersion,
+      'channel-type.version-mismatch',
+      'Selected Channel Type version does not match creation input',
+      409,
+    );
+    return input.typeVersion === undefined
+      ? { ...input, typeVersion: selectedType.typeVersion }
+      : rawInput;
   }
 
   async prepareQuery(
@@ -3393,7 +3652,7 @@ export class DatagramApplication {
         name: 'dictionary.entries.list',
         run: async (context, input): Promise<QueryResult> => {
           await this.#requireChannel(input.channelId, 'dictionary');
-          const role = await this.#requireRole(context.actorId, input.channelId, 'viewer');
+          await this.#requireRole(context.actorId, input.channelId, 'viewer');
           const entries = (await this.store.listDictionaryEntries(input.channelId)).filter(
             (entry) => input.includeRetired || entry.retiredAt === undefined,
           );
@@ -3403,21 +3662,7 @@ export class DatagramApplication {
               label: entry.label,
               ...(entry.retiredAt === undefined ? {} : { retiredAt: entry.retiredAt }),
             })),
-            view: {
-              bindings: { entries: '$result' },
-              commands:
-                roleRank[role] >= roleRank.contributor
-                  ? [
-                      'dictionary.entry.create',
-                      'dictionary.entry.rename',
-                      'dictionary.entry.retire',
-                      'dictionary.entry.restore',
-                    ]
-                  : [],
-              kind: 'dictionary',
-              schemaVersion: 'datagram/view@1',
-              title: 'Dictionary Entries',
-            },
+            view: semanticTypeView({ entries: '$result' }, 'Dictionary Entries'),
           };
         },
       }),
@@ -3430,7 +3675,7 @@ export class DatagramApplication {
         name: 'table.describe',
         run: async (context, input): Promise<QueryResult> => {
           const channel = await this.#requireChannel(input.channelId, 'table');
-          const role = await this.#requireRole(context.actorId, input.channelId, 'viewer');
+          await this.#requireRole(context.actorId, input.channelId, 'viewer');
           const fields = await this.store.listTableFields(input.channelId);
           return {
             data: fields
@@ -3449,24 +3694,7 @@ export class DatagramApplication {
                 unique: field.unique,
                 version: field.version,
               })),
-            view: {
-              bindings: { fields: '$result' },
-              commands: [
-                ...(roleRank[role] >= roleRank.admin
-                  ? [
-                      'table.field.add',
-                      'table.field.tombstone',
-                      'table.field.restore',
-                      'table.field.convert',
-                      'table.field.purge',
-                    ]
-                  : []),
-                ...(roleRank[role] >= roleRank.contributor ? ['table.record.create'] : []),
-              ],
-              kind: 'table-schema',
-              schemaVersion: 'datagram/view@1',
-              title: `${channel.title} Fields`,
-            },
+            view: semanticTypeView({ fields: '$result' }, `${channel.title} Fields`),
           };
         },
       }),
@@ -3560,13 +3788,7 @@ export class DatagramApplication {
               observedVersion: field.version,
               targetType: input.targetType,
             },
-            view: {
-              bindings: { preview: '$result' },
-              commands: ['table.field.convert'],
-              kind: 'table',
-              schemaVersion: 'datagram/view@1',
-              title: 'Field Conversion Preview',
-            },
+            view: semanticTypeView({ preview: '$result' }, 'Field Conversion Preview'),
           };
         },
       }),
@@ -3576,18 +3798,12 @@ export class DatagramApplication {
         name: 'table.configuration',
         run: async (context, input): Promise<QueryResult> => {
           await this.#requireChannel(input.channelId, 'table');
-          const role = await this.#requireRole(context.actorId, input.channelId, 'viewer');
+          await this.#requireRole(context.actorId, input.channelId, 'viewer');
           return {
             data: {
               displayFieldId: await this.store.getTableDisplayFieldId(input.channelId),
             },
-            view: {
-              bindings: { configuration: '$result' },
-              commands: roleRank[role] >= roleRank.admin ? ['table.display-field.set'] : [],
-              kind: 'value',
-              schemaVersion: 'datagram/view@1',
-              title: 'Table Configuration',
-            },
+            view: semanticTypeView({ configuration: '$result' }, 'Table Configuration'),
           };
         },
       }),
@@ -3601,7 +3817,7 @@ export class DatagramApplication {
         name: 'table.records.list',
         run: async (context, input): Promise<QueryResult> => {
           const channel = await this.#requireChannel(input.channelId, 'table');
-          const role = await this.#requireRole(context.actorId, input.channelId, 'viewer');
+          await this.#requireRole(context.actorId, input.channelId, 'viewer');
           const records = (await this.store.listTableRecords(input.channelId)).filter(
             (record) => input.includeTombstoned || record.tombstonedAt === undefined,
           );
@@ -3630,21 +3846,7 @@ export class DatagramApplication {
                 ),
               })),
             ),
-            view: {
-              bindings: { rows: '$result' },
-              commands:
-                roleRank[role] >= roleRank.contributor
-                  ? [
-                      'table.record.create',
-                      'table.record.edit',
-                      'table.record.tombstone',
-                      'table.record.restore',
-                    ]
-                  : [],
-              kind: 'table-records',
-              schemaVersion: 'datagram/view@1',
-              title: channel.title,
-            },
+            view: semanticTypeView({ rows: '$result' }, channel.title),
           };
         },
       }),
@@ -3657,7 +3859,7 @@ export class DatagramApplication {
         name: 'table.view.open',
         run: async (context, input): Promise<QueryResult> => {
           await this.#requireChannel(input.channelId, 'table');
-          const role = await this.#requireRole(context.actorId, input.channelId, 'viewer');
+          await this.#requireRole(context.actorId, input.channelId, 'viewer');
           const definition = (await this.store.listTableViews(input.channelId, context.actorId)).find(
             (view) => view.id === input.viewId,
           );
@@ -3692,21 +3894,7 @@ export class DatagramApplication {
                     : (values ?? null),
               };
             }),
-            view: {
-              bindings: { rows: '$result' },
-              commands:
-                roleRank[role] >= roleRank.contributor
-                  ? [
-                      'table.record.create',
-                      'table.record.edit',
-                      'table.record.tombstone',
-                      'table.record.restore',
-                    ]
-                  : [],
-              kind: 'table-records',
-              schemaVersion: 'datagram/view@1',
-              title: definition.name,
-            },
+            view: semanticTypeView({ rows: '$result' }, definition.name),
           };
           current = transformResult(current, {
             filters: definition.filters.map((filter) => ({
@@ -3771,13 +3959,7 @@ export class DatagramApplication {
                 visibleFieldIds: [...view.visibleFieldIds],
               })),
             ),
-            view: {
-              bindings: { views: '$result' },
-              commands: ['table.view.create'],
-              kind: 'table-views',
-              schemaVersion: 'datagram/view@1',
-              title: 'Table Views',
-            },
+            view: semanticTypeView({ views: '$result' }, 'Table Views'),
           };
         },
       }),
@@ -3787,7 +3969,7 @@ export class DatagramApplication {
         name: 'chart.open',
         run: async (context, input): Promise<QueryResult> => {
           const channel = await this.#requireChannel(input.channelId, 'chart');
-          const role = await this.#requireRole(context.actorId, input.channelId, 'viewer');
+          await this.#requireRole(context.actorId, input.channelId, 'viewer');
           const definition = await this.#requireChartDefinition(input.channelId);
           await this.#validateChartDefinition(context.actorId, definition);
           let current = await this.executeQuery(
@@ -3817,21 +3999,10 @@ export class DatagramApplication {
               presentation: toJson(definition.presentation),
               series: current.data,
             },
-            view: {
-              bindings: {
-                presentation: '$result.presentation',
-                series: '$result.series',
-              },
-              commands:
-                roleRank[role] >= roleRank.admin
-                  ? ['chart.definition.update', 'chart.event.record']
-                  : roleRank[role] >= roleRank.contributor
-                    ? ['chart.event.record']
-                    : [],
-              kind: 'chart',
-              schemaVersion: 'datagram/view@1',
-              title: channel.title,
-            },
+            view: semanticTypeView(
+              { presentation: '$result.presentation', series: '$result.series' },
+              channel.title,
+            ),
           };
         },
       }),
@@ -3844,8 +4015,7 @@ export class DatagramApplication {
         name: 'discussion.messages.list',
         run: async (context, input): Promise<QueryResult> => {
           const channel = await this.#requireChannel(input.channelId);
-          const membership = await this.store.getMembership(input.channelId, context.actorId);
-          invariant(membership, 'permission.denied', 'Channel membership is required', 403);
+          await this.#requireRole(context.actorId, input.channelId, 'viewer');
           const messages = (await this.store.listMessages(input.channelId)).filter(
             (message) => input.includeTombstoned || message.tombstonedAt === undefined,
           );
@@ -3872,21 +4042,7 @@ export class DatagramApplication {
                   : { tombstonedAt: message.tombstonedAt }),
               })),
             ),
-            view: {
-              bindings: { messages: '$result' },
-              commands:
-                membership.role === 'viewer'
-                  ? []
-                  : [
-                      'discussion.message.post',
-                      'discussion.message.edit',
-                      'discussion.message.tombstone',
-                      'discussion.message.restore',
-                    ],
-              kind: 'discussion',
-              schemaVersion: 'datagram/view@1',
-              title: `${channel.title} Discussion`,
-            },
+            view: semanticTypeView({ messages: '$result' }, `${channel.title} Discussion`),
           };
         },
       }),
@@ -3917,13 +4073,10 @@ export class DatagramApplication {
               id: revision.id,
               text: revision.text,
             })),
-            view: {
-              bindings: { revisions: '$result' },
-              commands: [],
-              kind: 'table',
-              schemaVersion: 'datagram/view@1',
-              title: `${channel.title} Message Revisions`,
-            },
+            view: semanticTypeView(
+              { revisions: '$result' },
+              `${channel.title} Message Revisions`,
+            ),
           };
         },
       }),

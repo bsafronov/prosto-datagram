@@ -110,17 +110,17 @@ export const tableChannelType = {
       targetChannelId: z.string().min(1).optional(),
       type: tableFieldTypeSchema,
       unique: z.boolean().default(false),
-    })),
+    }), undefined, { kind: 'channel-role', minimumRole: 'admin' }),
     contract('table.field.tombstone', z.object({
       channelId: channelIdSchema,
       fieldId: z.string().min(1),
       observedVersion: z.number().int().positive(),
-    })),
+    }), undefined, { kind: 'channel-role', minimumRole: 'admin' }),
     contract('table.field.restore', z.object({
       channelId: channelIdSchema,
       fieldId: z.string().min(1),
       observedVersion: z.number().int().positive(),
-    })),
+    }), undefined, { kind: 'channel-role', minimumRole: 'admin' }),
     contract('table.field.convert', z.object({
       cardinality: recordReferenceCardinalitySchema.optional(),
       cancel: z.boolean().default(false),
@@ -131,34 +131,34 @@ export const tableChannelType = {
       resolutions: z.array(conversionResolutionSchema).default([]),
       targetChannelId: z.string().min(1).optional(),
       targetType: tableFieldTypeSchema,
-    })),
+    }), undefined, { kind: 'channel-role', minimumRole: 'admin' }),
     contract('table.field.purge', z.object({
       channelId: channelIdSchema,
       fieldId: z.string().min(1),
       observedVersion: z.number().int().positive(),
-    })),
+    }), undefined, { kind: 'channel-role', minimumRole: 'admin' }),
     contract('table.record.create', z.object({
       channelId: channelIdSchema,
       values: z.record(z.string(), jsonValueSchema),
-    })),
+    }), undefined, { kind: 'channel-role', minimumRole: 'contributor' }),
     contract('table.display-field.set', z.object({
       channelId: channelIdSchema,
       fieldId: z.string().min(1).nullable(),
-    })),
+    }), undefined, { kind: 'channel-role', minimumRole: 'admin' }),
     contract('table.record.edit', z.object({
       channelId: channelIdSchema,
       observedVersions: z.record(z.string(), z.number().int().nonnegative()),
       recordId: z.string().min(1),
       values: z.record(z.string(), jsonValueSchema),
-    })),
+    }), undefined, { kind: 'channel-role', minimumRole: 'contributor' }),
     contract('table.record.tombstone', z.object({
       channelId: channelIdSchema,
       recordId: z.string().min(1),
-    })),
+    }), undefined, { kind: 'channel-role', minimumRole: 'contributor' }),
     contract('table.record.restore', z.object({
       channelId: channelIdSchema,
       recordId: z.string().min(1),
-    })),
+    }), undefined, { kind: 'channel-role', minimumRole: 'contributor' }),
     contract('table.view.create', z.object({
       channelId: channelIdSchema,
       filters: z.array(tableViewFilterSchema).default([]),
@@ -167,7 +167,7 @@ export const tableChannelType = {
       sorting: z.array(tableViewSortSchema).default([]),
       visibility: z.enum(['personal', 'shared']),
       visibleFieldIds: z.array(z.string().min(1)),
-    })),
+    }), undefined, { kind: 'channel-role', minimumRole: 'viewer' }),
     ...discussionActions,
   ],
   activityKinds: [
@@ -194,7 +194,7 @@ export const tableChannelType = {
       fieldId: z.string().min(1),
       targetChannelId: z.string().min(1).optional(),
       targetType: tableFieldTypeSchema,
-    })),
+    }), undefined, { kind: 'channel-role', minimumRole: 'admin' }),
     contract('table.configuration', z.object({ channelId: channelIdSchema })),
     contract('table.records.list', z.object({
       channelId: channelIdSchema,
@@ -257,6 +257,13 @@ export const tableChannelType = {
   version: '1.0.0',
   views: [
     {
+      commandRoles: {
+        'table.field.add': 'admin',
+        'table.field.convert': 'admin',
+        'table.field.purge': 'admin',
+        'table.field.restore': 'admin',
+        'table.field.tombstone': 'admin',
+      },
       commands: [
         'table.field.add',
         'table.field.tombstone',
@@ -270,12 +277,14 @@ export const tableChannelType = {
       query: 'table.describe',
     },
     {
+      commandRoles: { 'table.field.convert': 'admin' },
       commands: ['table.field.convert'],
       kind: 'table',
       produce: produceOwnedView,
       query: 'table.field.conversion.preview',
     },
     {
+      commandRoles: { 'table.display-field.set': 'admin' },
       commands: ['table.display-field.set'],
       kind: 'value',
       produce: produceOwnedView,
@@ -304,6 +313,7 @@ export const tableChannelType = {
       query: 'table.view.open',
     },
     {
+      commandRoles: { 'table.view.create': 'viewer' },
       commands: ['table.view.create'],
       kind: 'table-views',
       produce: produceOwnedView,

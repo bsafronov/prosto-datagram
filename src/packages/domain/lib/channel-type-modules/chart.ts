@@ -35,7 +35,7 @@ export const chartChannelType = {
       presentation: chartPresentationSchema,
       title: z.string().trim().min(1).max(160),
       typeVersion: z.string().regex(/^\d+\.\d+\.\d+$/).optional(),
-    })),
+    }), undefined, { kind: 'authenticated' }),
     contract('chart.definition.update', z.object({
       aggregations: z.array(chartAggregationSchema).min(1),
       channelId: channelIdSchema,
@@ -44,11 +44,11 @@ export const chartChannelType = {
       observedVersion: z.number().int().positive(),
       presentation: chartPresentationSchema,
       sourceChannelId: z.string().min(1),
-    })),
+    }), undefined, { kind: 'channel-role', minimumRole: 'admin' }),
     contract('chart.event.record', z.object({
       channelId: channelIdSchema,
       kind: z.enum(['insight', 'report', 'threshold']),
-    })),
+    }), undefined, { kind: 'channel-role', minimumRole: 'contributor' }),
     ...discussionActions,
   ],
   activityKinds: [
@@ -89,6 +89,10 @@ export const chartChannelType = {
   version: '1.0.0',
   views: [
     {
+      commandRoles: {
+        'chart.definition.update': 'admin',
+        'chart.event.record': 'contributor',
+      },
       commands: ['chart.definition.update', 'chart.event.record'],
       kind: 'chart',
       produce: produceOwnedView,

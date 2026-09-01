@@ -2,6 +2,8 @@ const suppliedUrl = process.env.DATAGRAM_TEST_POSTGRES_URL;
 const containerName = `datagram-postgres-check-${crypto.randomUUID()}`;
 const password = crypto.randomUUID();
 const readinessTimeoutMs = 30_000;
+const postgresImage =
+  'postgres:17-alpine@sha256:18cfe3ef5e6815560c98237d6216d1e5119702fb0f3894c8785dd58b8bbe5d73';
 const postgresProbe = `
   import { SQL } from 'bun';
 
@@ -82,7 +84,7 @@ if (suppliedUrl) {
       'POSTGRES_USER=datagram',
       '--publish',
       '127.0.0.1::5432',
-      'postgres:17-alpine',
+      postgresImage,
     ]);
     const address = await command(['docker', 'port', containerName, '5432/tcp']);
     const port = address.slice(address.lastIndexOf(':') + 1);

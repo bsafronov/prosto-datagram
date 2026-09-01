@@ -4,6 +4,8 @@ import { chartChannelType } from './channel-type-modules/chart';
 import type {
   ChannelActionCapabilities,
   ChannelQueryCapabilities,
+  ChannelViewDeclaration,
+  ChannelViewInput,
 } from './channel-type-modules/contract';
 import { dictionaryChannelType } from './channel-type-modules/dictionary';
 import { tableChannelType } from './channel-type-modules/table';
@@ -25,6 +27,11 @@ const defaultContractHandler = (
 ): Promise<any> => next(input);
 
 const channelContractSchema = z.object({
+  authorization: z.discriminatedUnion('kind', [
+    z.object({ kind: z.literal('authenticated') }),
+    z.object({ kind: z.literal('operator') }),
+    z.object({ kind: z.literal('channel-role'), minimumRole: z.enum(['viewer', 'contributor', 'admin', 'owner']) }),
+  ]),
   execute: z.custom<(
     input: any,
     next: (input: any) => Promise<any>,
@@ -109,6 +116,7 @@ const snapshotSchema = (root: z.ZodType): z.ZodType => {
 };
 
 const publicContract = (
+  authorization: ChannelTypeDefinition['actions'][number]['authorization'],
   name: string,
   schema: z.ZodType,
   execute: (
@@ -116,16 +124,16 @@ const publicContract = (
     next: (input: unknown) => Promise<unknown>,
     capabilities: ChannelActionCapabilities | ChannelQueryCapabilities,
   ) => Promise<unknown>,
-): { readonly execute: typeof execute; readonly inputSchema: z.ZodType; readonly name: string } =>
+): { readonly authorization: typeof authorization; readonly execute: typeof execute; readonly inputSchema: z.ZodType; readonly name: string } =>
   Object.defineProperties(
-    { execute, name },
+    { authorization, execute, name },
     {
       inputSchema: {
         enumerable: true,
         get: () => snapshotSchema(schema),
       },
     },
-  ) as { readonly execute: typeof execute; readonly inputSchema: z.ZodType; readonly name: string };
+  ) as { readonly authorization: typeof authorization; readonly execute: typeof execute; readonly inputSchema: z.ZodType; readonly name: string };
 
 export const channelTypeDefinitionSchema = z.object({
   actions: z.array(channelContractSchema),
@@ -137,9 +145,10 @@ export const channelTypeDefinitionSchema = z.object({
   title: z.string().min(1),
   version: z.string().regex(/^\d+\.\d+\.\d+$/),
   views: z.array(z.object({
+    commandRoles: z.record(z.string(), z.enum(['viewer', 'contributor', 'admin', 'owner'])).optional(),
     commands: z.array(z.string()),
     kind: z.string().min(1),
-    produce: z.custom<(candidate: ViewDefinition, role?: ChannelRole) => ViewDefinition>(
+    produce: z.custom<(input: ChannelViewInput, declaration: ChannelViewDeclaration) => ViewDefinition>(
       (value) => value === undefined || typeof value === 'function',
     ).optional(),
     query: z.string().min(1),
@@ -179,7 +188,7 @@ export class ChannelTypeRegistry {
             `action:${ChannelTypeRegistry.key(parsed.id, parsed.version)}:${contract.name}`,
             contract.execute,
           );
-          return publicContract(contract.name, schema, contract.execute);
+          return publicContract(contract.authorization, contract.name, schema, contract.execute);
         }),
         queries: parsed.queries.map((contract) => {
           const schema = snapshotSchema(contract.inputSchema);
@@ -191,7 +200,7 @@ export class ChannelTypeRegistry {
             `query:${ChannelTypeRegistry.key(parsed.id, parsed.version)}:${contract.name}`,
             contract.execute,
           );
-          return publicContract(contract.name, schema, contract.execute);
+          return publicContract(contract.authorization, contract.name, schema, contract.execute);
         }),
       } satisfies ChannelTypeDefinition;
       const key = ChannelTypeRegistry.key(definition.id, definition.version);
@@ -284,28 +293,9 @@ export class ChannelTypeRegistry {
     return (handler ? handler(parsed, next, capabilities) : next(parsed)) as Promise<T>;
   }
 
-  assertImplementations(
-    actionNames: ReadonlySet<string>,
-    queryNames: ReadonlySet<string>,
-  ): void {
-    for (const definition of this.#definitions.values()) {
-      for (const action of definition.actions) {
-        if (!actionNames.has(action.name)) {
-          throw new DatagramError(
-            'channel-type.action-unimplemented',
-            `Channel Type Action is not implemented: ${definition.id}@${definition.version}:${action.name}`,
-          );
-        }
-      }
-      for (const query of definition.queries) {
-        if (!queryNames.has(query.name)) {
-          throw new DatagramError(
-            'channel-type.query-unimplemented',
-            `Channel Type Query is not implemented: ${definition.id}@${definition.version}:${query.name}`,
-          );
-        }
-      }
-    }
+  requireAuthorization(id: string, version: string, kind: 'action' | 'query', name: string) {
+    const contracts = kind === 'action' ? this.require(id, version).actions : this.require(id, version).queries;
+    return contracts.find((candidate) => candidate.name === name)?.authorization;
   }
 
   validateState(id: string, version: string, contract: string, input: unknown): void {
@@ -320,8 +310,7 @@ export class ChannelTypeRegistry {
     id: string,
     version: string,
     query: string,
-    candidate: ViewDefinition,
-    role?: ChannelRole,
+    input: ChannelViewInput,
   ): ViewDefinition {
     const definition = this.require(id, version);
     const declared = definition.views.find((candidate) => candidate.query === query);
@@ -331,7 +320,12 @@ export class ChannelTypeRegistry {
         `Channel Type Query has no View Definition: ${id}@${version}:${query}`,
       );
     }
-    const view = viewDefinitionSchema.parse(declared.produce?.(candidate, role) ?? candidate);
+    const declaration: ChannelViewDeclaration = {
+      commands: declared.commands,
+      kind: declared.kind,
+      ...(declared.commandRoles === undefined ? {} : { commandRoles: declared.commandRoles }),
+    };
+    const view = viewDefinitionSchema.parse(declared.produce?.(input, declaration));
     if (
       declared.kind !== view.kind ||
       view.commands.some((command) => !declared.commands.includes(command))

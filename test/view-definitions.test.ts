@@ -261,5 +261,21 @@ describe('semantic View Definitions', () => {
       { channelId: channel.subject!.id },
     );
     expect(configuration.view.commands).toEqual([]);
+    const availableViews = await value.app.executeQuery(
+      viewer.subject!.id,
+      'cli',
+      'table.views.list',
+      { channelId: channel.subject!.id },
+    );
+    expect(availableViews.view.commands).toEqual(['table.view.create']);
+    await expect(value.app.executeAction(viewer.subject!.id, 'cli', 'table.view.create', {
+      channelId: channel.subject!.id,
+      filters: [],
+      grouping: [],
+      name: 'My personal view',
+      sorting: [],
+      visibility: 'personal',
+      visibleFieldIds: [],
+    })).resolves.toMatchObject({ action: 'table.view.create' });
   });
 });

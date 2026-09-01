@@ -36,20 +36,20 @@ export const dictionaryChannelType = {
     contract('dictionary.entry.create', z.object({
       channelId: channelIdSchema,
       label: dictionaryLabelSchema,
-    })),
+    }), undefined, { kind: 'channel-role', minimumRole: 'contributor' }),
     contract('dictionary.entry.rename', z.object({
       channelId: channelIdSchema,
       entryId: z.string().min(1),
       label: dictionaryLabelSchema,
-    })),
+    }), undefined, { kind: 'channel-role', minimumRole: 'contributor' }),
     contract('dictionary.entry.retire', z.object({
       channelId: channelIdSchema,
       entryId: z.string().min(1),
-    })),
+    }), undefined, { kind: 'channel-role', minimumRole: 'contributor' }),
     contract('dictionary.entry.restore', z.object({
       channelId: channelIdSchema,
       entryId: z.string().min(1),
-    })),
+    }), undefined, { kind: 'channel-role', minimumRole: 'contributor' }),
     ...discussionActions,
   ],
   activityKinds: [

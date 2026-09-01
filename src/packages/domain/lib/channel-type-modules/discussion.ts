@@ -8,20 +8,20 @@ export const discussionActions = [
     recordReferences: z.array(z.string().min(1)).default([]),
     replyToMessageId: z.string().min(1).optional(),
     text: z.string().trim().min(1).max(20_000),
-  })),
+  }), undefined, { kind: 'channel-role', minimumRole: 'contributor' }),
   contract('discussion.message.edit', z.object({
     channelId: channelIdSchema,
     messageId: z.string().min(1),
     text: z.string().trim().min(1).max(20_000),
-  })),
+  }), undefined, { kind: 'channel-role', minimumRole: 'contributor' }),
   contract('discussion.message.tombstone', z.object({
     channelId: channelIdSchema,
     messageId: z.string().min(1),
-  })),
+  }), undefined, { kind: 'channel-role', minimumRole: 'contributor' }),
   contract('discussion.message.restore', z.object({
     channelId: channelIdSchema,
     messageId: z.string().min(1),
-  })),
+  }), undefined, { kind: 'channel-role', minimumRole: 'contributor' }),
 ];
 
 export const discussionActivityKinds = [

@@ -43,6 +43,10 @@ type ContractSchemaResolver = (
   name: string,
 ) => z.ZodType | undefined;
 
+type SelectedContractResolver = (
+  selector: ChannelTypeContractSelector,
+) => readonly { readonly inputSchema: z.ZodType; readonly name: string }[];
+
 export const defineAction = <TInput>(definition: {
   readonly description: string;
   readonly inputSchema: z.ZodType<TInput>;
@@ -106,23 +110,48 @@ export class ActionRegistry {
   readonly #registry: DefinitionRegistry<ActionDefinition>;
   readonly #schemaResolver: ContractSchemaResolver | undefined;
   readonly #channelContractNames: ReadonlySet<string>;
+  readonly #selectedContracts: SelectedContractResolver | undefined;
 
   constructor(
     definitions: readonly ActionDefinition[],
     schemaResolver?: ContractSchemaResolver,
     channelContractNames: ReadonlySet<string> = new Set(),
+    selectedContracts?: SelectedContractResolver,
   ) {
     this.#registry = new DefinitionRegistry(definitions, 'action.duplicate');
     this.#schemaResolver = schemaResolver;
     this.#channelContractNames = channelContractNames;
+    this.#selectedContracts = selectedContracts;
   }
 
   list(selector?: ChannelTypeContractSelector): readonly ActionDefinition[] {
-    return this.#registry.list(this.#selectedSchemaResolver(selector));
+    const definitions = this.#registry.list(this.#selectedSchemaResolver(selector));
+    if (!selector || !this.#selectedContracts) return definitions;
+    const names = new Set(definitions.map((definition) => definition.name));
+    return [
+      ...definitions,
+      ...this.#selectedContracts(selector)
+        .filter((contract) => !names.has(contract.name))
+        .map((contract): ActionDefinition => ({
+          description: `Channel Type Action: ${contract.name}`,
+          inputSchema: contract.inputSchema,
+          name: contract.name,
+          run: async () => {
+            throw new DatagramError(
+              'channel-type.handler-required',
+              `Channel Type Action must execute through its pinned definition: ${contract.name}`,
+            );
+          },
+        })),
+    ];
   }
 
   catalog(selector?: ChannelTypeContractSelector): readonly ContractDefinition[] {
-    return this.#registry.catalog(this.#selectedSchemaResolver(selector));
+    return this.list(selector).map(({ description, inputSchema, name }) => ({
+      description,
+      inputSchema: z.toJSONSchema(inputSchema, { unrepresentable: 'any' }),
+      name,
+    }));
   }
 
   #selectedSchemaResolver(
@@ -149,23 +178,48 @@ export class QueryRegistry {
   readonly #registry: DefinitionRegistry<QueryDefinition>;
   readonly #schemaResolver: ContractSchemaResolver | undefined;
   readonly #channelContractNames: ReadonlySet<string>;
+  readonly #selectedContracts: SelectedContractResolver | undefined;
 
   constructor(
     definitions: readonly QueryDefinition[],
     schemaResolver?: ContractSchemaResolver,
     channelContractNames: ReadonlySet<string> = new Set(),
+    selectedContracts?: SelectedContractResolver,
   ) {
     this.#registry = new DefinitionRegistry(definitions, 'query.duplicate');
     this.#schemaResolver = schemaResolver;
     this.#channelContractNames = channelContractNames;
+    this.#selectedContracts = selectedContracts;
   }
 
   list(selector?: ChannelTypeContractSelector): readonly QueryDefinition[] {
-    return this.#registry.list(this.#selectedSchemaResolver(selector));
+    const definitions = this.#registry.list(this.#selectedSchemaResolver(selector));
+    if (!selector || !this.#selectedContracts) return definitions;
+    const names = new Set(definitions.map((definition) => definition.name));
+    return [
+      ...definitions,
+      ...this.#selectedContracts(selector)
+        .filter((contract) => !names.has(contract.name))
+        .map((contract): QueryDefinition => ({
+          description: `Channel Type Query: ${contract.name}`,
+          inputSchema: contract.inputSchema,
+          name: contract.name,
+          run: async () => {
+            throw new DatagramError(
+              'channel-type.handler-required',
+              `Channel Type Query must execute through its pinned definition: ${contract.name}`,
+            );
+          },
+        })),
+    ];
   }
 
   catalog(selector?: ChannelTypeContractSelector): readonly ContractDefinition[] {
-    return this.#registry.catalog(this.#selectedSchemaResolver(selector));
+    return this.list(selector).map(({ description, inputSchema, name }) => ({
+      description,
+      inputSchema: z.toJSONSchema(inputSchema, { unrepresentable: 'any' }),
+      name,
+    }));
   }
 
   #selectedSchemaResolver(
