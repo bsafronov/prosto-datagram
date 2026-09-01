@@ -80,7 +80,7 @@ describe('universal Discussion lifecycle', () => {
     const contributorId = await createPerson(value, 'Contributor');
 
     for (const type of bundledChannelTypes) {
-      expect(type.actions).toEqual(
+      expect(type.actions.map((action) => action.name)).toEqual(
         expect.arrayContaining([
           'discussion.message.post',
           'discussion.message.edit',

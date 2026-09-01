@@ -105,9 +105,10 @@ export class ActionRegistry {
     name: string,
     context: ExecutionContext,
     rawInput: unknown,
+    inputSchema?: z.ZodType,
   ): Promise<ActionReceipt> {
     const definition = this.#registry.require(name, 'action.unknown');
-    return definition.run(context, definition.inputSchema.parse(rawInput));
+    return definition.run(context, (inputSchema ?? definition.inputSchema).parse(rawInput));
   }
 }
 
@@ -130,9 +131,13 @@ export class QueryRegistry {
     name: string,
     context: ExecutionContext,
     rawInput: unknown,
+    inputSchema?: z.ZodType,
   ): Promise<QueryResult> {
     const definition = this.#registry.require(name, 'query.unknown');
-    const result = await definition.run(context, definition.inputSchema.parse(rawInput));
+    const result = await definition.run(
+      context,
+      (inputSchema ?? definition.inputSchema).parse(rawInput),
+    );
     return { ...result, view: viewDefinitionSchema.parse(result.view) };
   }
 }

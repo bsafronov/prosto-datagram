@@ -223,4 +223,36 @@ describe('semantic View Definitions', () => {
     );
     expect(viewerHandle.view.commands).toEqual([]);
   });
+
+  test('filters durable Table View mutation commands by Channel Role', async () => {
+    const value = await runtime();
+    const channel = await value.app.executeAction(value.owner.id, 'cli', 'channel.create', {
+      title: 'Read-only view',
+      typeId: 'table',
+    });
+    await value.app.executeAction(value.owner.id, 'cli', 'table.view.create', {
+      channelId: channel.subject!.id,
+      filters: [],
+      grouping: [],
+      name: 'All records',
+      sorting: [],
+      visibility: 'shared',
+      visibleFieldIds: [],
+    });
+    const view = (await value.store.listTableViews(channel.subject!.id, value.owner.id))[0]!;
+    const viewer = await value.app.executeAction(value.owner.id, 'cli', 'service.person.create', {
+      displayName: 'Viewer',
+    });
+    await value.app.executeAction(value.owner.id, 'cli', 'channel.member.grant', {
+      channelId: channel.subject!.id,
+      personId: viewer.subject!.id,
+      role: 'viewer',
+    });
+
+    const opened = await value.app.executeQuery(viewer.subject!.id, 'cli', 'table.view.open', {
+      channelId: channel.subject!.id,
+      viewId: view.id,
+    });
+    expect(opened.view.commands).toEqual([]);
+  });
 });

@@ -1,6 +1,11 @@
 import * as z from 'zod/v4';
 
-import { ChannelTypeRegistry } from '../../domain/channel-types';
+import {
+  ChannelTypeRegistry,
+  dictionaryLabelKey,
+  normalizeDictionaryLabel,
+  validateTableFieldValue,
+} from '../../domain/channel-types';
 import { DatagramError, invariant } from '../../domain/errors';
 import {
   channelRoleSchema,
@@ -54,19 +59,10 @@ const roleRank: Readonly<Record<ChannelRole, number>> = {
 
 const optionalJsonValueSchema = jsonValueSchema.optional();
 
-const normalizeDictionaryLabel = (value: string): string => value.trim().normalize('NFC');
-
 const dictionaryLabelSchema = z
   .string()
   .transform(normalizeDictionaryLabel)
   .pipe(z.string().min(1).max(160));
-
-const dictionaryLabelKey = (value: string): string =>
-  normalizeDictionaryLabel(value)
-    .normalize('NFKC')
-    .toUpperCase()
-    .toLowerCase()
-    .normalize('NFKC');
 
 const tableViewFilterSchema = z.object({
   fieldId: z.string().min(1),
@@ -121,8 +117,14 @@ export class DatagramApplication {
     handles = new ResultHandleBroker(),
   ) {
     this.handles = handles;
-    this.actions = new ActionRegistry(this.#actionDefinitions());
-    this.queries = new QueryRegistry(this.#queryDefinitions());
+    const actions = this.#actionDefinitions();
+    const queries = this.#queryDefinitions();
+    this.channelTypes.assertImplementations(
+      new Set(actions.map((definition) => definition.name)),
+      new Set(queries.map((definition) => definition.name)),
+    );
+    this.actions = new ActionRegistry(actions);
+    this.queries = new QueryRegistry(queries);
   }
 
   async verifyServiceIdentity(actorId: string): Promise<{ readonly actorId: string }> {
@@ -137,7 +139,12 @@ export class DatagramApplication {
     input: unknown,
   ): Promise<ActionReceipt> {
     await this.#requirePerson(actorId);
-    return this.actions.execute(name, { actorId, origin }, input);
+    return this.actions.execute(
+      name,
+      { actorId, origin },
+      input,
+      await this.#channelContractSchema('action', name, input),
+    );
   }
 
   async executeQuery(
@@ -147,7 +154,57 @@ export class DatagramApplication {
     input: unknown,
   ): Promise<QueryResult> {
     await this.#requirePerson(actorId);
-    return this.queries.execute(name, { actorId, origin }, input);
+    const result = await this.queries.execute(
+      name,
+      { actorId, origin },
+      input,
+      await this.#channelContractSchema('query', name, input),
+    );
+    if (input !== null && !Array.isArray(input) && typeof input === 'object') {
+      const channelId = (input as Record<string, unknown>).channelId;
+      if (typeof channelId === 'string') {
+        const channel = await this.store.getChannel(channelId);
+        const definition = channel
+          ? this.channelTypes.require(channel.typeId, channel.typeVersion)
+          : undefined;
+        if (definition?.queries.some((query) => query.name === name)) {
+          this.channelTypes.assertView(channel!.typeId, channel!.typeVersion, name, result.view);
+        }
+      }
+    }
+    return result;
+  }
+
+  async #channelContractSchema(
+    kind: 'action' | 'query',
+    name: string,
+    rawInput: unknown,
+  ): Promise<z.ZodType | undefined> {
+    if (rawInput === null || Array.isArray(rawInput) || typeof rawInput !== 'object') {
+      return undefined;
+    }
+    const input = rawInput as Record<string, unknown>;
+    let typeId: string | undefined;
+    let typeVersion: string | undefined;
+    if (typeof input.channelId === 'string') {
+      const channel = await this.store.getChannel(input.channelId);
+      if (channel) {
+        typeId = channel.typeId;
+        typeVersion = channel.typeVersion;
+      }
+    } else if (name === 'channel.create' && typeof input.typeId === 'string') {
+      const type = this.channelTypes.requireCurrent(input.typeId);
+      typeId = type.id;
+      typeVersion = type.version;
+    } else if (name === 'chart.create') {
+      const type = this.channelTypes.requireCurrent('chart');
+      typeId = type.id;
+      typeVersion = type.version;
+    }
+    if (!typeId || !typeVersion) return undefined;
+    return kind === 'action'
+      ? this.channelTypes.requireAction(typeId, typeVersion, name)
+      : this.channelTypes.requireQuery(typeId, typeVersion, name);
   }
 
   async prepareQuery(
@@ -257,6 +314,8 @@ export class DatagramApplication {
     const channelId = event.type === 'activity' ? event.activity.channelId : event.channelId;
     if (event.type === 'operation-result' && event.actorId !== actorId) return false;
     if (channelId === undefined) return true;
+    const channel = await this.store.getChannel(channelId);
+    if (channel) this.channelTypes.require(channel.typeId, channel.typeVersion);
     return (await this.store.getMembership(channelId, actorId)) !== null;
   }
 
@@ -276,6 +335,7 @@ export class DatagramApplication {
   async #requireChannel(channelId: string, typeId?: string): Promise<Channel> {
     const channel = await this.store.getChannel(channelId);
     invariant(channel, 'channel.not-found', 'Channel does not exist', 404);
+    this.channelTypes.require(channel.typeId, channel.typeVersion);
     invariant(channel.purgedAt === undefined, 'channel.purged', 'Channel was purged', 410);
     invariant(channel.deletedAt === undefined, 'channel.deleted', 'Channel is deleted', 410);
     if (typeId) {
@@ -291,6 +351,7 @@ export class DatagramApplication {
   async #requireStoredChannel(channelId: string): Promise<Channel> {
     const channel = await this.store.getChannel(channelId);
     invariant(channel, 'channel.not-found', 'Channel does not exist', 404);
+    this.channelTypes.require(channel.typeId, channel.typeVersion);
     invariant(channel.purgedAt === undefined, 'channel.purged', 'Channel was purged', 410);
     return channel;
   }
@@ -466,7 +527,7 @@ export class DatagramApplication {
         name: 'channel.create',
         run: async (context, input) => {
           await this.#requirePerson(context.actorId);
-          const type = this.channelTypes.require(input.typeId);
+          const type = this.channelTypes.requireCurrent(input.typeId);
           invariant(
             type.id !== 'chart',
             'chart.definition-required',
@@ -1704,7 +1765,12 @@ export class DatagramApplication {
             'Dictionary Field requires one target Dictionary Channel',
           );
           if (isRecordReference) {
-            await this.#requireChannel(input.targetChannelId!, 'table');
+            const target = await this.#requireChannel(input.targetChannelId!);
+            invariant(
+              this.channelTypes.require(target.typeId, target.typeVersion).recordKinds.length > 0,
+              'table.record-reference-invalid',
+              'Target Channel Type does not expose Channel Records',
+            );
             await this.#requireRole(context.actorId, input.targetChannelId!, 'viewer');
           } else if (isDictionary) {
             await this.#requireChannel(input.targetChannelId!, 'dictionary');
@@ -2036,7 +2102,12 @@ export class DatagramApplication {
             'Dictionary Field requires one target Dictionary Channel',
           );
           if (isRecordReference) {
-            await this.#requireChannel(input.targetChannelId!, 'table');
+            const target = await this.#requireChannel(input.targetChannelId!);
+            invariant(
+              this.channelTypes.require(target.typeId, target.typeVersion).recordKinds.length > 0,
+              'table.record-reference-invalid',
+              'Target Channel Type does not expose Channel Records',
+            );
             await this.#requireRole(context.actorId, input.targetChannelId!, 'viewer');
           } else if (isDictionary) {
             await this.#requireChannel(input.targetChannelId!, 'dictionary');
@@ -2633,7 +2704,7 @@ export class DatagramApplication {
             },
             1,
           );
-          const type = this.channelTypes.require('chart');
+          const type = this.channelTypes.requireCurrent('chart');
           const occurredAt = nowIso();
           const channel: Channel = {
             createdAt: occurredAt,
@@ -3087,6 +3158,9 @@ export class DatagramApplication {
         run: async (context, input): Promise<QueryResult> => {
           await this.#requirePerson(context.actorId);
           const items = await this.store.listChannelNavigation(context.actorId);
+          for (const item of items) {
+            this.channelTypes.require(item.channel.typeId, item.channel.typeVersion);
+          }
           const groups = await this.store.listChannelGroups(context.actorId);
           const entries = (
             await Promise.all(groups.map((group) => this.store.listChannelGroupEntries(group.id)))
@@ -3290,7 +3364,12 @@ export class DatagramApplication {
             'Dictionary Field requires one target Dictionary Channel',
           );
           if (isRecordReference) {
-            await this.#requireChannel(input.targetChannelId!, 'table');
+            const target = await this.#requireChannel(input.targetChannelId!);
+            invariant(
+              this.channelTypes.require(target.typeId, target.typeVersion).recordKinds.length > 0,
+              'table.record-reference-invalid',
+              'Target Channel Type does not expose Channel Records',
+            );
             await this.#requireRole(context.actorId, input.targetChannelId!, 'viewer');
           } else if (isDictionary) {
             await this.#requireChannel(input.targetChannelId!, 'dictionary');
@@ -3435,7 +3514,7 @@ export class DatagramApplication {
         name: 'table.view.open',
         run: async (context, input): Promise<QueryResult> => {
           await this.#requireChannel(input.channelId, 'table');
-          await this.#requireRole(context.actorId, input.channelId, 'viewer');
+          const role = await this.#requireRole(context.actorId, input.channelId, 'viewer');
           const definition = (await this.store.listTableViews(input.channelId, context.actorId)).find(
             (view) => view.id === input.viewId,
           );
@@ -3472,12 +3551,15 @@ export class DatagramApplication {
             }),
             view: {
               bindings: { rows: '$result' },
-              commands: [
-                'table.record.create',
-                'table.record.edit',
-                'table.record.tombstone',
-                'table.record.restore',
-              ],
+              commands:
+                roleRank[role] >= roleRank.contributor
+                  ? [
+                      'table.record.create',
+                      'table.record.edit',
+                      'table.record.tombstone',
+                      'table.record.restore',
+                    ]
+                  : [],
               kind: 'table-records',
               schemaVersion: 'datagram/view@1',
               title: definition.name,
@@ -3923,15 +4005,21 @@ export class DatagramApplication {
     ) {
       return { channelId, ...(recordId ? { recordId } : {}), status: 'unresolved' };
     }
+    let type;
+    try {
+      type = this.channelTypes.require(channel.typeId, channel.typeVersion);
+    } catch (error) {
+      if (error instanceof DatagramError && error.code === 'channel-type.version-unavailable') {
+        return { channelId, ...(recordId ? { recordId } : {}), status: 'unresolved' };
+      }
+      throw error;
+    }
     if (recordId !== undefined) {
-      const record = await this.store.getTableRecord(recordId);
-      if (
-        !record ||
-        record.channelId !== channelId ||
-        record.tombstonedAt !== undefined
-      ) {
+      const status = await this.#channelRecordStatus(type.recordKinds, channelId, recordId);
+      if (status === 'unresolved') {
         return { channelId, recordId, status: 'unresolved' };
       }
+      if (status === 'retired') return { channelId, recordId, status };
     }
     return { channelId, ...(recordId ? { recordId } : {}), status: 'resolved' };
   }
@@ -4039,57 +4127,7 @@ export class DatagramApplication {
   }
 
   #validateFieldValue(field: TableField, rawValue: unknown): JsonValue {
-    const value = toJson(rawValue);
-    switch (field.type) {
-      case 'text':
-        invariant(typeof value === 'string', 'table.field-type', 'Expected text value');
-        return value;
-      case 'number':
-        invariant(
-          typeof value === 'number' && Number.isFinite(value),
-          'table.field-type',
-          'Expected finite number value',
-        );
-        return value;
-      case 'boolean':
-        invariant(typeof value === 'boolean', 'table.field-type', 'Expected boolean value');
-        return value;
-      case 'date-time':
-        invariant(
-          typeof value === 'string' && z.iso.datetime({ offset: true }).safeParse(value).success,
-          'table.field-type',
-          'Expected ISO date-time value',
-        );
-        return value;
-      case 'dictionary':
-        invariant(
-          typeof value === 'string',
-          'table.field-type',
-          `Expected stable identity for ${field.type} value`,
-        );
-        return value;
-      case 'record-reference':
-        invariant(
-          field.cardinality === 'one'
-            ? typeof value === 'string'
-            : Array.isArray(value) && value.every((item) => typeof item === 'string'),
-          'table.field-reference-cardinality',
-          `Expected ${field.cardinality ?? 'configured'} Record Reference value`,
-        );
-        if (Array.isArray(value)) {
-          invariant(
-            new Set(value).size === value.length,
-            'table.field-reference-duplicate',
-            'Record Reference values must be unique',
-          );
-        }
-        return value;
-      default:
-        throw new DatagramError(
-          'table.field-type',
-          `Unsupported Field type: ${String(field.type)}`,
-        );
-    }
+    return validateTableFieldValue(field, rawValue);
   }
 
   async #validateRecordReferenceTargets(
@@ -4105,11 +4143,22 @@ export class DatagramApplication {
     );
     const channel = await this.store.getChannel(field.targetChannelId);
     const membership = await this.store.getMembership(field.targetChannelId, actorId);
+    let recordKinds: readonly ('dictionary-entry' | 'discussion-message' | 'table-record')[] = [];
+    if (channel) {
+      try {
+        recordKinds = this.channelTypes.require(channel.typeId, channel.typeVersion).recordKinds;
+      } catch (error) {
+        if (!(error instanceof DatagramError && error.code === 'channel-type.version-unavailable')) {
+          throw error;
+        }
+      }
+    }
     invariant(
-      channel?.typeId === 'table' &&
+      channel !== null &&
         channel.deletedAt === undefined &&
         channel.purgedAt === undefined &&
-        membership !== null,
+        membership !== null &&
+        recordKinds.length > 0,
       'table.record-reference-invalid',
       'Record Reference target is unavailable',
     );
@@ -4120,13 +4169,39 @@ export class DatagramApplication {
           ? value.filter((recordId): recordId is string => typeof recordId === 'string')
           : [];
     for (const recordId of recordIds) {
-      const record = await this.store.getTableRecord(recordId);
       invariant(
-        record?.channelId === field.targetChannelId && record.tombstonedAt === undefined,
+        (await this.#channelRecordStatus(recordKinds, field.targetChannelId, recordId)) !==
+          'unresolved',
         'table.record-reference-invalid',
         'Record Reference target is unavailable',
       );
     }
+  }
+
+  async #channelRecordStatus(
+    recordKinds: readonly ('dictionary-entry' | 'discussion-message' | 'table-record')[],
+    channelId: string,
+    recordId: string,
+  ): Promise<'resolved' | 'retired' | 'unresolved'> {
+    if (recordKinds.includes('table-record')) {
+      const record = await this.store.getTableRecord(recordId);
+      if (record?.channelId === channelId) {
+        return record.tombstonedAt === undefined ? 'resolved' : 'unresolved';
+      }
+    }
+    if (recordKinds.includes('dictionary-entry')) {
+      const entry = await this.store.getDictionaryEntry(recordId);
+      if (entry?.channelId === channelId) {
+        return entry.retiredAt === undefined ? 'resolved' : 'retired';
+      }
+    }
+    if (recordKinds.includes('discussion-message')) {
+      const message = await this.store.getMessage(recordId);
+      if (message?.channelId === channelId) {
+        return message.tombstonedAt === undefined ? 'resolved' : 'unresolved';
+      }
+    }
+    return 'unresolved';
   }
 
   async #validateDictionaryEntry(

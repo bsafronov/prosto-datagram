@@ -71,6 +71,53 @@ afterEach(async () => {
 });
 
 describe('Record Reference Fields', () => {
+  test('targets Dictionary Entries and Discussion Messages through stable Channel Record identities', async () => {
+    const { sourceChannelId, value } = await setup();
+    const dictionary = await value.app.executeAction(value.owner.id, 'cli', 'channel.create', {
+      title: 'Reference vocabulary',
+      typeId: 'dictionary',
+    });
+    const targetChannelId = dictionary.subject!.id;
+    const entry = await value.app.executeAction(value.owner.id, 'cli', 'dictionary.entry.create', {
+      channelId: targetChannelId,
+      label: 'Stable entry',
+    });
+    const message = await value.app.executeAction(value.owner.id, 'cli', 'discussion.message.post', {
+      channelId: targetChannelId,
+      text: 'Stable message',
+    });
+    await addReferenceField(value, sourceChannelId, targetChannelId, 'targets', 'many');
+    const source = await value.app.executeAction(value.owner.id, 'cli', 'table.record.create', {
+      channelId: sourceChannelId,
+      values: { targets: [entry.subject!.id, message.subject!.id] },
+    });
+
+    const values = async () =>
+      ((await value.app.executeQuery(value.owner.id, 'cli', 'table.records.list', {
+        channelId: sourceChannelId,
+      })).data as Array<{ values: { targets: unknown[] } }>)[0]!.values.targets;
+    expect(await values()).toEqual([
+      { channelId: targetChannelId, recordId: entry.subject!.id, status: 'resolved' },
+      { channelId: targetChannelId, recordId: message.subject!.id, status: 'resolved' },
+    ]);
+
+    await value.app.executeAction(value.owner.id, 'cli', 'dictionary.entry.retire', {
+      channelId: targetChannelId,
+      entryId: entry.subject!.id,
+    });
+    await value.app.executeAction(value.owner.id, 'cli', 'discussion.message.tombstone', {
+      channelId: targetChannelId,
+      messageId: message.subject!.id,
+    });
+    expect(await values()).toEqual([
+      { channelId: targetChannelId, recordId: entry.subject!.id, status: 'retired' },
+      { channelId: targetChannelId, recordId: message.subject!.id, status: 'unresolved' },
+    ]);
+    expect(await value.store.getTableRecord(source.subject!.id)).toMatchObject({
+      values: { targets: [entry.subject!.id, message.subject!.id] },
+    });
+  });
+
   test('declare one target and cardinality, storing only validated stable identities', async () => {
     const { sourceChannelId, targetChannelId, value } = await setup();
     const first = await createTarget(value, targetChannelId, 'First secret');

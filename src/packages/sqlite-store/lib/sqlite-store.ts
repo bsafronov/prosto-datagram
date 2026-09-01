@@ -1,6 +1,12 @@
 import { Database } from 'bun:sqlite';
 
 import {
+  applyTableRecordUpdate,
+  parseRecordState,
+  validatePostedMessage,
+} from '../../application/transitions';
+
+import {
   newId,
   nowIso,
   type Channel,
@@ -1173,7 +1179,7 @@ export class SqliteStore implements DatagramStore {
   async commit(operation: Operation): Promise<void> {
     const apply = this.#database.transaction((candidate: Operation) => {
       for (const change of candidate.changes) {
-        if (change.kind !== 'activity.appended') this.#applyChange(change);
+        if (change.kind !== 'activity.appended') this.#persistChange(change);
       }
 
       const invalidOwnership = this.#database
@@ -1212,7 +1218,7 @@ export class SqliteStore implements DatagramStore {
       );
 
       for (const change of candidate.changes) {
-        if (change.kind === 'activity.appended') this.#applyChange(change);
+        if (change.kind === 'activity.appended') this.#persistChange(change);
       }
 
       for (const change of candidate.changes) {
@@ -1247,7 +1253,7 @@ export class SqliteStore implements DatagramStore {
     apply(operation);
   }
 
-  #applyChange(change: DomainChange): void {
+  #persistChange(change: DomainChange): void {
     switch (change.kind) {
       case 'person.created':
         this.#database.run(
@@ -1712,27 +1718,38 @@ export class SqliteStore implements DatagramStore {
         return;
       case 'table.record-updated': {
         const row = this.#database
-          .query('SELECT values_json, field_versions_json FROM table_records WHERE id = ?')
+          .query(
+            `SELECT channel_id, created_by, created_at, values_json, field_versions_json
+             FROM table_records WHERE id = ?`,
+          )
           .get(change.recordId) as {
+          channel_id: string;
+          created_at: string;
+          created_by: string;
           field_versions_json: string;
           values_json: string;
         } | null;
         if (!row) throw new Error('Table Record is unavailable');
-        const values = JSON.parse(row.values_json) as Record<string, JsonValue>;
-        const versions = JSON.parse(row.field_versions_json) as Record<string, number>;
-        for (const [key, expected] of Object.entries(change.expectedVersions ?? {})) {
-          if ((versions[key] ?? 0) !== expected) {
-            throw new Error(`Table Field value changed after observation: ${key}`);
-          }
-        }
-        const changedKeys = new Set([...Object.keys(change.values), ...(change.removedKeys ?? [])]);
-        for (const [key, value] of Object.entries(change.values)) values[key] = value;
-        for (const key of change.removedKeys ?? []) delete values[key];
-        for (const key of changedKeys) versions[key] = (versions[key] ?? 0) + 1;
+        const next = applyTableRecordUpdate(
+          parseRecordState(
+            change.recordId,
+            row.channel_id,
+            row.created_by,
+            row.created_at,
+            row.values_json,
+            row.field_versions_json,
+          ),
+          change,
+        );
         const result = this.#database.run(
           `UPDATE table_records
            SET values_json = ?, field_versions_json = ?, updated_at = ? WHERE id = ?`,
-          [JSON.stringify(values), JSON.stringify(versions), change.updatedAt, change.recordId],
+          [
+            JSON.stringify(next.values),
+            JSON.stringify(next.fieldVersions),
+            change.updatedAt,
+            change.recordId,
+          ],
         );
         if (result.changes !== 1) throw new Error('Table Record is unavailable');
         return;
@@ -1845,25 +1862,16 @@ export class SqliteStore implements DatagramStore {
         return;
       }
       case 'discussion.message-posted':
-        if (change.message.revisions.length !== 1) {
-          throw new Error('Posted Message must have exactly one initial revision');
-        }
-        if (
-          change.message.revisions[0]!.editorId !== change.message.authorId ||
-          change.message.revisions[0]!.text !== change.message.text
-        ) {
-          throw new Error('Initial Message revision must match posted Message');
-        }
+        let replyTargetChannelId: string | undefined;
         if (change.message.replyToMessageId !== undefined) {
           const replyTarget = this.#database
             .query('SELECT channel_id FROM messages WHERE id = ?')
             .get(change.message.replyToMessageId) as {
             channel_id: string;
           } | null;
-          if (replyTarget?.channel_id !== change.message.channelId) {
-            throw new Error('Reply target must belong to the same Channel Discussion');
-          }
+          replyTargetChannelId = replyTarget?.channel_id;
         }
+        validatePostedMessage(change.message, replyTargetChannelId);
         this.#database.run(
           `INSERT INTO messages
             (id, channel_id, author_id, text, record_references_json, reply_to_message_id,
