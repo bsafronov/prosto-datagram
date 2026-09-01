@@ -617,49 +617,47 @@ export class DatagramApplication {
                 invariant(isReference ? intent.targetChannelId !== undefined && intent.cardinality !== undefined : intent.cardinality === undefined, 'table.field-reference-configuration', 'Record Reference Field requires one target Channel and cardinality');
                 invariant(isDictionary ? intent.targetChannelId !== undefined : isReference || intent.targetChannelId === undefined, 'table.field-dictionary-configuration', 'Dictionary Field requires one target Dictionary Channel');
                 const { cardinality: _oldCardinality, defaultValue: _oldDefault, targetChannelId: _oldTarget, ...base } = stored;
-                invariant(
-                  (stored.defaultValue === undefined) === (intent.defaultValue === undefined),
-                  'table.field-conversion-default-unresolved',
-                  'Field conversion must preserve or explicitly resolve its existing default',
-                  409,
-                );
                 field = {
                   ...base,
                   ...(intent.cardinality === undefined ? {} : { cardinality: intent.cardinality }),
-                  ...(intent.defaultValue === undefined ? {} : { defaultValue: intent.defaultValue }),
                   ...(intent.targetChannelId === undefined ? {} : { targetChannelId: intent.targetChannelId }),
                   type: intent.targetType,
                   version: stored.version + 1,
                 };
                 await this.#channelTypeState(actorId, selectedChannelId, { typeId: contract.typeId, typeVersion: contract.typeVersion })
                   .then((state) => state.validateTableFieldTarget(field));
-                if (field.defaultValue !== undefined) {
-                  invariant(!(field.required && field.defaultValue === null), 'table.record-required-field', `Required Field cannot default to null: ${field.key}`);
-                  if (field.defaultValue !== null) {
-                    this.#validateFieldValue(field, field.defaultValue);
-                    await this.#validateRecordReferenceTargets(actorId, field, field.defaultValue);
-                    if (field.type === 'dictionary') await this.#validateDictionaryEntry(actorId, field, field.defaultValue);
+                const resolveValue = async (resolution: { readonly kind: 'correct' | 'map' | 'null'; readonly value?: JsonValue }): Promise<JsonValue> => {
+                  if (resolution.kind === 'null') {
+                    invariant(!stored.required, 'table.field-conversion-null-required', 'Required Field cannot be explicitly nulled');
+                    invariant(resolution.value === undefined, 'table.field-conversion-resolution-invalid', 'Null resolution cannot include a value');
+                    return null;
                   }
-                  if (stored.defaultValue !== undefined && stored.defaultValue !== null) {
-                    let oldDefaultCompatible = true;
-                    try { this.#validateFieldValue(field, stored.defaultValue); } catch { oldDefaultCompatible = false; }
-                    invariant(
-                      !oldDefaultCompatible || JSON.stringify(field.defaultValue) === JSON.stringify(stored.defaultValue),
-                      'table.field-conversion-default-unresolved',
-                      'Compatible Field defaults must remain unchanged during conversion',
-                      409,
-                    );
-                  }
-                }
+                  invariant(resolution.value !== undefined && resolution.value !== null, 'table.field-conversion-resolution-required', 'Correction or mapping needs a replacement value');
+                  invariant(await this.#fieldAccepts(actorId, field, resolution.value), 'table.field-conversion-resolution-invalid', 'Replacement value is incompatible with target Field');
+                  return resolution.value;
+                };
+                const defaultFails = stored.defaultValue !== undefined && stored.defaultValue !== null &&
+                  !(await this.#fieldAccepts(actorId, field, stored.defaultValue));
+                invariant(
+                  defaultFails === (intent.defaultResolution !== undefined),
+                  'table.field-conversion-default-unresolved',
+                  defaultFails ? 'Incompatible default value needs one explicit resolution' : 'Default resolution does not match an incompatible default',
+                  409,
+                );
+                const nextDefault = intent.defaultResolution
+                  ? await resolveValue(intent.defaultResolution)
+                  : stored.defaultValue;
+                field = { ...field, ...(nextDefault === undefined ? {} : { defaultValue: nextDefault }) };
                 const records = await this.store.listTableRecords(selectedChannelId);
-                const updates = new Map(intent.recordUpdates.map((update) => [update.recordId, update.value]));
-                invariant(updates.size === intent.recordUpdates.length, 'table.field-conversion-resolution-duplicate', 'Each Record may have one conversion resolution');
-                const failures = records.filter((record) => {
+                const failures = (await Promise.all(records.map(async (record) => {
                   const value = record.values[stored.key];
-                  if (value === undefined || value === null) return false;
-                  try { this.#validateFieldValue(field, value); return false; } catch { return true; }
-                });
-                invariant(failures.length === updates.size && failures.every((record) => updates.has(record.id)), 'table.field-conversion-unresolved', 'Every incompatible value needs one explicit resolution', 409);
+                  return value !== undefined && value !== null && !(await this.#fieldAccepts(actorId, field, value)) ? record : null;
+                }))).filter((record): record is TableRecord => record !== null);
+                const requestedResolutions = intent.resolutions ?? [];
+                const resolutions = new Map(requestedResolutions.map((resolution) => [resolution.recordId, resolution]));
+                invariant(resolutions.size === requestedResolutions.length, 'table.field-conversion-resolution-duplicate', 'Each Record may have one conversion resolution');
+                invariant(failures.length === resolutions.size && failures.every((record) => resolutions.has(record.id)), 'table.field-conversion-unresolved', 'Every incompatible value needs one explicit resolution', 409);
+                const updates = new Map(await Promise.all(failures.map(async (record) => [record.id, await resolveValue(resolutions.get(record.id)!)] as const)));
                 const nextRecords = records.map((record) => updates.has(record.id) ? { ...record, values: { ...record.values, [stored.key]: updates.get(record.id)! } } : record);
                 const fields = (await this.store.listTableFields(selectedChannelId)).map((candidate) => candidate.id === stored.id ? field : candidate);
                 for (const record of nextRecords.filter((candidate) => candidate.tombstonedAt === undefined)) {
@@ -2921,7 +2919,7 @@ export class DatagramApplication {
   async #fieldAccepts(actorId: string, field: TableField, value: JsonValue): Promise<boolean> {
     try {
       this.#validateFieldValue(field, value);
-      await this.#validateRecordReferenceTargets(actorId, field, value);
+      await this.#validateRecordReferenceTargets(actorId, field, value, false);
       await this.#validateDictionaryEntry(actorId, field, value);
       return true;
     } catch (error) {
@@ -3020,6 +3018,7 @@ export class DatagramApplication {
     actorId: string,
     field: TableField,
     value: JsonValue,
+    allowRetired = true,
   ): Promise<void> {
     if (field.type !== 'record-reference') return;
     invariant(
@@ -3061,7 +3060,7 @@ export class DatagramApplication {
         recordId,
       );
       invariant(
-        status === 'resolved' || status === 'retired',
+        status === 'resolved' || (allowRetired && status === 'retired'),
         'table.record-reference-invalid',
         'Record Reference target is unavailable',
       );

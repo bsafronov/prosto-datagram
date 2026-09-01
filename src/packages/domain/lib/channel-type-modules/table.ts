@@ -188,68 +188,27 @@ export const tableChannelType = {
       invariant(field.tombstonedAt === undefined, 'table.field-tombstoned', 'Table Field is tombstoned', 409);
       invariant(field.version === input.observedVersion, 'table.field-conflict', 'Table Field changed after observation', 409);
       invariant(field.type !== input.targetType, 'table.field-type-unchanged', 'Target Field type must differ', 409);
-      const isDictionary = input.targetType === 'dictionary';
-      const isReference = input.targetType === 'record-reference';
-      invariant(isReference ? input.targetChannelId !== undefined && input.cardinality !== undefined : input.cardinality === undefined, 'table.field-reference-configuration', 'Record Reference Field requires one target Channel and cardinality');
-      invariant(isDictionary ? input.targetChannelId !== undefined : isReference || input.targetChannelId === undefined, 'table.field-dictionary-configuration', 'Dictionary Field requires one target Dictionary Channel');
-      const { cardinality: _oldCardinality, targetChannelId: _oldTarget, ...fieldBase } = field;
-      const convertedField: TableField = { ...fieldBase, ...(input.cardinality === undefined ? {} : { cardinality: input.cardinality }), ...(input.targetChannelId === undefined ? {} : { targetChannelId: input.targetChannelId }), type: input.targetType };
-      await capabilities.state!.validateTableFieldTarget(convertedField);
       if (input.cancel) {
         invariant(input.resolutions.length === 0 && input.defaultResolution === undefined, 'table.field-conversion-cancelled', 'Cancelled conversion cannot include resolutions');
         return capabilities.cancel!({ id: field.id, kind: 'field' });
       }
-      const records = await capabilities.state!.tableRecords();
-      const failures = (await Promise.all(records.map(async (record) => {
-        const value = record.values[field.key];
-        return value !== undefined && value !== null && !(await capabilities.state!.acceptsTableFieldValue(convertedField, value)) ? record : null;
-      }))).filter((record): record is TableRecord => record !== null);
-      const defaultFails = field.defaultValue !== undefined && field.defaultValue !== null && !(await capabilities.state!.acceptsTableFieldValue(convertedField, field.defaultValue));
-      invariant(defaultFails === (input.defaultResolution !== undefined), 'table.field-conversion-default-unresolved', defaultFails ? 'Incompatible default value needs one explicit resolution' : 'Default resolution does not match an incompatible default', 409);
-      let nextDefault = field.defaultValue;
-      if (input.defaultResolution) {
-        if (input.defaultResolution.kind === 'null') {
-          invariant(!field.required, 'table.field-conversion-null-required', 'Required Field cannot be explicitly nulled');
-          invariant(input.defaultResolution.value === undefined, 'table.field-conversion-resolution-invalid', 'Null resolution cannot include a value');
-          nextDefault = null;
-        } else {
-          invariant(input.defaultResolution.value !== undefined && input.defaultResolution.value !== null, 'table.field-conversion-resolution-required', 'Correction or mapping needs a replacement value');
-          invariant(await capabilities.state!.acceptsTableFieldValue(convertedField, input.defaultResolution.value), 'table.field-conversion-resolution-invalid', 'Replacement value is incompatible with target Field');
-          nextDefault = input.defaultResolution.value;
-        }
-      }
-      const resolutions = new Map(input.resolutions.map((resolution) => [resolution.recordId, resolution]));
-      invariant(resolutions.size === input.resolutions.length, 'table.field-conversion-resolution-duplicate', 'Each Record may have one conversion resolution');
-      invariant(failures.every((record) => resolutions.has(record.id)) && resolutions.size === failures.length, 'table.field-conversion-unresolved', 'Every incompatible value needs one explicit resolution', 409);
-      const updates = await Promise.all(failures.map(async (record) => {
-        const resolution = resolutions.get(record.id)!;
-        let value: JsonValue;
-        if (resolution.kind === 'null') {
-          invariant(!field.required, 'table.field-conversion-null-required', 'Required Field cannot be explicitly nulled');
-          invariant(resolution.value === undefined, 'table.field-conversion-resolution-invalid', 'Null resolution cannot include a value');
-          value = null;
-        } else {
-          invariant(resolution.value !== undefined && resolution.value !== null, 'table.field-conversion-resolution-required', 'Correction or mapping needs a replacement value');
-          invariant(await capabilities.state!.acceptsTableFieldValue(convertedField, resolution.value), 'table.field-conversion-resolution-invalid', 'Replacement value is incompatible with target Field');
-          value = resolution.value;
-        }
-        return { record, value };
-      }));
-      const next: TableField = { ...convertedField, ...(nextDefault === undefined ? {} : { defaultValue: nextDefault }), version: field.version + 1 };
-      const nextFields = (await capabilities.state!.tableFields()).map((candidate) => candidate.id === field.id ? next : candidate);
-      const nextRecords = records.map((record) => {
-        const update = updates.find((candidate) => candidate.record.id === record.id);
-        return update ? { ...record, values: { ...record.values, [field.key]: update.value } } : record;
-      });
-      for (const record of nextRecords.filter((candidate) => candidate.tombstonedAt === undefined)) await capabilities.state!.validateTableRecordValues(nextFields, nextRecords, record.values, record.id, true, [field.key]);
       await capabilities.changes.updateTableField!({
         ...(input.cardinality === undefined ? {} : { cardinality: input.cardinality }),
+        ...(input.defaultResolution === undefined ? {} : {
+          defaultResolution: {
+            kind: input.defaultResolution.kind,
+            ...(input.defaultResolution.value === undefined ? {} : { value: input.defaultResolution.value }),
+          },
+        }),
         ...(input.targetChannelId === undefined ? {} : { targetChannelId: input.targetChannelId }),
-        ...(nextDefault === undefined ? {} : { defaultValue: nextDefault }),
         fieldId: field.id,
         kind: 'convert',
         observedVersion: input.observedVersion,
-        recordUpdates: updates.map(({ record, value }) => ({ recordId: record.id, value })),
+        resolutions: input.resolutions.map((resolution) => ({
+          kind: resolution.kind,
+          recordId: resolution.recordId,
+          ...(resolution.value === undefined ? {} : { value: resolution.value }),
+        })),
         targetType: input.targetType,
       });
       return capabilities.commit();

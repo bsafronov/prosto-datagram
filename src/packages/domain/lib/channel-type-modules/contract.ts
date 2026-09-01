@@ -112,11 +112,11 @@ export interface ChannelActionCapabilities {
       | { readonly fieldId: string; readonly kind: 'tombstone'; readonly observedVersion: number }
       | {
           readonly cardinality?: 'many' | 'one';
-          readonly defaultValue?: JsonValue;
+          readonly defaultResolution?: { readonly kind: 'correct' | 'map' | 'null'; readonly value?: JsonValue };
           readonly fieldId: string;
           readonly kind: 'convert';
           readonly observedVersion: number;
-          readonly recordUpdates: readonly { readonly recordId: string; readonly value: JsonValue }[];
+          readonly resolutions: readonly { readonly kind: 'correct' | 'map' | 'null'; readonly recordId: string; readonly value?: JsonValue }[];
           readonly targetChannelId?: string;
           readonly targetType: TableField['type'];
         }

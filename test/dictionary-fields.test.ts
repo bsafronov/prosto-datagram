@@ -428,6 +428,83 @@ describe('Dictionary-backed Table Fields', () => {
     ).rejects.toMatchObject({ code: 'permission.denied' } satisfies Partial<DatagramError>);
   });
 
+  test('validates Dictionary conversion defaults and Record resolutions centrally', async () => {
+    const { dictionaryId, entryId, otherEntryId, tableId, value } = await setup();
+    const retired = await value.app.executeAction(
+      value.owner.id,
+      'cli',
+      'dictionary.entry.create',
+      { channelId: dictionaryId, label: 'Retired' },
+    );
+    await value.app.executeAction(value.owner.id, 'cli', 'dictionary.entry.retire', {
+      channelId: dictionaryId,
+      entryId: retired.subject!.id,
+    });
+    const field = await value.app.executeAction(value.owner.id, 'cli', 'table.field.add', {
+      channelId: tableId,
+      defaultValue: 'missing-default',
+      key: 'legacy',
+      label: 'Legacy',
+      required: false,
+      type: 'text',
+      unique: false,
+    });
+    const record = await value.app.executeAction(value.owner.id, 'cli', 'table.record.create', {
+      channelId: tableId,
+      values: { legacy: 'missing' },
+    });
+    const convert = (actorId: string, defaultValue: string, recordValue: string) =>
+      value.app.executeAction(actorId, 'cli', 'table.field.convert', {
+        channelId: tableId,
+        defaultResolution: { kind: 'map', value: defaultValue },
+        fieldId: field.subject!.id,
+        observedVersion: 1,
+        resolutions: [{ kind: 'map', recordId: record.subject!.id, value: recordValue }],
+        targetChannelId: dictionaryId,
+        targetType: 'dictionary',
+      });
+
+    await expect(convert(value.owner.id, 'missing-entry', entryId)).rejects.toMatchObject({
+      code: 'table.field-conversion-resolution-invalid',
+    } satisfies Partial<DatagramError>);
+    await expect(convert(value.owner.id, retired.subject!.id, entryId)).rejects.toMatchObject({
+      code: 'table.field-conversion-resolution-invalid',
+    } satisfies Partial<DatagramError>);
+    await expect(convert(value.owner.id, otherEntryId, entryId)).rejects.toMatchObject({
+      code: 'table.field-conversion-resolution-invalid',
+    } satisfies Partial<DatagramError>);
+
+    const admin = await value.app.executeAction(
+      value.owner.id,
+      'cli',
+      'service.person.create',
+      { displayName: 'Table-only Admin' },
+    );
+    await value.app.executeAction(value.owner.id, 'cli', 'channel.member.grant', {
+      channelId: tableId,
+      personId: admin.subject!.id,
+      role: 'admin',
+    });
+    await expect(convert(admin.subject!.id, entryId, entryId)).rejects.toMatchObject({
+      code: 'permission.denied',
+    } satisfies Partial<DatagramError>);
+
+    await convert(value.owner.id, entryId, entryId);
+    expect(
+      (await value.store.listTableFields(tableId)).find(
+        (candidate) => candidate.id === field.subject!.id,
+      ),
+    ).toMatchObject({
+      defaultValue: entryId,
+      targetChannelId: dictionaryId,
+      type: 'dictionary',
+      version: 2,
+    });
+    expect(await value.store.getTableRecord(record.subject!.id)).toMatchObject({
+      values: { legacy: entryId },
+    });
+  });
+
   test('keeps retired references through Field restore, unrelated conversion, and undo', async () => {
     const { dictionaryId, entryId, tableId, value } = await setup();
     const dictionaryField = await addDictionaryField(value, tableId, dictionaryId);
