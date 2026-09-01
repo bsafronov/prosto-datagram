@@ -3776,6 +3776,7 @@ export class DatagramApplication {
       (field) => field.tombstonedAt === undefined,
     );
     const knownKeys = new Set(fields.map((field) => field.key));
+    const fieldsByKey = new Map(fields.map((field) => [field.key, field]));
     const referencedSourceFields = [
       ...definition.filters.map((filter) => filter.field),
       ...definition.grouping,
@@ -3787,6 +3788,53 @@ export class DatagramApplication {
       referencedSourceFields.every((field) => knownKeys.has(field)),
       'chart.definition-unknown-field',
       'Chart definition references an unknown active Table Field',
+    );
+    invariant(
+      definition.aggregations.every((aggregation) => {
+        if (aggregation.operator === 'count') return true;
+        return aggregation.field !== undefined &&
+          fieldsByKey.get(aggregation.field)?.type === 'number';
+      }),
+      'chart.definition-invalid-aggregation',
+      'Numeric Chart aggregations require a number Field',
+    );
+    invariant(
+      definition.filters.every((filter) => {
+        const field = fieldsByKey.get(filter.field);
+        if (!field) return false;
+        if (filter.operator === 'is-empty') return filter.value === undefined;
+        if (filter.value === undefined) return false;
+        if (filter.operator === 'contains') {
+          return field.type === 'text' && typeof filter.value === 'string';
+        }
+        if (filter.operator === 'greater-than' || filter.operator === 'less-than') {
+          return (
+            (field.type === 'number' &&
+              typeof filter.value === 'number' &&
+              Number.isFinite(filter.value)) ||
+            (field.type === 'date-time' &&
+              typeof filter.value === 'string' &&
+              z.iso.datetime({ offset: true }).safeParse(filter.value).success)
+          );
+        }
+        if (filter.value === null) return true;
+        switch (field.type) {
+          case 'text':
+            return typeof filter.value === 'string';
+          case 'number':
+            return typeof filter.value === 'number' && Number.isFinite(filter.value);
+          case 'boolean':
+            return typeof filter.value === 'boolean';
+          case 'date-time':
+            return typeof filter.value === 'string' &&
+              z.iso.datetime({ offset: true }).safeParse(filter.value).success;
+          case 'dictionary':
+          case 'record-reference':
+            return false;
+        }
+      }),
+      'chart.definition-invalid-filter',
+      'Chart filter operator or value is incompatible with its Field',
     );
     invariant(
       new Set(definition.grouping).size === definition.grouping.length,

@@ -250,4 +250,103 @@ describe('live Chart Channel', () => {
     } satisfies Partial<DatagramError>);
     expect(await value.store.listChannels(value.owner.id)).toHaveLength(before.length);
   });
+
+  test('rejects type-incompatible aggregations and filters atomically', async () => {
+    const value = await runtime();
+    const sourceChannelId = await source(value);
+    const beforeCreate = await value.store.listChannels(value.owner.id);
+
+    const aggregationSource = await value.app.prepareQuery(
+      value.owner.id,
+      'agent',
+      'table.records.list',
+      { channelId: sourceChannelId },
+      'invalid.aggregate',
+    );
+    const invalidAggregation = await value.app.composeResultHandle(value.owner.id, {
+      handleId: aggregationSource.id,
+      inputPurpose: 'invalid.aggregate',
+      outputPurpose: 'chart.create',
+      transform: {
+        aggregations: [{ as: 'total', field: 'region', operator: 'sum' }],
+        kind: 'aggregate',
+      },
+    });
+    await expect(
+      value.app.executeAction(value.owner.id, 'agent', 'chart.create', {
+        handleId: invalidAggregation.id,
+        presentation: { series: ['total'], type: 'bar' },
+        title: 'Invalid aggregation',
+      }),
+    ).rejects.toMatchObject({
+      code: 'chart.definition-invalid-aggregation',
+    } satisfies Partial<DatagramError>);
+
+    const filterSource = await value.app.prepareQuery(
+      value.owner.id,
+      'agent',
+      'table.records.list',
+      { channelId: sourceChannelId },
+      'invalid.filter',
+    );
+    const invalidFilter = await value.app.composeResultHandle(value.owner.id, {
+      handleId: filterSource.id,
+      inputPurpose: 'invalid.filter',
+      outputPurpose: 'invalid.filter.aggregate',
+      transform: {
+        filters: [{ field: 'amount', operator: 'contains', value: '10' }],
+        kind: 'filter',
+      },
+    });
+    const filteredAggregate = await value.app.composeResultHandle(value.owner.id, {
+      handleId: invalidFilter.id,
+      inputPurpose: 'invalid.filter.aggregate',
+      outputPurpose: 'chart.create',
+      transform: {
+        aggregations: [{ as: 'count', operator: 'count' }],
+        kind: 'aggregate',
+      },
+    });
+    await expect(
+      value.app.executeAction(value.owner.id, 'agent', 'chart.create', {
+        handleId: filteredAggregate.id,
+        presentation: { series: ['count'], type: 'bar' },
+        title: 'Invalid filter',
+      }),
+    ).rejects.toMatchObject({
+      code: 'chart.definition-invalid-filter',
+    } satisfies Partial<DatagramError>);
+    expect(await value.store.listChannels(value.owner.id)).toHaveLength(beforeCreate.length);
+
+    const created = await chart(value, sourceChannelId);
+    const beforeUpdate = await value.store.listActivities(created.channelId);
+    await expect(
+      value.app.executeAction(value.owner.id, 'cli', 'chart.definition.update', {
+        aggregations: [{ as: 'total', field: 'region', operator: 'maximum' }],
+        channelId: created.channelId,
+        filters: [],
+        grouping: [],
+        observedVersion: 1,
+        presentation: { series: ['total'], type: 'bar' },
+        sourceChannelId,
+      }),
+    ).rejects.toMatchObject({
+      code: 'chart.definition-invalid-aggregation',
+    } satisfies Partial<DatagramError>);
+    await expect(
+      value.app.executeAction(value.owner.id, 'cli', 'chart.definition.update', {
+        aggregations: [{ as: 'count', operator: 'count' }],
+        channelId: created.channelId,
+        filters: [{ field: 'region', operator: 'greater-than', value: 5 }],
+        grouping: [],
+        observedVersion: 1,
+        presentation: { series: ['count'], type: 'bar' },
+        sourceChannelId,
+      }),
+    ).rejects.toMatchObject({
+      code: 'chart.definition-invalid-filter',
+    } satisfies Partial<DatagramError>);
+    expect((await value.store.getChartDefinition(created.channelId))?.version).toBe(1);
+    expect(await value.store.listActivities(created.channelId)).toHaveLength(beforeUpdate.length);
+  });
 });
