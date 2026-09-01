@@ -138,7 +138,7 @@ describe('live Chart Channel', () => {
       { channelId: created.channelId },
       'chart.render',
     );
-    const serialized = JSON.stringify(agentHandle);
+    const serialized = JSON.stringify(agentHandle.view);
     for (const forbidden of ['Live private revenue', 'Hidden North', '22']) {
       expect(serialized).not.toContain(forbidden);
     }
