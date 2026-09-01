@@ -620,21 +620,65 @@ export class DatagramApplication {
                 }
               } else {
                 invariant(conversionPlan !== undefined, 'channel-type.capability-denied', 'Field conversion requires a trusted Channel Type plan', 403);
+                invariant(
+                  conversionPlan.binding.fieldId === stored.id &&
+                    conversionPlan.previousField.id === stored.id &&
+                    conversionPlan.field.id === stored.id,
+                  'channel-type.capability-denied',
+                  'Field conversion plan must retain its bound Field identity',
+                  403,
+                );
                 invariant(conversionPlan.field.channelId === selectedChannelId && conversionPlan.previousField.channelId === selectedChannelId, 'channel-type.capability-denied', 'Field conversion plan crossed Channel scope', 403);
                 invariant(JSON.stringify(conversionPlan.previousField) === JSON.stringify(stored), 'table.field-conflict', 'Table Field changed after planning', 409);
                 field = conversionPlan.field;
+                invariant(field.version === stored.version + 1, 'channel-type.capability-denied', 'Field conversion must increment its canonical version exactly once', 403);
+                const immutableFieldShape = (candidate: TableField) => {
+                  const {
+                    cardinality: _cardinality,
+                    defaultValue: _defaultValue,
+                    targetChannelId: _targetChannelId,
+                    type: _type,
+                    version: _version,
+                    ...immutable
+                  } = candidate;
+                  return immutable;
+                };
+                invariant(
+                  JSON.stringify(immutableFieldShape(field)) === JSON.stringify(immutableFieldShape(stored)),
+                  'channel-type.capability-denied',
+                  'Field conversion may only change conversion-owned properties',
+                  403,
+                );
                 pendingChanges.push({ expectedVersion: stored.version, field, kind: 'table.field-updated', previousField: stored });
+                invariant(
+                  new Set(conversionPlan.recordUpdates.map((update) => update.record.id)).size === conversionPlan.recordUpdates.length,
+                  'channel-type.capability-denied',
+                  'Field conversion plan may update each Record once',
+                  403,
+                );
                 for (const update of conversionPlan.recordUpdates) {
-                  const record = await requireOwned(await this.store.getTableRecord(update.recordId), 'table.record-not-found');
-                  invariant((record.fieldVersions[stored.key] ?? 0) === update.observedVersion, 'table.record-edit-conflict', `Table Field value changed after planning: ${stored.key}`, 409);
-                  invariant(JSON.stringify(record.values[stored.key]) === JSON.stringify(update.previousValue), 'table.record-edit-conflict', `Table Field value changed after planning: ${stored.key}`, 409);
+                  const record = await requireOwned(await this.store.getTableRecord(update.previousRecord.id), 'table.record-not-found');
+                  invariant(update.record.id === record.id && update.record.channelId === selectedChannelId, 'channel-type.capability-denied', 'Field conversion must retain Record identity and Channel scope', 403);
+                  invariant(JSON.stringify(update.previousRecord) === JSON.stringify(record), 'table.record-edit-conflict', `Table Record changed after planning: ${record.id}`, 409);
+                  const immutableRecordShape = (candidate: TableRecord) => {
+                    const { fieldVersions: _fieldVersions, updatedAt: _updatedAt, values: _values, ...immutable } = candidate;
+                    return immutable;
+                  };
+                  invariant(JSON.stringify(immutableRecordShape(update.record)) === JSON.stringify(immutableRecordShape(record)), 'channel-type.capability-denied', 'Field conversion may not change Record identity or lifecycle metadata', 403);
+                  const valuesWithoutTarget = (candidate: TableRecord) => Object.fromEntries(Object.entries(candidate.values).filter(([key]) => key !== stored.key));
+                  const versionsWithoutTarget = (candidate: TableRecord) => Object.fromEntries(Object.entries(candidate.fieldVersions).filter(([key]) => key !== stored.key));
+                  invariant(JSON.stringify(valuesWithoutTarget(update.record)) === JSON.stringify(valuesWithoutTarget(record)), 'channel-type.capability-denied', 'Field conversion may only change its target Field value', 403);
+                  invariant(JSON.stringify(versionsWithoutTarget(update.record)) === JSON.stringify(versionsWithoutTarget(record)), 'channel-type.capability-denied', 'Field conversion may only change its target Field history', 403);
+                  const observedVersion = record.fieldVersions[stored.key] ?? 0;
+                  invariant(update.record.fieldVersions[stored.key] === observedVersion + 1, 'channel-type.capability-denied', 'Field conversion must increment target Field history exactly once', 403);
+                  invariant(Object.hasOwn(update.record.values, stored.key) && jsonValueSchema.safeParse(update.record.values[stored.key]).success, 'channel-type.capability-denied', 'Field conversion must provide one canonical target Field value', 403);
                   pendingChanges.push({
-                    expectedVersions: { [stored.key]: update.observedVersion },
+                    expectedVersions: { [stored.key]: observedVersion },
                     kind: 'table.record-updated',
-                    previousValues: [{ existed: update.previousValue !== undefined, key: stored.key, ...(update.previousValue === undefined ? {} : { value: update.previousValue }) }],
+                    previousValues: [{ existed: Object.hasOwn(record.values, stored.key), key: stored.key, ...(Object.hasOwn(record.values, stored.key) ? { value: record.values[stored.key] } : {}) }],
                     recordId: record.id,
                     updatedAt: nowIso(),
-                    values: { [stored.key]: update.value },
+                    values: { [stored.key]: update.record.values[stored.key]! },
                   });
                 }
                 pendingSubject = { id: field.id, kind: 'field' };

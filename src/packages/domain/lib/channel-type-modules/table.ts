@@ -84,10 +84,8 @@ export interface TrustedTableFieldConversionPlan {
     readonly targetType: TableField['type'];
   };
   readonly recordUpdates: readonly {
-    readonly observedVersion: number;
-    readonly previousValue?: JsonValue;
-    readonly recordId: string;
-    readonly value: JsonValue;
+    readonly previousRecord: TableRecord;
+    readonly record: TableRecord;
   }[];
 }
 
@@ -165,10 +163,15 @@ export async function planTableFieldConversion(
   const recordUpdates = failures.map((failure) => {
     const record = records.find((candidate) => candidate.id === failure.recordId)!;
     return {
-      observedVersion: record.fieldVersions[field.key] ?? 0,
-      ...(Object.hasOwn(record.values, field.key) ? { previousValue: record.values[field.key] } : {}),
-      recordId: record.id,
-      value: updates.get(record.id)!,
+      previousRecord: record,
+      record: {
+        ...record,
+        fieldVersions: {
+          ...record.fieldVersions,
+          [field.key]: (record.fieldVersions[field.key] ?? 0) + 1,
+        },
+        values: { ...record.values, [field.key]: updates.get(record.id)! },
+      },
     };
   });
   return sealCanonicalPlan({ field: nextField, previousField: field, preview, purpose: 'execute', recordUpdates }, field.id, field.version);

@@ -157,6 +157,89 @@ describe('Channel Type version pinning', () => {
       .toThrowError(expect.objectContaining({ code: 'channel-type.capability-denied' }));
   });
 
+  test('rejects sealed plans that smuggle Field or Record state', async () => {
+    const table = bundledChannelTypes.find((definition) => definition.id === 'table')!;
+    let substituteFieldId = '';
+    const maliciousV2 = {
+      ...table,
+      planTableFieldConversion: async (
+        input: Parameters<NonNullable<typeof table.planTableFieldConversion>>[0],
+        state: Parameters<NonNullable<typeof table.planTableFieldConversion>>[1],
+        seal: Parameters<NonNullable<typeof table.planTableFieldConversion>>[2],
+      ) => {
+        const field = (await state.tableFields()).find((candidate) => candidate.id === input.fieldId)!;
+        let nextField: TableField = { ...field, type: input.targetType, version: field.version + 1 };
+        if (field.key === 'field_identity') nextField = { ...nextField, id: substituteFieldId };
+        if (field.key === 'field_shape') nextField = { ...nextField, key: 'stolen', required: true, unique: true };
+        if (field.key === 'field_version') nextField = { ...nextField, version: field.version + 2 };
+        const records = await state.tableRecords();
+        const previousRecord = records[0]!;
+        let recordUpdates: { previousRecord: TableRecord; record: TableRecord }[] = [];
+        if (field.key.startsWith('record_')) {
+          let record: TableRecord = {
+            ...previousRecord,
+            fieldVersions: { ...previousRecord.fieldVersions, [field.key]: (previousRecord.fieldVersions[field.key] ?? 0) + 1 },
+            values: { ...previousRecord.values, [field.key]: 1 },
+          };
+          if (field.key === 'record_identity') record = { ...record, id: 'record-stolen' };
+          if (field.key === 'record_scope') record = { ...record, channelId: 'channel-stolen' };
+          if (field.key === 'record_value') record = { ...record, values: { ...record.values, untouched: 'stolen' } };
+          if (field.key === 'record_history') record = { ...record, fieldVersions: { ...record.fieldVersions, [field.key]: (previousRecord.fieldVersions[field.key] ?? 0) + 2 } };
+          recordUpdates = [{ previousRecord, record }];
+        }
+        return seal({
+          field: nextField,
+          previousField: field,
+          preview: { defaultFailure: null, failures: [], fieldId: field.id, observedVersion: field.version, targetType: input.targetType },
+          purpose: 'execute',
+          recordUpdates,
+        }, field.id, field.version);
+      },
+      title: 'Malicious Table v2',
+      version: '2.0.0',
+    };
+    const store = new SqliteStore(':memory:');
+    stores.push(store);
+    await store.initialize();
+    const owner = await store.ensureLocalOwner();
+    const app = new DatagramApplication(store, new ChannelTypeRegistry([maliciousV2]));
+    const channelId = (await app.executeAction(owner.id, 'cli', 'channel.create', {
+      title: 'Malicious Table',
+      typeId: 'table',
+      typeVersion: '2.0.0',
+    })).subject!.id;
+    const keys = ['field_identity', 'field_shape', 'field_version', 'record_identity', 'record_scope', 'record_value', 'record_history'];
+    const fieldIds = new Map<string, string>();
+    for (const key of [...keys, 'substitute', 'untouched']) {
+      const receipt = await app.executeAction(owner.id, 'cli', 'table.field.add', {
+        channelId,
+        key,
+        label: key,
+        required: false,
+        type: 'text',
+        unique: false,
+      });
+      fieldIds.set(key, receipt.subject!.id);
+    }
+    substituteFieldId = fieldIds.get('substitute')!;
+    const record = await app.executeAction(owner.id, 'cli', 'table.record.create', {
+      channelId,
+      values: Object.fromEntries([...keys, 'untouched'].map((key) => [key, 'original'])),
+    });
+    const before = (await store.listOperations(channelId)).length;
+    for (const key of keys) {
+      await expect(app.executeAction(owner.id, 'cli', 'table.field.convert', {
+        channelId,
+        fieldId: fieldIds.get(key),
+        observedVersion: 1,
+        targetType: 'number',
+      })).rejects.toMatchObject({ code: 'channel-type.capability-denied' });
+    }
+    expect(await store.listOperations(channelId)).toHaveLength(before);
+    expect(await store.getTableRecord(record.subject!.id)).toMatchObject({ values: { untouched: 'original' } });
+    for (const key of keys) expect((await store.listTableFields(channelId)).find((field) => field.key === key)).toMatchObject({ type: 'text', version: 1 });
+  });
+
   test('bundled modules own typed contracts, rules, and semantic views', () => {
     for (const definition of bundledChannelTypes) {
       expect(definition.actions.length).toBeGreaterThan(0);
