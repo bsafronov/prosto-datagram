@@ -417,6 +417,7 @@ export function applyChange(state: StoreState, change: DomainChange): void {
           (entry) =>
             entry.id === change.entry.id ||
             (entry.channelId === change.entry.channelId &&
+              entry.retiredAt === undefined &&
               entry.normalizedLabel === change.entry.normalizedLabel),
         )
       ) {
@@ -432,6 +433,7 @@ export function applyChange(state: StoreState, change: DomainChange): void {
           (candidate) =>
             candidate.id !== entry.id &&
             candidate.channelId === entry.channelId &&
+            candidate.retiredAt === undefined &&
             candidate.normalizedLabel === change.normalizedLabel,
         )
       ) {
@@ -459,6 +461,12 @@ export function applyChange(state: StoreState, change: DomainChange): void {
     case 'dictionary.entry-restored': {
       const entry = one(state.dictionaryEntries, (candidate) => candidate.id === change.entryId);
       if (!entry || entry.retiredAt === undefined) throw new Error('Dictionary Entry is not retired');
+      if (state.dictionaryEntries.some((candidate) =>
+        candidate.id !== entry.id &&
+        candidate.channelId === entry.channelId &&
+        candidate.retiredAt === undefined &&
+        candidate.normalizedLabel === entry.normalizedLabel
+      )) throw new Error('Dictionary Entry already exists');
       const { retiredAt: _retiredAt, retiredBy: _retiredBy, ...active } = entry;
       replace(state.dictionaryEntries, (candidate) => candidate === entry, {
         ...active,

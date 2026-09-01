@@ -81,42 +81,42 @@ export interface ChannelActionCapabilities {
   readonly changes: {
     readonly createChannel?: (title: string) => string;
     readonly createChart?: () => Promise<void>;
-    readonly setChartDefinition?: (definition: ChartDefinition, expectedVersion?: number) => void;
-    readonly recordChartEvent?: (kind: 'chart.insight-produced' | 'chart.report-produced' | 'chart.threshold-crossed') => void;
+    readonly setChartDefinition?: (definition: ChartDefinition, expectedVersion?: number) => Promise<void>;
+    readonly recordChartEvent?: (kind: 'chart.insight-produced' | 'chart.report-produced' | 'chart.threshold-crossed') => Promise<void>;
     readonly createDictionaryEntry?: (label: string) => Promise<string>;
     readonly renameDictionaryEntry?: (input: {
       readonly entryId: string;
       readonly label: string;
       readonly normalizedLabel: string;
       readonly updatedAt: string;
-    }) => void;
-    readonly restoreDictionaryEntry?: (entryId: string, restoredAt: string) => void;
-    readonly retireDictionaryEntry?: (entryId: string, retiredAt: string) => void;
-    readonly editDiscussionMessage?: (messageId: string, text: string) => void;
+    }) => Promise<void>;
+    readonly restoreDictionaryEntry?: (entryId: string, restoredAt: string) => Promise<void>;
+    readonly retireDictionaryEntry?: (entryId: string, retiredAt: string) => Promise<void>;
+    readonly editDiscussionMessage?: (messageId: string, text: string) => Promise<void>;
     readonly postDiscussionMessage?: (input: {
       readonly recordReferences: readonly string[];
       readonly replyToMessageId?: string;
       readonly text: string;
-    }) => string;
-    readonly restoreDiscussionMessage?: (messageId: string) => void;
-    readonly tombstoneDiscussionMessage?: (messageId: string) => void;
+    }) => Promise<string>;
+    readonly restoreDiscussionMessage?: (messageId: string) => Promise<void>;
+    readonly tombstoneDiscussionMessage?: (messageId: string) => Promise<void>;
     readonly createTableRecord?: (values: Readonly<Record<string, JsonValue>>) => Promise<string>;
     readonly createTableView?: (
       input: Omit<TableView, 'channelId' | 'createdAt' | 'id' | 'ownerId'>,
     ) => Promise<string>;
     readonly setTableDisplayField?: (displayFieldId: string | null) => Promise<void>;
-    readonly addTableField?: (field: TableField) => void;
-    readonly purgeTableField?: (field: TableField) => void;
-    readonly updateTableField?: (field: TableField, previousField: TableField) => void;
+    readonly addTableField?: (field: TableField) => Promise<void>;
+    readonly purgeTableField?: (field: TableField) => Promise<void>;
+    readonly updateTableField?: (field: TableField, previousField: TableField) => Promise<void>;
     readonly updateTableRecord?: (input: {
       readonly expectedVersions?: Readonly<Record<string, number>>;
       readonly previousValues?: readonly { readonly existed: boolean; readonly key: string; readonly value?: JsonValue }[];
       readonly recordId: string;
       readonly removedKeys?: readonly string[];
       readonly values: Readonly<Record<string, JsonValue>>;
-    }) => void;
-    readonly restoreTableRecord?: (recordId: string, expectedTombstonedAt?: string) => void;
-    readonly tombstoneTableRecord?: (recordId: string, expectedUpdatedAt?: string | null) => void;
+    }) => Promise<void>;
+    readonly restoreTableRecord?: (recordId: string, expectedTombstonedAt?: string) => Promise<void>;
+    readonly tombstoneTableRecord?: (recordId: string, expectedUpdatedAt?: string | null) => Promise<void>;
   };
   readonly commit: () => Promise<ActionReceipt>;
   readonly cancel?: (subject: ActionReceipt['subject']) => Promise<ActionReceipt>;
@@ -173,6 +173,7 @@ export const stateRule = (
 export interface ChannelViewInput {
   readonly channelTitle?: string;
   readonly queryInput: unknown;
+  readonly resultTitle?: string;
   readonly role: ChannelRole;
 }
 

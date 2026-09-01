@@ -20,6 +20,39 @@ afterEach(async () => {
 });
 
 describe('Dictionary Entry lifecycle', () => {
+  test('reuses retired labels while keeping retired identities resolvable', async () => {
+    const { channelId, value } = await setup();
+    const retired = await value.app.executeAction(value.owner.id, 'cli', 'dictionary.entry.create', {
+      channelId,
+      label: 'Reusable',
+    });
+    await value.app.executeAction(value.owner.id, 'cli', 'dictionary.entry.retire', {
+      channelId,
+      entryId: retired.subject!.id,
+    });
+    const active = await value.app.executeAction(value.owner.id, 'cli', 'dictionary.entry.create', {
+      channelId,
+      label: 'REUSABLE',
+    });
+    expect(await value.store.getDictionaryEntry(retired.subject!.id)).toMatchObject({
+      id: retired.subject!.id,
+      retiredAt: expect.any(String),
+    });
+    await expect(value.app.executeAction(value.owner.id, 'cli', 'dictionary.entry.restore', {
+      channelId,
+      entryId: retired.subject!.id,
+    })).rejects.toMatchObject({ code: 'dictionary.entry-label-conflict' });
+    await value.app.executeAction(value.owner.id, 'cli', 'dictionary.entry.rename', {
+      channelId,
+      entryId: active.subject!.id,
+      label: 'Different',
+    });
+    await expect(value.app.executeAction(value.owner.id, 'cli', 'dictionary.entry.restore', {
+      channelId,
+      entryId: retired.subject!.id,
+    })).resolves.toBeDefined();
+  });
+
   test('normalizes labels and rejects Unicode-equivalent case-insensitive duplicates atomically', async () => {
     const { channelId, value } = await setup();
     const created = await value.app.executeAction(

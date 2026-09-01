@@ -207,6 +207,12 @@ describe('typed Table Record lifecycle', () => {
       visibility: 'shared',
     });
     expect(await value.store.listTableViews(channelId, person.subject!.id)).toHaveLength(2);
+    const shared = (await value.store.listTableViews(channelId, person.subject!.id))
+      .find((view) => view.name === 'Shared')!;
+    expect((await value.app.executeQuery(person.subject!.id, 'cli', 'table.view.open', {
+      channelId,
+      viewId: shared.id,
+    })).view.title).toBe('Shared');
   });
 
   test('backfills tombstoned Records before restoring after a required Field addition', async () => {

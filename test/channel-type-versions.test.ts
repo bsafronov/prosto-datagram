@@ -9,7 +9,7 @@ import {
   type ChannelViewDeclaration,
   type ChannelViewInput,
 } from '../src/packages/domain/channel-types';
-import type { Channel, Operation, QueryResult } from '../src/packages/domain/model';
+import type { Channel, ChartDefinition, DictionaryEntry, Message, Operation, QueryResult, TableField, TableRecord } from '../src/packages/domain/model';
 import { SqliteStore } from '../src/packages/sqlite-store';
 
 const stores: SqliteStore[] = [];
@@ -118,6 +118,105 @@ describe('Channel Type version pinning', () => {
     }).success).toBeTrue();
   });
 
+  test('binds every mutation capability to its selected aggregate', async () => {
+    let foreignEntry!: DictionaryEntry;
+    let foreignMessage!: Message;
+    let foreignField!: TableField;
+    let foreignRecord!: TableRecord;
+    let foreignChart!: ChartDefinition;
+    const malicious = (name: string, allowedOperations: any[], execute: any) => ({
+      allowedOperations,
+      authorization: { kind: 'channel-role' as const, minimumRole: 'owner' as const },
+      execute,
+      inputSchema: z.object({ channelId: z.string().min(1) }),
+      name,
+    });
+    const definitions = bundledChannelTypes.map((definition) => {
+      if (definition.id === 'dictionary') return {
+        ...definition,
+        actions: [...definition.actions,
+          malicious('dictionary.attack.entry', ['renameDictionaryEntry'], async (_input: unknown, capabilities: any) => {
+            await capabilities.changes.renameDictionaryEntry({ entryId: foreignEntry.id, label: 'stolen', normalizedLabel: 'stolen', updatedAt: capabilities.now() });
+            return capabilities.commit();
+          }),
+          malicious('dictionary.attack.message', ['editDiscussionMessage'], async (_input: unknown, capabilities: any) => {
+            await capabilities.changes.editDiscussionMessage(foreignMessage.id, 'stolen');
+            return capabilities.commit();
+          }),
+        ],
+      };
+      if (definition.id === 'table') return {
+        ...definition,
+        actions: [...definition.actions,
+          malicious('table.attack.field', ['updateTableField'], async (_input: unknown, capabilities: any) => {
+            await capabilities.changes.updateTableField({ ...foreignField, label: 'stolen', version: foreignField.version + 1 }, foreignField);
+            return capabilities.commit();
+          }),
+          malicious('table.attack.record', ['updateTableRecord'], async (_input: unknown, capabilities: any) => {
+            await capabilities.changes.updateTableRecord({ recordId: foreignRecord.id, values: {} });
+            return capabilities.commit();
+          }),
+          malicious('table.attack.view', ['createTableView'], async (_input: unknown, capabilities: any) => {
+            await capabilities.changes.createTableView({ filters: [], grouping: [], name: 'Scoped', sorting: [], visibility: 'personal', visibleFieldIds: [] });
+            return capabilities.commit();
+          }),
+        ],
+      };
+      if (definition.id === 'chart') return {
+        ...definition,
+        actions: [...definition.actions,
+          malicious('chart.attack.definition', ['setChartDefinition'], async (_input: unknown, capabilities: any) => {
+            await capabilities.changes.setChartDefinition({ ...foreignChart, version: foreignChart.version + 1 }, foreignChart.version);
+            return capabilities.commit();
+          }),
+        ],
+      };
+      return definition;
+    });
+    const store = new SqliteStore(':memory:');
+    stores.push(store);
+    await store.initialize();
+    const owner = await store.ensureLocalOwner();
+    const app = new DatagramApplication(store, new ChannelTypeRegistry(definitions));
+    const create = async (typeId: 'dictionary' | 'table') => (await app.executeAction(owner.id, 'cli', 'channel.create', { title: typeId, typeId })).subject!.id;
+    const dictionaryA = await create('dictionary');
+    const dictionaryB = await create('dictionary');
+    const tableA = await create('table');
+    const tableB = await create('table');
+    const entry = await app.executeAction(owner.id, 'cli', 'dictionary.entry.create', { channelId: dictionaryB, label: 'Foreign' });
+    foreignEntry = (await store.getDictionaryEntry(entry.subject!.id))!;
+    const message = await app.executeAction(owner.id, 'cli', 'discussion.message.post', { channelId: dictionaryB, text: 'Foreign' });
+    foreignMessage = (await store.getMessage(message.subject!.id))!;
+    const field = await app.executeAction(owner.id, 'cli', 'table.field.add', { channelId: tableB, key: 'name', label: 'Name', required: false, type: 'text', unique: false });
+    foreignField = (await store.listTableFields(tableB)).find((item) => item.id === field.subject!.id)!;
+    const record = await app.executeAction(owner.id, 'cli', 'table.record.create', { channelId: tableB, values: {} });
+    foreignRecord = (await store.getTableRecord(record.subject!.id))!;
+    const now = new Date().toISOString();
+    const chartA = 'chart-a';
+    const chartB = 'chart-b';
+    foreignChart = { aggregations: [{ as: 'count', operator: 'count' }], channelId: chartB, filters: [], grouping: [], presentation: { series: ['count'], type: 'bar' }, sourceChannelId: tableB, version: 1 };
+    for (const channelId of [chartA, chartB]) await store.commit({
+      action: 'test.seed', actorId: owner.id, channelId, id: `seed-${channelId}`, intent: 'test.seed', occurredAt: now, origin: 'cli', result: { status: 'succeeded' }, status: 'succeeded',
+      changes: [
+        { channel: { createdAt: now, id: channelId, ownerId: owner.id, title: channelId, typeId: 'chart', typeVersion: '1.0.0', updatedAt: now }, kind: 'channel.created' },
+        { kind: 'membership.granted', membership: { channelId, personId: owner.id, role: 'owner' } },
+        { definition: { ...foreignChart, channelId }, kind: 'chart.definition-set' },
+      ],
+    });
+    for (const [action, channelId] of [
+      ['dictionary.attack.entry', dictionaryA], ['dictionary.attack.message', dictionaryA],
+      ['table.attack.field', tableA], ['table.attack.record', tableA],
+      ['chart.attack.definition', chartA],
+    ] as const) {
+      const before = (await store.listOperations(channelId)).length;
+      await expect(app.executeAction(owner.id, 'cli', action, { channelId })).rejects.toBeDefined();
+      expect(await store.listOperations(channelId)).toHaveLength(before);
+    }
+    await app.executeAction(owner.id, 'cli', 'table.attack.view', { channelId: tableA });
+    expect(await store.listTableViews(tableA, owner.id)).toHaveLength(1);
+    expect(await store.listTableViews(tableB, owner.id)).toHaveLength(0);
+  });
+
   test('discovers and executes exact contracts for pinned versions', async () => {
     const table = bundledChannelTypes.find((definition) => definition.id === 'table')!;
     const chart = bundledChannelTypes.find((definition) => definition.id === 'chart')!;
@@ -207,10 +306,13 @@ describe('Channel Type version pinning', () => {
                 execute: async (
                   input: { channelId: string; fieldId: string | null },
                   capabilities: Parameters<typeof action.execute>[1],
-                ) =>
-                  input.fieldId === 'v2-default' && 'commit' in capabilities
-                    ? (capabilities.changes.setTableDisplayField!(null), capabilities.commit())
-                    : action.execute(input, capabilities),
+                ) => {
+                  if (input.fieldId !== 'v2-default' || !('commit' in capabilities)) {
+                    return action.execute(input, capabilities);
+                  }
+                  await capabilities.changes.setTableDisplayField!(null);
+                  return capabilities.commit();
+                },
               }
           : action,
       ), {
@@ -224,7 +326,7 @@ describe('Channel Type version pinning', () => {
           expect(Object.isFrozen(input)).toBeTrue();
           expect(Reflect.set(input, 'channelId', 'table-v1')).toBeFalse();
           expect(input.channelId).toBe('table-v2');
-          capabilities.changes.setTableDisplayField!(null);
+          await capabilities.changes.setTableDisplayField!(null);
           return capabilities.commit();
         },
         inputSchema: z.object({ channelId: z.string().min(1) }),
@@ -442,6 +544,10 @@ describe('Channel Type version pinning', () => {
     });
     const v1Catalog = app.queries.catalog({ typeId: 'table', typeVersion: '1.0.0' });
     const v2Catalog = app.queries.catalog({ typeId: 'table', typeVersion: '2.0.0' });
+    const defaultNames = app.queries.catalog().map((definition) => definition.name);
+    expect(defaultNames).not.toContain('table.configuration');
+    expect(defaultNames).not.toContain('table.custom.configuration');
+    expect(defaultNames).not.toContain('chart.open');
     const configuration = (catalog: typeof v1Catalog) =>
       catalog.find((definition) => definition.name === 'table.configuration')!.inputSchema;
     const v1Names = v1Catalog.map((definition) => definition.name);
@@ -512,6 +618,24 @@ describe('Channel Type version pinning', () => {
       {},
       { typeId: 'table', typeVersion: '2.0.0' },
     )).resolves.toMatchObject({ data: { status: 'ready' } });
+    const selectedOperatorHandle = await app.prepareQuery(
+      owner.id,
+      'agent',
+      'table.custom.operator-status',
+      {},
+      'operator.status',
+      { typeId: 'table', typeVersion: '2.0.0' },
+    );
+    await expect(app.consumeResultHandle(owner.id, selectedOperatorHandle.id, 'operator.status'))
+      .resolves.toMatchObject({ data: { status: 'ready' } });
+    const reopenedOperatorHandle = await app.reopenDataView(owner.id, 'agent', {
+      input: {},
+      purpose: 'operator.reopened',
+      queryName: 'table.custom.operator-status',
+      selectedType: { typeId: 'table', typeVersion: '2.0.0' },
+    });
+    await expect(app.consumeResultHandle(owner.id, reopenedOperatorHandle.id, 'operator.reopened'))
+      .resolves.toMatchObject({ data: { status: 'ready' } });
     await app.executeAction(viewer.subject!.id, 'cli', 'table.view.create', {
       channelId: 'table-v2',
       filters: [],

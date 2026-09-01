@@ -46,7 +46,7 @@ const defaultConversionResolutionSchema = z.object({
   value: optionalJsonValueSchema,
 });
 
-const pendingView = () => ({ bindings: {}, commands: [], kind: 'pending', schemaVersion: 'datagram/view@1' as const, title: 'Channel Type View' });
+const pendingView = (title = 'Channel Type View') => ({ bindings: {}, commands: [], kind: 'pending', schemaVersion: 'datagram/view@1' as const, title });
 
 export function validateTableFieldValue(field: TableField, rawValue: unknown): JsonValue {
   const value = jsonValueSchema.parse(rawValue);
@@ -140,8 +140,8 @@ export const tableChannelType = {
       }
       invariant(!(input.required && input.defaultValue === undefined && activeRecords.length > 0), 'table.field-required-existing-records', 'Required Field needs a default while Records exist', 409);
       invariant(!(input.unique && input.defaultValue != null && activeRecords.length > 1), 'table.field-unique-default-conflict', 'Unique Field default cannot be applied to multiple Records', 409);
-      if (input.defaultValue !== undefined) for (const record of allRecords) capabilities.changes.updateTableRecord!({ expectedVersions: { [input.key]: 0 }, recordId: record.id, values: { [input.key]: input.defaultValue } });
-      capabilities.changes.addTableField!(field);
+      if (input.defaultValue !== undefined) for (const record of allRecords) await capabilities.changes.updateTableRecord!({ expectedVersions: { [input.key]: 0 }, recordId: record.id, values: { [input.key]: input.defaultValue } });
+      await capabilities.changes.addTableField!(field);
       return capabilities.commit();
     }, { kind: 'channel-role', minimumRole: 'admin' }, ['addTableField', 'updateTableRecord']),
     contract('table.field.tombstone', z.object({
@@ -154,7 +154,7 @@ export const tableChannelType = {
       invariant(field, 'table.field-not-found', 'Table Field not found', 404);
       invariant(field.tombstonedAt === undefined, 'table.field-already-tombstoned', 'Table Field is already tombstoned', 409);
       invariant(field.version === input.observedVersion, 'table.field-conflict', 'Table Field changed after observation', 409);
-      capabilities.changes.updateTableField!({ ...field, tombstonedAt: capabilities.now(), tombstonedBy: capabilities.actorId, version: field.version + 1 }, field);
+      await capabilities.changes.updateTableField!({ ...field, tombstonedAt: capabilities.now(), tombstonedBy: capabilities.actorId, version: field.version + 1 }, field);
       if (await capabilities.state!.displayFieldId() === field.id) await capabilities.changes.setTableDisplayField!(null);
       return capabilities.commit();
     }, { kind: 'channel-role', minimumRole: 'admin' }, ['updateTableField', 'setTableDisplayField']),
@@ -173,7 +173,7 @@ export const tableChannelType = {
       const fields = (await capabilities.state!.tableFields()).map((candidate) => candidate.id === field.id ? next : candidate);
       const records = await capabilities.state!.tableRecords();
       for (const record of records.filter((candidate) => candidate.tombstonedAt === undefined)) await capabilities.state!.validateTableRecordValues(fields, records, record.values, record.id, true, []);
-      capabilities.changes.updateTableField!(next, field);
+      await capabilities.changes.updateTableField!(next, field);
       return capabilities.commit();
     }, { kind: 'channel-role', minimumRole: 'admin' }, ['updateTableField']),
     contract('table.field.convert', z.object({
@@ -247,8 +247,8 @@ export const tableChannelType = {
         return update ? { ...record, values: { ...record.values, [field.key]: update.value } } : record;
       });
       for (const record of nextRecords.filter((candidate) => candidate.tombstonedAt === undefined)) await capabilities.state!.validateTableRecordValues(nextFields, nextRecords, record.values, record.id, true, [field.key]);
-      for (const { record, value } of updates) capabilities.changes.updateTableRecord!({ expectedVersions: { [field.key]: record.fieldVersions[field.key] ?? 0 }, previousValues: [{ existed: true, key: field.key, value: record.values[field.key]! }], recordId: record.id, values: { [field.key]: value } });
-      capabilities.changes.updateTableField!(next, field);
+      for (const { record, value } of updates) await capabilities.changes.updateTableRecord!({ expectedVersions: { [field.key]: record.fieldVersions[field.key] ?? 0 }, previousValues: [{ existed: true, key: field.key, value: record.values[field.key]! }], recordId: record.id, values: { [field.key]: value } });
+      await capabilities.changes.updateTableField!(next, field);
       return capabilities.commit();
     }, { kind: 'channel-role', minimumRole: 'admin' }, ['cancel', 'updateTableField', 'updateTableRecord']),
     contract('table.field.purge', z.object({
@@ -261,7 +261,7 @@ export const tableChannelType = {
       invariant(field, 'table.field-not-found', 'Table Field not found', 404);
       invariant(field.tombstonedAt !== undefined, 'table.field-not-tombstoned', 'Table Field must be tombstoned before purge', 409);
       invariant(field.version === input.observedVersion, 'table.field-conflict', 'Table Field changed after observation', 409);
-      capabilities.changes.purgeTableField!(field);
+      await capabilities.changes.purgeTableField!(field);
       return capabilities.commit();
     }, { kind: 'channel-role', minimumRole: 'admin' }, ['purgeTableField']),
     contract('table.record.create', z.object({
@@ -297,7 +297,7 @@ export const tableChannelType = {
       const fields = await capabilities.state!.tableFields();
       const records = await capabilities.state!.tableRecords();
       const values = await capabilities.state!.validateTableRecordValues(fields, records, { ...record.values, ...input.values }, record.id, true, changedKeys);
-      capabilities.changes.updateTableRecord!({
+      await capabilities.changes.updateTableRecord!({
         expectedVersions: Object.fromEntries(changedKeys.map((key) => [key, input.observedVersions[key]!])),
         previousValues: changedKeys.map((key) => ({ existed: Object.hasOwn(record.values, key), key, ...(Object.hasOwn(record.values, key) ? { value: record.values[key] } : {}) })),
         recordId: record.id,
@@ -313,7 +313,7 @@ export const tableChannelType = {
       const record = await capabilities.state!.tableRecord(input.recordId);
       invariant(record?.channelId === input.channelId, 'table.record-not-found', 'Table Record not found', 404);
       invariant(record.tombstonedAt === undefined, 'table.record-already-tombstoned', 'Table Record is already tombstoned', 409);
-      capabilities.changes.tombstoneTableRecord!(record.id, record.updatedAt ?? null);
+      await capabilities.changes.tombstoneTableRecord!(record.id, record.updatedAt ?? null);
       return capabilities.commit();
     }, { kind: 'channel-role', minimumRole: 'contributor' }, ['tombstoneTableRecord']),
     contract('table.record.restore', z.object({
@@ -325,7 +325,7 @@ export const tableChannelType = {
       invariant(record?.channelId === input.channelId, 'table.record-not-found', 'Table Record not found', 404);
       invariant(record.tombstonedAt !== undefined, 'table.record-not-tombstoned', 'Table Record is not tombstoned', 409);
       await capabilities.state!.validateTableRecordValues(await capabilities.state!.tableFields(), await capabilities.state!.tableRecords(), record.values, record.id, false);
-      capabilities.changes.restoreTableRecord!(record.id, record.tombstonedAt);
+      await capabilities.changes.restoreTableRecord!(record.id, record.tombstonedAt);
       return capabilities.commit();
     }, { kind: 'channel-role', minimumRole: 'contributor' }, ['restoreTableRecord']),
     contract('table.view.create', z.object({
@@ -479,7 +479,7 @@ export const tableChannelType = {
           const values = record.values;
           return { ...record, values: values !== null && !Array.isArray(values) && typeof values === 'object' ? Object.fromEntries(Object.entries(values).filter(([key]) => visibleKeys.has(key))) : (values ?? null) };
         }),
-        view: pendingView(),
+        view: pendingView(definition.name),
       };
       current = capabilities.transform(current, { filters: definition.filters.map((filter) => ({ field: keys.get(filter.fieldId) ?? filter.fieldId, operator: filter.operator, ...(filter.value === undefined ? {} : { value: filter.value }) })), kind: 'filter' });
       if (Array.isArray(current.data) && definition.sorting.length > 0) {
@@ -616,7 +616,7 @@ export const tableChannelType = {
       kind: 'table-records',
       produce: produceOwnedView,
       query: 'table.view.open',
-      title: 'Table View',
+      title: (input) => input.resultTitle ?? 'Table View',
     },
     {
       bindings: { views: '$result' },

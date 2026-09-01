@@ -65,7 +65,7 @@ export const chartChannelType = {
         version: current.version + 1,
       };
       await capabilities.state!.validateChartDefinition(definition);
-      capabilities.changes.setChartDefinition!(definition, current.version);
+      await capabilities.changes.setChartDefinition!(definition, current.version);
       return capabilities.commit();
     }, { kind: 'channel-role', minimumRole: 'admin' }, ['setChartDefinition']),
     contract('chart.event.record', z.object({
@@ -73,7 +73,7 @@ export const chartChannelType = {
       kind: z.enum(['insight', 'report', 'threshold']),
     }), async (input, capabilities) => {
       if (!('changes' in capabilities)) throw new Error('Chart event recording needs Action capabilities');
-      capabilities.changes.recordChartEvent!(
+      await capabilities.changes.recordChartEvent!(
         input.kind === 'insight'
           ? 'chart.insight-produced'
           : input.kind === 'report'

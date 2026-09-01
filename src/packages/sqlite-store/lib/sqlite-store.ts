@@ -578,8 +578,7 @@ export class SqliteStore implements DatagramStore {
         created_at TEXT NOT NULL,
         updated_at TEXT,
         retired_at TEXT,
-        retired_by TEXT REFERENCES persons(id),
-        UNIQUE (channel_id, normalized_label)
+        retired_by TEXT REFERENCES persons(id)
       );
 
       CREATE TABLE IF NOT EXISTS table_records (
@@ -712,6 +711,36 @@ export class SqliteStore implements DatagramStore {
         ON messages(channel_id, created_at);
       CREATE INDEX IF NOT EXISTS message_revisions_message
         ON message_revisions(message_id, created_at, id);
+    `);
+
+    const dictionaryTable = this.#database
+      .query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'dictionary_entries'")
+      .get() as { sql: string } | null;
+    if (dictionaryTable?.sql.includes('UNIQUE (channel_id, normalized_label)')) {
+      this.#database.exec(`
+        ALTER TABLE dictionary_entries RENAME TO dictionary_entries_legacy;
+        CREATE TABLE dictionary_entries (
+          id TEXT PRIMARY KEY,
+          channel_id TEXT NOT NULL REFERENCES channels(id),
+          label TEXT NOT NULL,
+          normalized_label TEXT NOT NULL,
+          created_by TEXT NOT NULL REFERENCES persons(id),
+          created_at TEXT NOT NULL,
+          updated_at TEXT,
+          retired_at TEXT,
+          retired_by TEXT REFERENCES persons(id)
+        );
+        INSERT INTO dictionary_entries
+          SELECT * FROM dictionary_entries_legacy;
+        DROP TABLE dictionary_entries_legacy;
+      `);
+    }
+    this.#database.exec(`
+      CREATE INDEX IF NOT EXISTS dictionary_entries_channel
+        ON dictionary_entries(channel_id, created_at, id);
+      CREATE UNIQUE INDEX IF NOT EXISTS dictionary_entries_active_label
+        ON dictionary_entries(channel_id, normalized_label)
+        WHERE retired_at IS NULL;
     `);
 
     const personColumns = new Set(

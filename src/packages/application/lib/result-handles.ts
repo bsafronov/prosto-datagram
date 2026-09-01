@@ -3,6 +3,7 @@ import * as z from 'zod/v4';
 import { DatagramError } from '../../domain/errors';
 import type { JsonValue, QueryResult, ViewDefinition } from '../../domain/model';
 import { newId } from '../../domain/model';
+import type { ChannelTypeContractSelector } from './contracts';
 
 export type AgentViewMetadata = Readonly<Pick<
   ViewDefinition,
@@ -12,6 +13,7 @@ export type AgentViewMetadata = Readonly<Pick<
 export interface ResultSourceAuthorization {
   readonly input: unknown;
   readonly queryName: string;
+  readonly selectedType?: ChannelTypeContractSelector;
 }
 
 interface HandleEntry {
@@ -73,6 +75,7 @@ export interface DataViewQueryDefinition {
   readonly input: unknown;
   readonly purpose: string;
   readonly queryName: string;
+  readonly selectedType?: ChannelTypeContractSelector;
 }
 
 export interface ResultHandleBrokerOptions {

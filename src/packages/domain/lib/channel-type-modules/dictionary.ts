@@ -42,7 +42,7 @@ export const dictionaryChannelType = {
       const normalizedLabel = dictionaryLabelKey(input.label);
       invariant(
         !(await capabilities.state!.dictionaryEntries()).some(
-          (entry) => entry.normalizedLabel === normalizedLabel,
+          (entry) => entry.retiredAt === undefined && entry.normalizedLabel === normalizedLabel,
         ),
         'dictionary.entry-label-conflict',
         'Dictionary Entry label already exists',
@@ -62,13 +62,13 @@ export const dictionaryChannelType = {
       const normalizedLabel = dictionaryLabelKey(input.label);
       invariant(
         !(await capabilities.state!.dictionaryEntries()).some(
-          (candidate) => candidate.id !== entry.id && candidate.normalizedLabel === normalizedLabel,
+          (candidate) => candidate.id !== entry.id && candidate.retiredAt === undefined && candidate.normalizedLabel === normalizedLabel,
         ),
         'dictionary.entry-label-conflict',
         'Dictionary Entry label already exists',
         409,
       );
-      capabilities.changes.renameDictionaryEntry!({
+      await capabilities.changes.renameDictionaryEntry!({
         entryId: entry.id,
         label: input.label,
         normalizedLabel,
@@ -84,7 +84,7 @@ export const dictionaryChannelType = {
       const entry = await capabilities.state!.dictionaryEntry(input.entryId);
       invariant(entry?.channelId === input.channelId, 'dictionary.entry-not-found', 'Dictionary Entry not found', 404);
       invariant(entry.retiredAt === undefined, 'dictionary.entry-retired', 'Dictionary Entry is already retired', 409);
-      capabilities.changes.retireDictionaryEntry!(entry.id, capabilities.now());
+      await capabilities.changes.retireDictionaryEntry!(entry.id, capabilities.now());
       return capabilities.commit();
     }, { kind: 'channel-role', minimumRole: 'contributor' }, ['retireDictionaryEntry']),
     contract('dictionary.entry.restore', z.object({
@@ -95,7 +95,15 @@ export const dictionaryChannelType = {
       const entry = await capabilities.state!.dictionaryEntry(input.entryId);
       invariant(entry?.channelId === input.channelId, 'dictionary.entry-not-found', 'Dictionary Entry not found', 404);
       invariant(entry.retiredAt !== undefined, 'dictionary.entry-active', 'Dictionary Entry is not retired', 409);
-      capabilities.changes.restoreDictionaryEntry!(entry.id, capabilities.now());
+      invariant(
+        !(await capabilities.state!.dictionaryEntries()).some(
+          (candidate) => candidate.id !== entry.id && candidate.retiredAt === undefined && candidate.normalizedLabel === entry.normalizedLabel,
+        ),
+        'dictionary.entry-label-conflict',
+        'Dictionary Entry label already exists',
+        409,
+      );
+      await capabilities.changes.restoreDictionaryEntry!(entry.id, capabilities.now());
       return capabilities.commit();
     }, { kind: 'channel-role', minimumRole: 'contributor' }, ['restoreDictionaryEntry']),
     ...discussionActions,

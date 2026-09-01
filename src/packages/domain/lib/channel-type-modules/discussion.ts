@@ -34,7 +34,7 @@ export const discussionActions = [
       const reply = await capabilities.state!.message(input.replyToMessageId);
       invariant(reply?.channelId === input.channelId, 'discussion.message-not-found', 'Reply Message not found', 404);
     }
-    capabilities.changes.postDiscussionMessage!({
+    await capabilities.changes.postDiscussionMessage!({
       recordReferences: input.recordReferences,
       ...(input.replyToMessageId === undefined ? {} : { replyToMessageId: input.replyToMessageId }),
       text: input.text,
@@ -50,7 +50,7 @@ export const discussionActions = [
     const message = await capabilities.state!.message(input.messageId);
     invariant(message?.channelId === input.channelId, 'discussion.message-not-found', 'Message not found', 404);
     invariant(message.tombstonedAt === undefined, 'discussion.message-tombstoned', 'Tombstoned Message cannot be edited', 409);
-    capabilities.changes.editDiscussionMessage!(message.id, input.text);
+    await capabilities.changes.editDiscussionMessage!(message.id, input.text);
     return capabilities.commit();
   }, { kind: 'message-author-or-admin' }, ['editDiscussionMessage']),
   contract('discussion.message.tombstone', z.object({
@@ -61,7 +61,7 @@ export const discussionActions = [
     const message = await capabilities.state!.message(input.messageId);
     invariant(message?.channelId === input.channelId, 'discussion.message-not-found', 'Message not found', 404);
     invariant(message.tombstonedAt === undefined, 'discussion.message-already-tombstoned', 'Message is already tombstoned', 409);
-    capabilities.changes.tombstoneDiscussionMessage!(message.id);
+    await capabilities.changes.tombstoneDiscussionMessage!(message.id);
     return capabilities.commit();
   }, { kind: 'message-author-or-admin' }, ['tombstoneDiscussionMessage']),
   contract('discussion.message.restore', z.object({
@@ -72,7 +72,7 @@ export const discussionActions = [
     const message = await capabilities.state!.message(input.messageId);
     invariant(message?.channelId === input.channelId, 'discussion.message-not-found', 'Message not found', 404);
     invariant(message.tombstonedAt !== undefined, 'discussion.message-not-tombstoned', 'Message is not tombstoned', 409);
-    capabilities.changes.restoreDiscussionMessage!(message.id);
+    await capabilities.changes.restoreDiscussionMessage!(message.id);
     return capabilities.commit();
   }, { kind: 'message-author-or-admin' }, ['restoreDiscussionMessage']),
 ];
