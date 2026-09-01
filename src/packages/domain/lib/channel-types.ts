@@ -275,7 +275,7 @@ export class ChannelTypeRegistry {
   async planTableFieldConversion(
     id: string,
     version: string,
-    binding: Omit<TrustedTableFieldConversionPlan['binding'], 'fieldId' | 'observedVersion'>,
+    binding: Pick<TrustedTableFieldConversionPlan['binding'], 'actorId' | 'channelId' | 'serviceId'>,
     input: TableFieldConversionInput,
     state: ChannelTypeStatePort,
   ): Promise<TrustedTableFieldConversionPlan> {
@@ -283,10 +283,12 @@ export class ChannelTypeRegistry {
     invariant(definition.planTableFieldConversion, 'channel-type.capability-denied', 'Selected Channel Type version does not own Field conversion planning', 403);
     const key = ChannelTypeRegistry.key(id, version);
     const issuer = this.#conversionPlanIssuers.get(key)!;
-    const seal: SealTableFieldConversionPlan = (payload, fieldId, observedVersion) => {
+    const seal: SealTableFieldConversionPlan = (payload) => {
+      const purpose = input.resolutions === undefined ? 'preview' : 'execute';
       const sealed = deepFreeze(structuredClone({
         ...payload,
-        binding: { ...binding, fieldId, observedVersion },
+        binding: { ...binding, fieldId: input.fieldId, observedVersion: input.observedVersion, purpose, typeId: id, typeVersion: version },
+        purpose,
       })) as TrustedTableFieldConversionPlan;
       issuer.add(sealed);
       return sealed;
@@ -298,15 +300,17 @@ export class ChannelTypeRegistry {
     id: string,
     version: string,
     value: TrustedTableFieldConversionPlan,
-    binding: Omit<TrustedTableFieldConversionPlan['binding'], 'fieldId' | 'observedVersion'>,
+    binding: Pick<TrustedTableFieldConversionPlan['binding'], 'actorId' | 'channelId' | 'serviceId'>,
   ): TrustedTableFieldConversionPlan {
     const issuer = this.#conversionPlanIssuers.get(ChannelTypeRegistry.key(id, version));
     invariant(value !== null && typeof value === 'object' && issuer?.delete(value), 'channel-type.capability-denied', 'Field conversion plan was not issued by the selected Channel Type version', 403);
-    invariant(value.purpose === 'execute', 'channel-type.capability-denied', 'Preview plans cannot emit Field transitions', 403);
+    invariant(value.purpose === 'execute' && value.binding.purpose === 'execute', 'channel-type.capability-denied', 'Preview plans cannot emit Field transitions', 403);
     invariant(
       value.binding.actorId === binding.actorId &&
         value.binding.channelId === binding.channelId &&
-        value.binding.serviceId === binding.serviceId,
+        value.binding.serviceId === binding.serviceId &&
+        value.binding.typeId === id &&
+        value.binding.typeVersion === version,
       'channel-type.capability-denied',
       'Field conversion plan belongs to another execution scope',
       403,

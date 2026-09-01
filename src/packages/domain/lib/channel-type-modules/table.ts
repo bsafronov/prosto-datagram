@@ -71,7 +71,10 @@ export interface TrustedTableFieldConversionPlan {
     readonly channelId: string;
     readonly fieldId: string;
     readonly observedVersion: number;
+    readonly purpose: 'execute' | 'preview';
     readonly serviceId: string;
+    readonly typeId: string;
+    readonly typeVersion: string;
   };
   readonly field: TableField;
   readonly previousField: TableField;
@@ -89,11 +92,9 @@ export interface TrustedTableFieldConversionPlan {
   }[];
 }
 
-export type TableFieldConversionPlanPayload = Omit<TrustedTableFieldConversionPlan, 'binding'>;
+export type TableFieldConversionPlanPayload = Omit<TrustedTableFieldConversionPlan, 'binding' | 'purpose'>;
 export type SealTableFieldConversionPlan = (
   payload: TableFieldConversionPlanPayload,
-  fieldId: string,
-  observedVersion: number,
 ) => TrustedTableFieldConversionPlan;
 
 export async function planTableFieldConversion(
@@ -145,7 +146,7 @@ export async function planTableFieldConversion(
   const preview = { defaultFailure, failures, fieldId: field.id, observedVersion: field.version, targetType: input.targetType };
   const requestedResolutions = input.resolutions;
   if (requestedResolutions === undefined && input.defaultResolution === undefined) {
-    return sealCanonicalPlan({ field: nextField, previousField: field, preview, purpose: 'preview', recordUpdates: [] }, field.id, field.version);
+    return sealCanonicalPlan({ field: nextField, previousField: field, preview, recordUpdates: [] });
   }
   invariant((defaultFailure !== null) === (input.defaultResolution !== undefined), 'table.field-conversion-default-unresolved', defaultFailure !== null ? 'Incompatible default value needs one explicit resolution' : 'Default resolution does not match an incompatible default', 409);
   const nextDefault = input.defaultResolution ? await resolveValue(input.defaultResolution) : field.defaultValue;
@@ -174,7 +175,7 @@ export async function planTableFieldConversion(
       },
     };
   });
-  return sealCanonicalPlan({ field: nextField, previousField: field, preview, purpose: 'execute', recordUpdates }, field.id, field.version);
+  return sealCanonicalPlan({ field: nextField, previousField: field, preview, recordUpdates });
 }
 
 export function validateTableFieldValue(field: TableField, rawValue: unknown): JsonValue {

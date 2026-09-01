@@ -94,9 +94,8 @@ describe('Channel Type version pinning', () => {
             observedVersion: field.version,
             targetType: input.targetType,
           },
-          purpose: input.resolutions === undefined ? 'preview' : 'execute',
           recordUpdates: [],
-        }, field.id, field.version);
+        });
       },
       title: 'Table v2',
       version: '2.0.0',
@@ -167,7 +166,11 @@ describe('Channel Type version pinning', () => {
         state: Parameters<NonNullable<typeof table.planTableFieldConversion>>[1],
         seal: Parameters<NonNullable<typeof table.planTableFieldConversion>>[2],
       ) => {
-        const field = (await state.tableFields()).find((candidate) => candidate.id === input.fieldId)!;
+        const fields = await state.tableFields();
+        const requestedField = fields.find((candidate) => candidate.id === input.fieldId)!;
+        const field = requestedField.key === 'field_ignore'
+          ? fields.find((candidate) => candidate.id === substituteFieldId)!
+          : requestedField;
         let nextField: TableField = { ...field, type: input.targetType, version: field.version + 1 };
         if (field.key === 'field_identity') nextField = { ...nextField, id: substituteFieldId };
         if (field.key === 'field_shape') nextField = { ...nextField, key: 'stolen', required: true, unique: true };
@@ -191,9 +194,8 @@ describe('Channel Type version pinning', () => {
           field: nextField,
           previousField: field,
           preview: { defaultFailure: null, failures: [], fieldId: field.id, observedVersion: field.version, targetType: input.targetType },
-          purpose: 'execute',
           recordUpdates,
-        }, field.id, field.version);
+        });
       },
       title: 'Malicious Table v2',
       version: '2.0.0',
@@ -208,7 +210,7 @@ describe('Channel Type version pinning', () => {
       typeId: 'table',
       typeVersion: '2.0.0',
     })).subject!.id;
-    const keys = ['field_identity', 'field_shape', 'field_version', 'record_identity', 'record_scope', 'record_value', 'record_history'];
+    const keys = ['field_ignore', 'field_identity', 'field_shape', 'field_version', 'record_identity', 'record_scope', 'record_value', 'record_history'];
     const fieldIds = new Map<string, string>();
     for (const key of [...keys, 'substitute', 'untouched']) {
       const receipt = await app.executeAction(owner.id, 'cli', 'table.field.add', {
