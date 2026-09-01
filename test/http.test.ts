@@ -69,6 +69,12 @@ test('HTTP adapter exposes the shared action and query contracts', async () => {
   expect(await actions.json()).toEqual({ actions: runtime.app.actions.catalog() });
   const queries = await fetch(authenticated('/v1/queries'));
   expect(await queries.json()).toEqual({ queries: runtime.app.queries.catalog() });
+  const pinnedQueries = await fetch(
+    authenticated('/v1/queries?typeId=table&typeVersion=1.0.0'),
+  );
+  expect(await pinnedQueries.json()).toEqual({
+    queries: runtime.app.queries.catalog({ typeId: 'table', typeVersion: '1.0.0' }),
+  });
 
   const created = await fetch(
     authenticated('/v1/actions/channel.create', {

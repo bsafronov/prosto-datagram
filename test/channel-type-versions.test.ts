@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, test } from 'bun:test';
+import * as z from 'zod/v4';
 
 import { DatagramError } from '../src/packages/application/errors';
-import { createDatagramApplication } from '../src/packages/application';
+import { createDatagramApplication, DatagramApplication } from '../src/packages/application';
 import {
   bundledChannelTypes,
   ChannelTypeRegistry,
@@ -47,17 +48,195 @@ describe('Channel Type version pinning', () => {
     }
   });
 
-  test('deep-freezes installed definitions, contracts, schemas, and views', () => {
+  test('deep-freezes metadata and exposes isolated real Zod schemas', () => {
     const registry = new ChannelTypeRegistry(bundledChannelTypes);
     const definition = registry.require('table', '1.0.0');
     expect(Object.isFrozen(definition)).toBeTrue();
     expect(Object.isFrozen(definition.actions)).toBeTrue();
     expect(Object.isFrozen(definition.actions[0])).toBeTrue();
-    expect(Object.isFrozen(definition.actions[0]!.inputSchema)).toBeTrue();
+    expect(z.toJSONSchema(definition.actions[0]!.inputSchema)).toMatchObject({ type: 'object' });
+    expect(definition.actions[0]!.inputSchema).not.toBe(definition.actions[0]!.inputSchema);
     expect(Object.isFrozen(definition.views)).toBeTrue();
     expect(Object.isFrozen(definition.views[0])).toBeTrue();
     expect(Object.isFrozen(definition.views[0]!.commands)).toBeTrue();
     expect(() => definition.views[0]!.commands.push('mutated')).toThrow();
+  });
+
+  test('snapshots caller schemas and isolates schemas returned to consumers', () => {
+    const source = z.object({ channelId: z.string(), value: z.string() });
+    const registry = new ChannelTypeRegistry([
+      {
+        actions: [{ inputSchema: source, name: 'custom.write' }],
+        activityKinds: [],
+        id: 'custom',
+        queries: [],
+        recordKinds: [],
+        stateRules: [],
+        title: 'Custom',
+        version: '1.0.0',
+        views: [],
+      },
+    ]);
+    source.shape.value = z.number() as never;
+    expect(registry.requireAction('custom', '1.0.0', 'custom.write')!.parse({
+      channelId: 'channel',
+      value: 'stable',
+    })).toEqual({ channelId: 'channel', value: 'stable' });
+
+    const exposed = registry.requireAction('custom', '1.0.0', 'custom.write')! as z.ZodObject;
+    exposed.shape.value = z.number();
+    expect(registry.requireAction('custom', '1.0.0', 'custom.write')!.safeParse({
+      channelId: 'channel',
+      value: 'still-stable',
+    }).success).toBeTrue();
+  });
+
+  test('discovers and executes exact contracts for pinned versions', async () => {
+    const table = bundledChannelTypes.find((definition) => definition.id === 'table')!;
+    const v2 = {
+      ...table,
+      actions: table.actions.map((action) =>
+        action.name === 'table.record.create'
+          ? {
+              ...action,
+              inputSchema: z.object({
+                channelId: z.string().min(1),
+                mode: z.literal('v2').optional(),
+                values: z.record(z.string(), z.unknown()),
+              }),
+            }
+          : action,
+      ),
+      queries: table.queries.map((query) =>
+        query.name === 'table.configuration'
+          ? {
+              ...query,
+              inputSchema: z.object({
+                channelId: z.string().min(1),
+                edition: z.literal('v2'),
+              }),
+            }
+          : query,
+      ),
+      title: 'Table v2',
+      version: '2.0.0',
+      stateRules: [
+        ...table.stateRules,
+        {
+          name: 'v2-record-mode',
+          validate: (contract: string, input: unknown) => {
+            if (
+              contract === 'table.record.create' &&
+              (input as { mode?: unknown }).mode !== 'v2'
+            ) throw new Error('Table v2 record mode is required');
+          },
+          validateTransition: (operation: Operation) => {
+            if (
+              operation.action === 'table.display-field.set' &&
+              operation.changes.some(
+                (change) =>
+                  change.kind === 'table.display-field-set' && change.displayFieldId === undefined,
+              )
+            ) throw new Error('Table v2 requires a display field');
+          },
+        },
+      ],
+      views: table.views.map((view) =>
+        view.query === 'table.configuration'
+          ? {
+              ...view,
+              commands: [],
+              kind: 'table-configuration-v2',
+              produce: (candidate: Parameters<ChannelTypeRegistry['produceView']>[3]) => ({
+                ...candidate,
+                commands: [],
+                kind: 'table-configuration-v2',
+                title: 'Table Configuration v2',
+              }),
+            }
+          : view,
+      ),
+    };
+    const registry = new ChannelTypeRegistry([
+      ...bundledChannelTypes.filter((definition) => definition.id !== 'table'),
+      table,
+      v2,
+    ]);
+    const store = new SqliteStore(':memory:');
+    stores.push(store);
+    await store.initialize();
+    const owner = await store.ensureLocalOwner();
+    for (const [id, version] of [['table-v1', '1.0.0'], ['table-v2', '2.0.0']] as const) {
+      const channel: Channel = {
+        createdAt: new Date().toISOString(),
+        id,
+        ownerId: owner.id,
+        title: id,
+        typeId: 'table',
+        typeVersion: version,
+        updatedAt: new Date().toISOString(),
+      };
+      await store.commit({
+        action: 'test.seed',
+        actorId: owner.id,
+        changes: [
+          { channel, kind: 'channel.created' },
+          { kind: 'membership.granted', membership: { channelId: id, personId: owner.id, role: 'owner' } },
+        ],
+        channelId: id,
+        id: `seed-${id}`,
+        intent: 'test.seed',
+        occurredAt: new Date().toISOString(),
+        origin: 'cli',
+        result: { status: 'succeeded' },
+        status: 'succeeded',
+      });
+    }
+    const app = new DatagramApplication(store, registry);
+    const v1Catalog = app.queries.catalog({ typeId: 'table', typeVersion: '1.0.0' });
+    const v2Catalog = app.queries.catalog({ typeId: 'table', typeVersion: '2.0.0' });
+    const configuration = (catalog: typeof v1Catalog) =>
+      catalog.find((definition) => definition.name === 'table.configuration')!.inputSchema;
+    expect(configuration(v1Catalog).required).toEqual(['channelId']);
+    expect(configuration(v2Catalog).required).toEqual(['channelId', 'edition']);
+    await app.executeQuery(owner.id, 'cli', 'table.configuration', { channelId: 'table-v1' });
+    await expect(
+      app.executeQuery(owner.id, 'cli', 'table.configuration', { channelId: 'table-v2' }),
+    ).rejects.toBeDefined();
+    const v2Result = await app.executeQuery(owner.id, 'cli', 'table.configuration', {
+      channelId: 'table-v2',
+      edition: 'v2',
+    });
+    expect(v2Result.view).toMatchObject({
+      commands: [],
+      kind: 'table-configuration-v2',
+      title: 'Table Configuration v2',
+    });
+    await app.executeAction(owner.id, 'cli', 'table.record.create', {
+      channelId: 'table-v1',
+      values: {},
+    });
+    await expect(
+      app.executeAction(owner.id, 'cli', 'table.record.create', {
+        channelId: 'table-v2',
+        values: {},
+      }),
+    ).rejects.toThrow('Table v2 record mode is required');
+    await app.executeAction(owner.id, 'cli', 'table.record.create', {
+      channelId: 'table-v2',
+      mode: 'v2',
+      values: {},
+    });
+    await app.executeAction(owner.id, 'cli', 'table.display-field.set', {
+      channelId: 'table-v1',
+      fieldId: null,
+    });
+    await expect(
+      app.executeAction(owner.id, 'cli', 'table.display-field.set', {
+        channelId: 'table-v2',
+        fieldId: null,
+      }),
+    ).rejects.toThrow('Table v2 requires a display field');
   });
 
   test('rejects reads and actions for a Channel pinned to an unavailable version', async () => {

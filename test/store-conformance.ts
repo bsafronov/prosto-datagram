@@ -567,5 +567,41 @@ export function storeConformance(name: string, createFixture: StoreFixtureFactor
         await fixture.dispose();
       }
     });
+
+    test('applies Activity through the shared Operation transition', async () => {
+      const fixture = await createFixture();
+      try {
+        const owner = await fixture.store.ensureLocalOwner('Owner');
+        await commitChannel(fixture.store, owner, 'activity-channel', 1);
+        const invalid = operation({
+          action: 'test.invalid-activity',
+          actorId: owner.id,
+          changes: [{
+            activity: activity(
+              'invalid-activity',
+              'activity-channel',
+              'missing-actor',
+              'invalid-activity-operation',
+              2,
+            ),
+            kind: 'activity.appended',
+          }],
+          channelId: 'activity-channel',
+          id: 'invalid-activity-operation',
+          second: 2,
+        });
+        await expect(fixture.store.commit(invalid)).rejects.toThrow(
+          'Channel Activity actor is unavailable',
+        );
+        expect(
+          (await fixture.store.listOperations('activity-channel')).some(
+            (candidate) => candidate.id === invalid.id,
+          ),
+        ).toBeFalse();
+        expect(await fixture.store.listActivities('activity-channel')).toHaveLength(1);
+      } finally {
+        await fixture.dispose();
+      }
+    });
   });
 }

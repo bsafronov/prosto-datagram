@@ -1,12 +1,8 @@
 import { Database } from 'bun:sqlite';
 
 import {
-  applyChange,
-  applyTableRecordUpdate,
-  checkOwnerInvariant,
-  parseRecordState,
+  applyOperation,
   type StoreState,
-  validatePostedMessage,
 } from '../../application/transitions';
 
 import {
@@ -398,6 +394,45 @@ const groupEntryFromRow = (row: ChannelGroupEntryRow): ChannelGroupEntry => ({
   pinned: row.pinned === 1,
   position: row.position,
 });
+
+const subscriptionEventFromRow = (row: SubscriptionEventRow): SubscriptionEvent => {
+  if (row.event_type === 'activity') {
+    if (
+      row.activity_actor_id === null ||
+      row.activity_channel_id === null ||
+      row.activity_id === null ||
+      row.activity_kind === null ||
+      row.activity_occurred_at === null ||
+      row.activity_operation_id === null ||
+      row.activity_position === null
+    ) throw new Error('Activity subscription event is incomplete');
+    return {
+      activity: {
+        actorId: row.activity_actor_id,
+        channelId: row.activity_channel_id,
+        id: row.activity_id,
+        kind: row.activity_kind,
+        occurredAt: row.activity_occurred_at,
+        operationId: row.activity_operation_id,
+        position: row.activity_position,
+      },
+      id: row.id,
+      position: row.position,
+      type: 'activity',
+    };
+  }
+  return {
+    action: row.action,
+    actorId: row.actor_id,
+    ...(row.channel_id === null ? {} : { channelId: row.channel_id }),
+    id: row.id,
+    occurredAt: row.occurred_at,
+    operationId: row.operation_id,
+    position: row.position,
+    status: row.status,
+    type: 'operation-result',
+  };
+};
 
 export class SqliteStore implements DatagramStore {
   readonly #database: Database;
@@ -1137,70 +1172,16 @@ export class SqliteStore implements DatagramStore {
          LIMIT ?`,
       )
       .all(afterPosition, limit) as SubscriptionEventRow[];
-    return rows.map((row): SubscriptionEvent => {
-      if (row.event_type === 'activity') {
-        if (
-          row.activity_actor_id === null ||
-          row.activity_channel_id === null ||
-          row.activity_id === null ||
-          row.activity_kind === null ||
-          row.activity_occurred_at === null ||
-          row.activity_operation_id === null ||
-          row.activity_position === null
-        ) {
-          throw new Error('Activity subscription event is incomplete');
-        }
-        return {
-          activity: {
-            actorId: row.activity_actor_id,
-            channelId: row.activity_channel_id,
-            id: row.activity_id,
-            kind: row.activity_kind,
-            occurredAt: row.activity_occurred_at,
-            operationId: row.activity_operation_id,
-            position: row.activity_position,
-          },
-          id: row.id,
-          position: row.position,
-          type: 'activity',
-        };
-      }
-      return {
-        action: row.action,
-        actorId: row.actor_id,
-        ...(row.channel_id === null ? {} : { channelId: row.channel_id }),
-        id: row.id,
-        occurredAt: row.occurred_at,
-        operationId: row.operation_id,
-        position: row.position,
-        status: row.status,
-        type: 'operation-result',
-      };
-    });
+    return rows.map(subscriptionEventFromRow);
   }
 
   async commit(operation: Operation): Promise<void> {
     const apply = this.#database.transaction((candidate: Operation) => {
       const state = this.#transitionState();
-      if (state.operations.some((existing) => existing.id === candidate.id)) {
-        throw new Error('Operation identity already exists');
-      }
-      for (const change of candidate.changes) {
-        if (change.kind !== 'activity.appended') applyChange(state, change);
-      }
-      checkOwnerInvariant(state);
-      if (!state.persons.some((person) => person.id === candidate.actorId)) {
-        throw new Error('Operation actor is unavailable');
-      }
-      if (
-        candidate.channelId !== undefined &&
-        !state.channels.some((channel) => channel.id === candidate.channelId)
-      ) {
-        throw new Error('Operation Channel is unavailable');
-      }
+      applyOperation(state, candidate);
 
       for (const change of candidate.changes) {
-        if (change.kind !== 'activity.appended') this.#persistChange(change);
+        if (change.kind !== 'activity.appended') this.#projectReducedChange(change, state);
       }
 
       this.#database.run(
@@ -1223,7 +1204,7 @@ export class SqliteStore implements DatagramStore {
       );
 
       for (const change of candidate.changes) {
-        if (change.kind === 'activity.appended') this.#persistChange(change);
+        if (change.kind === 'activity.appended') this.#projectReducedChange(change, state);
       }
 
       for (const change of candidate.changes) {
@@ -1255,17 +1236,37 @@ export class SqliteStore implements DatagramStore {
         ],
       );
     });
-    apply(operation);
+    apply.immediate(operation);
   }
 
   #transitionState(): StoreState {
     const messages = this.#database.query('SELECT * FROM messages').all() as MessageRow[];
-    const activityPosition = this.#database
-      .query('SELECT COALESCE(MAX(sequence), 0) AS position FROM channel_activities')
-      .get() as { position: number };
-    const eventPosition = this.#database
-      .query('SELECT COALESCE(MAX(position), 0) AS position FROM subscription_events')
-      .get() as { position: number };
+    const sequence = (table: string): number =>
+      (this.#database.query('SELECT seq FROM sqlite_sequence WHERE name = ?').get(table) as
+        | { seq: number }
+        | null)?.seq ?? 0;
+    const events = this.#database.query(
+      `SELECT events.position,
+              events.id,
+              events.event_type,
+              events.operation_id,
+              events.channel_id,
+              events.actor_id,
+              events.occurred_at,
+              operations.action,
+              operations.status,
+              activities.id AS activity_id,
+              activities.channel_id AS activity_channel_id,
+              activities.operation_id AS activity_operation_id,
+              activities.kind AS activity_kind,
+              activities.actor_id AS activity_actor_id,
+              activities.occurred_at AS activity_occurred_at,
+              activities.sequence AS activity_position
+       FROM subscription_events AS events
+       INNER JOIN operations ON operations.id = events.operation_id
+       LEFT JOIN channel_activities AS activities ON activities.id = events.activity_id
+       ORDER BY events.position`,
+    ).all() as SubscriptionEventRow[];
     const tableDisplayFields = this.#database
       .query('SELECT channel_id, display_field_id FROM table_settings')
       .all() as Array<{ channel_id: string; display_field_id: string | null }>;
@@ -1275,7 +1276,7 @@ export class SqliteStore implements DatagramStore {
       activities: (
         this.#database.query('SELECT *, sequence AS position FROM channel_activities').all() as ActivityRow[]
       ).map(activityFromRow),
-      activitySequence: activityPosition.position,
+      activitySequence: sequence('channel_activities'),
       channelGroupEntries: (
         this.#database.query('SELECT * FROM channel_group_entries').all() as ChannelGroupEntryRow[]
       ).map(groupEntryFromRow),
@@ -1289,8 +1290,8 @@ export class SqliteStore implements DatagramStore {
       dictionaryEntries: (
         this.#database.query('SELECT * FROM dictionary_entries').all() as DictionaryEntryRow[]
       ).map(dictionaryEntryFromRow),
-      eventSequence: eventPosition.position,
-      events: [],
+      eventSequence: sequence('subscription_events'),
+      events: events.map(subscriptionEventFromRow),
       invitations: (
         this.#database.query('SELECT * FROM channel_invitations').all() as InvitationRow[]
       ).map(invitationFromRow),
@@ -1321,7 +1322,7 @@ export class SqliteStore implements DatagramStore {
     };
   }
 
-  #persistChange(change: DomainChange): void {
+  #projectReducedChange(change: DomainChange, reduced: StoreState): void {
     switch (change.kind) {
       case 'person.created':
         this.#database.run(
@@ -1785,30 +1786,7 @@ export class SqliteStore implements DatagramStore {
         );
         return;
       case 'table.record-updated': {
-        const row = this.#database
-          .query(
-            `SELECT channel_id, created_by, created_at, values_json, field_versions_json
-             FROM table_records WHERE id = ?`,
-          )
-          .get(change.recordId) as {
-          channel_id: string;
-          created_at: string;
-          created_by: string;
-          field_versions_json: string;
-          values_json: string;
-        } | null;
-        if (!row) throw new Error('Table Record is unavailable');
-        const next = applyTableRecordUpdate(
-          parseRecordState(
-            change.recordId,
-            row.channel_id,
-            row.created_by,
-            row.created_at,
-            row.values_json,
-            row.field_versions_json,
-          ),
-          change,
-        );
+        const next = reduced.tableRecords.find((record) => record.id === change.recordId)!;
         const result = this.#database.run(
           `UPDATE table_records
            SET values_json = ?, field_versions_json = ?, updated_at = ? WHERE id = ?`,
@@ -1930,16 +1908,6 @@ export class SqliteStore implements DatagramStore {
         return;
       }
       case 'discussion.message-posted':
-        let replyTargetChannelId: string | undefined;
-        if (change.message.replyToMessageId !== undefined) {
-          const replyTarget = this.#database
-            .query('SELECT channel_id FROM messages WHERE id = ?')
-            .get(change.message.replyToMessageId) as {
-            channel_id: string;
-          } | null;
-          replyTargetChannelId = replyTarget?.channel_id;
-        }
-        validatePostedMessage(change.message, replyTargetChannelId);
         this.#database.run(
           `INSERT INTO messages
             (id, channel_id, author_id, text, record_references_json, reply_to_message_id,

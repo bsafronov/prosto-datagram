@@ -5,6 +5,7 @@ export {
 } from './lib/domain-transitions';
 export {
   applyChange,
+  applyOperation,
   checkOwnerInvariant,
   copy,
   emptyState,

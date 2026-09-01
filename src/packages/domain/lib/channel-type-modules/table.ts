@@ -230,6 +230,21 @@ export const tableChannelType = {
         'table.record-invalid',
         'Table Record input must be an object',
       );
+    }, (operation) => {
+      if (operation.action === 'table.record.create') {
+        invariant(
+          operation.changes.some((change) => change.kind === 'table.record-created'),
+          'table.transition-invalid',
+          'Table Record creation must produce a Table Record transition',
+        );
+      }
+      if (operation.action === 'table.record.edit') {
+        invariant(
+          operation.changes.some((change) => change.kind === 'table.record-updated'),
+          'table.transition-invalid',
+          'Table Record edit must produce a Table Record transition',
+        );
+      }
     }),
   ],
   title: 'Table',

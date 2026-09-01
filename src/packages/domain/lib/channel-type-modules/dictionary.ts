@@ -72,6 +72,17 @@ export const dictionaryChannelType = {
         'dictionary.label-invalid',
         'Dictionary Entry label must be normalized',
       );
+    }, (operation) => {
+      for (const change of operation.changes) {
+        if (change.kind !== 'dictionary.entry-created' && change.kind !== 'dictionary.entry-renamed') continue;
+        invariant(
+          change.kind === 'dictionary.entry-created'
+            ? change.entry.label === normalizeDictionaryLabel(change.entry.label)
+            : change.label === normalizeDictionaryLabel(change.label),
+          'dictionary.transition-invalid',
+          'Dictionary transitions must preserve normalized labels',
+        );
+      }
     }),
   ],
   title: 'Dictionary',

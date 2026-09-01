@@ -71,6 +71,17 @@ export const chartChannelType = {
         'chart.definition-invalid-aggregation',
         'Chart needs uniquely named aggregations',
       );
+    }, (operation) => {
+      const transition = operation.changes.find(
+        (change) => change.kind === 'chart.definition-set',
+      );
+      if (transition?.kind !== 'chart.definition-set') return;
+      invariant(
+        new Set(transition.definition.aggregations.map((aggregation) => aggregation.as)).size ===
+          transition.definition.aggregations.length,
+        'chart.transition-invalid',
+        'Chart transitions need uniquely named aggregations',
+      );
     }),
   ],
   title: 'Chart',

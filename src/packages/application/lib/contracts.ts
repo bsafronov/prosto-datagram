@@ -33,6 +33,16 @@ export interface ContractDefinition {
   readonly name: string;
 }
 
+export interface ChannelTypeContractSelector {
+  readonly typeId: string;
+  readonly typeVersion: string;
+}
+
+type ContractSchemaResolver = (
+  selector: ChannelTypeContractSelector,
+  name: string,
+) => z.ZodType | undefined;
+
 export const defineAction = <TInput>(definition: {
   readonly description: string;
   readonly inputSchema: z.ZodType<TInput>;
@@ -71,10 +81,10 @@ class DefinitionRegistry<
     return [...this.#definitions.values()];
   }
 
-  catalog(): readonly ContractDefinition[] {
+  catalog(resolveSchema?: (name: string) => z.ZodType | undefined): readonly ContractDefinition[] {
     return this.list().map(({ description, inputSchema, name }) => ({
       description,
-      inputSchema: z.toJSONSchema(inputSchema, { unrepresentable: 'any' }),
+      inputSchema: z.toJSONSchema(resolveSchema?.(name) ?? inputSchema, { unrepresentable: 'any' }),
       name,
     }));
   }
@@ -88,17 +98,23 @@ class DefinitionRegistry<
 
 export class ActionRegistry {
   readonly #registry: DefinitionRegistry<ActionDefinition>;
+  readonly #schemaResolver: ContractSchemaResolver | undefined;
 
-  constructor(definitions: readonly ActionDefinition[]) {
+  constructor(definitions: readonly ActionDefinition[], schemaResolver?: ContractSchemaResolver) {
     this.#registry = new DefinitionRegistry(definitions, 'action.duplicate');
+    this.#schemaResolver = schemaResolver;
   }
 
   list(): readonly ActionDefinition[] {
     return this.#registry.list();
   }
 
-  catalog(): readonly ContractDefinition[] {
-    return this.#registry.catalog();
+  catalog(selector?: ChannelTypeContractSelector): readonly ContractDefinition[] {
+    return this.#registry.catalog(
+      selector && this.#schemaResolver
+        ? (name) => this.#schemaResolver!(selector, name)
+        : undefined,
+    );
   }
 
   async execute(
@@ -114,17 +130,23 @@ export class ActionRegistry {
 
 export class QueryRegistry {
   readonly #registry: DefinitionRegistry<QueryDefinition>;
+  readonly #schemaResolver: ContractSchemaResolver | undefined;
 
-  constructor(definitions: readonly QueryDefinition[]) {
+  constructor(definitions: readonly QueryDefinition[], schemaResolver?: ContractSchemaResolver) {
     this.#registry = new DefinitionRegistry(definitions, 'query.duplicate');
+    this.#schemaResolver = schemaResolver;
   }
 
   list(): readonly QueryDefinition[] {
     return this.#registry.list();
   }
 
-  catalog(): readonly ContractDefinition[] {
-    return this.#registry.catalog();
+  catalog(selector?: ChannelTypeContractSelector): readonly ContractDefinition[] {
+    return this.#registry.catalog(
+      selector && this.#schemaResolver
+        ? (name) => this.#schemaResolver!(selector, name)
+        : undefined,
+    );
   }
 
   async execute(

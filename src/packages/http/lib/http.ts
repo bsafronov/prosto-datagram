@@ -102,11 +102,15 @@ function handler(
         throw new DatagramError('identity.unauthenticated', 'Authentication required', 401);
       }
       const actorId = identity.actorId;
+      const typeId = url.searchParams.get('typeId');
+      const typeVersion = url.searchParams.get('typeVersion');
+      const selector =
+        typeId && typeVersion ? { typeId, typeVersion } : undefined;
       if (request.method === 'GET' && url.pathname === '/v1/actions') {
-        return json({ actions: app.actions.catalog() });
+        return json({ actions: app.actions.catalog(selector) });
       }
       if (request.method === 'GET' && url.pathname === '/v1/queries') {
-        return json({ queries: app.queries.catalog() });
+        return json({ queries: app.queries.catalog(selector) });
       }
       if (request.method === 'GET' && url.pathname === '/v1/events') {
         const rawPosition =

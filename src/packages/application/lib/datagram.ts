@@ -117,20 +117,18 @@ export class DatagramApplication {
     handles = new ResultHandleBroker(),
   ) {
     this.handles = handles;
-    const actions = this.#actionDefinitions().map((definition) => ({
-      ...definition,
-      inputSchema: this.channelTypes.canonicalAction(definition.name) ?? definition.inputSchema,
-    }));
-    const queries = this.#queryDefinitions().map((definition) => ({
-      ...definition,
-      inputSchema: this.channelTypes.canonicalQuery(definition.name) ?? definition.inputSchema,
-    }));
+    const actions = this.#actionDefinitions();
+    const queries = this.#queryDefinitions();
     this.channelTypes.assertImplementations(
       new Set(actions.map((definition) => definition.name)),
       new Set(queries.map((definition) => definition.name)),
     );
-    this.actions = new ActionRegistry(actions);
-    this.queries = new QueryRegistry(queries);
+    this.actions = new ActionRegistry(actions, (selector, name) =>
+      this.channelTypes.requireAction(selector.typeId, selector.typeVersion, name),
+    );
+    this.queries = new QueryRegistry(queries, (selector, name) =>
+      this.channelTypes.requireQuery(selector.typeId, selector.typeVersion, name),
+    );
   }
 
   async verifyServiceIdentity(actorId: string): Promise<{ readonly actorId: string }> {
@@ -174,7 +172,15 @@ export class DatagramApplication {
           ? this.channelTypes.require(channel.typeId, channel.typeVersion)
           : undefined;
         if (definition?.queries.some((query) => query.name === name)) {
-          this.channelTypes.assertView(channel!.typeId, channel!.typeVersion, name, result.view);
+          return {
+            ...result,
+            view: this.channelTypes.produceView(
+              channel!.typeId,
+              channel!.typeVersion,
+              name,
+              result.view,
+            ),
+          };
         }
       }
     }
@@ -447,6 +453,12 @@ export class DatagramApplication {
       },
       status: 'succeeded',
     };
+    const persistedChannel = channelId ? await this.store.getChannel(channelId) : null;
+    const createdChannel = operation.changes.find((change) => change.kind === 'channel.created');
+    const channel = persistedChannel ?? (createdChannel?.kind === 'channel.created' ? createdChannel.channel : null);
+    if (channel) {
+      this.channelTypes.validateTransition(channel.typeId, channel.typeVersion, operation);
+    }
     await this.store.commit(operation);
     return {
       action,

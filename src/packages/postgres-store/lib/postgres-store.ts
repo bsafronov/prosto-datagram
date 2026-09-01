@@ -2,8 +2,7 @@ import { SQL } from 'bun';
 
 import type { DatagramStore } from '../../application/store';
 import {
-  applyChange,
-  checkOwnerInvariant,
+  applyOperation,
   copy,
   emptyState,
   insert,
@@ -135,45 +134,7 @@ export class PostgresStore implements DatagramStore {
       const row = rows[0];
       if (!row) throw new Error('PostgreSQL Store state is unavailable');
       const state = parseState(row.state_json);
-      if (state.operations.some((candidate) => candidate.id === operation.id)) {
-        throw new Error('Operation identity already exists');
-      }
-      for (const change of operation.changes) {
-        if (change.kind !== 'activity.appended') applyChange(state, change);
-      }
-      checkOwnerInvariant(state);
-      if (!state.persons.some((person) => person.id === operation.actorId)) {
-        throw new Error('Operation actor is unavailable');
-      }
-      if (
-        operation.channelId !== undefined &&
-        !state.channels.some((channel) => channel.id === operation.channelId)
-      ) {
-        throw new Error('Operation Channel is unavailable');
-      }
-      state.operations.push(copy(operation));
-      for (const change of operation.changes) {
-        if (change.kind !== 'activity.appended') continue;
-        applyChange(state, change);
-        const activity = state.activities.at(-1)!;
-        state.events.push({
-          activity,
-          id: activity.id,
-          position: ++state.eventSequence,
-          type: 'activity',
-        });
-      }
-      state.events.push({
-        action: operation.action,
-        actorId: operation.actorId,
-        ...(operation.channelId === undefined ? {} : { channelId: operation.channelId }),
-        id: `operation-result:${operation.id}`,
-        occurredAt: operation.occurredAt,
-        operationId: operation.id,
-        position: ++state.eventSequence,
-        status: operation.status,
-        type: 'operation-result',
-      });
+      applyOperation(state, operation);
       await sql.unsafe(
         `UPDATE datagram_store_state
          SET state_json = $1, revision = revision + 1
