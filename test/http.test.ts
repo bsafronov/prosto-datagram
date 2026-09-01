@@ -41,5 +41,35 @@ test('HTTP adapter exposes the shared action and query contracts', async () => {
       method: 'POST',
     }),
   );
-  expect(JSON.stringify(await prepared.json())).not.toContain('Products');
+  const sourceHandle = (await prepared.json()) as { id: string; purpose: string };
+  expect(JSON.stringify(sourceHandle)).not.toContain('Products');
+
+  const composed = await fetch(
+    new Request('http://datagram.test/v1/agent/result-handles/compose', {
+      body: JSON.stringify({
+        handleId: sourceHandle.id,
+        inputPurpose: sourceHandle.purpose,
+        outputPurpose: 'trusted.render',
+        transform: {
+          aggregations: [{ as: 'Derived count', operator: 'count' }],
+          kind: 'aggregate',
+        },
+      }),
+      method: 'POST',
+    }),
+  );
+  expect(composed.status).toBe(201);
+  const composedHandle = (await composed.json()) as { id: string };
+  expect(JSON.stringify(composedHandle)).not.toContain('Products');
+  expect(JSON.stringify(composedHandle)).not.toContain('Derived count');
+
+  const rendered = await fetch(
+    new Request(`http://datagram.test/v1/result-handles/${composedHandle.id}`, {
+      body: JSON.stringify({ purpose: 'trusted.render' }),
+      method: 'POST',
+    }),
+  );
+  expect((await rendered.json()) as { data: unknown }).toMatchObject({
+    data: { 'Derived count': 1 },
+  });
 });

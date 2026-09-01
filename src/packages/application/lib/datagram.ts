@@ -34,8 +34,12 @@ import type {
 import type { DatagramStore } from './store';
 import { ActionRegistry, QueryRegistry, defineAction, defineQuery } from './contracts';
 import type { ExecutionContext } from './contracts';
-import { ResultHandleBroker } from './result-handles';
-import type { IssuedResultHandle } from './result-handles';
+import { ResultHandleBroker, transformResult } from './result-handles';
+import type {
+  DataViewQueryDefinition,
+  IssuedResultHandle,
+  ResultHandleComposition,
+} from './result-handles';
 
 const roleRank: Readonly<Record<ChannelRole, number>> = {
   admin: 2,
@@ -124,9 +128,60 @@ export class DatagramApplication {
     origin: OperationOrigin,
     name: string,
     input: unknown,
+    purpose = name,
   ): Promise<IssuedResultHandle> {
-    const result = await this.executeQuery(actorId, origin, name, input);
-    return this.handles.issue(actorId, name, result);
+    let result: QueryResult;
+    try {
+      result = await this.executeQuery(actorId, origin, name, input);
+    } catch (error) {
+      if (error instanceof DatagramError) {
+        throw new DatagramError(error.code, 'Agent Query could not be prepared', error.status);
+      }
+      throw new DatagramError(
+        'agent-query.failed',
+        'Agent Query could not be prepared',
+        500,
+      );
+    }
+    const sourceInput = structuredClone(input);
+    return this.handles.issue(
+      actorId,
+      purpose,
+      { input: sourceInput, queryName: name },
+      result,
+      () => this.executeQuery(actorId, origin, name, sourceInput),
+    );
+  }
+
+  async reopenDataView(
+    actorId: string,
+    origin: OperationOrigin,
+    definition: DataViewQueryDefinition,
+  ): Promise<IssuedResultHandle> {
+    return this.prepareQuery(
+      actorId,
+      origin,
+      definition.queryName,
+      definition.input,
+      definition.purpose,
+    );
+  }
+
+  async composeResultHandle(
+    actorId: string,
+    composition: ResultHandleComposition,
+  ): Promise<IssuedResultHandle> {
+    await this.#requirePerson(actorId);
+    return this.handles.compose(this.handles.serviceId, actorId, composition);
+  }
+
+  async consumeResultHandle(
+    actorId: string,
+    handleId: string,
+    purpose: string,
+  ): Promise<QueryResult> {
+    await this.#requirePerson(actorId);
+    return this.handles.consume(this.handles.serviceId, actorId, handleId, purpose);
   }
 
   async *subscribe(
@@ -3159,6 +3214,105 @@ export class DatagramApplication {
               title: channel.title,
             },
           };
+        },
+      }),
+      defineQuery({
+        description: 'Reopen a durable Table View definition against current Records.',
+        inputSchema: z.object({
+          channelId: z.string().min(1),
+          viewId: z.string().min(1),
+        }),
+        name: 'table.view.open',
+        run: async (context, input): Promise<QueryResult> => {
+          await this.#requireChannel(input.channelId, 'table');
+          await this.#requireRole(context.actorId, input.channelId, 'viewer');
+          const definition = (await this.store.listTableViews(input.channelId, context.actorId)).find(
+            (view) => view.id === input.viewId,
+          );
+          invariant(
+            definition,
+            'table.view-not-found',
+            'Table View does not exist or is not available',
+            404,
+          );
+          const fields = await this.store.listTableFields(input.channelId);
+          const keys = new Map(fields.map((field) => [field.id, field.key]));
+          const visibleKeys = new Set(
+            definition.visibleFieldIds.map((fieldId) => keys.get(fieldId)).filter(Boolean),
+          );
+          const records = await this.executeQuery(
+            context.actorId,
+            context.origin,
+            'table.records.list',
+            { channelId: input.channelId },
+          );
+          let current: QueryResult = {
+            data: (records.data as JsonValue[]).map((record) => {
+              if (record === null || Array.isArray(record) || typeof record !== 'object') return record;
+              const values = record.values;
+              return {
+                ...record,
+                values:
+                  values !== null && !Array.isArray(values) && typeof values === 'object'
+                    ? Object.fromEntries(
+                        Object.entries(values).filter(([key]) => visibleKeys.has(key)),
+                      )
+                    : (values ?? null),
+              };
+            }),
+            view: {
+              bindings: { rows: '$result' },
+              commands: [
+                'table.record.create',
+                'table.record.edit',
+                'table.record.tombstone',
+                'table.record.restore',
+              ],
+              kind: 'table-records',
+              schemaVersion: 'datagram/view@1',
+              title: definition.name,
+            },
+          };
+          current = transformResult(current, {
+            filters: definition.filters.map((filter) => ({
+              field: keys.get(filter.fieldId) ?? filter.fieldId,
+              operator: filter.operator,
+              ...(filter.value === undefined ? {} : { value: filter.value }),
+            })),
+            kind: 'filter',
+          });
+          if (Array.isArray(current.data) && definition.sorting.length > 0) {
+            const valueAt = (row: JsonValue, key: string): JsonValue | undefined => {
+              if (row === null || Array.isArray(row) || typeof row !== 'object') return undefined;
+              const values = row.values;
+              return values !== null && !Array.isArray(values) && typeof values === 'object'
+                ? values[key]
+                : undefined;
+            };
+            current = {
+              ...current,
+              data: [...current.data].sort((left, right) => {
+                for (const sort of definition.sorting) {
+                  const key = keys.get(sort.fieldId) ?? sort.fieldId;
+                  const leftValue = valueAt(left, key);
+                  const rightValue = valueAt(right, key);
+                  const compared = (JSON.stringify(leftValue) ?? '').localeCompare(
+                    JSON.stringify(rightValue) ?? '',
+                  );
+                  if (compared !== 0) {
+                    return sort.direction === 'ascending' ? compared : -compared;
+                  }
+                }
+                return 0;
+              }),
+            };
+          }
+          return definition.grouping.length === 0
+            ? current
+            : transformResult(current, {
+                fields: definition.grouping.map((fieldId) => keys.get(fieldId) ?? fieldId),
+                kind: 'group',
+              });
         },
       }),
       defineQuery({

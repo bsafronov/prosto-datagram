@@ -143,7 +143,11 @@ describe('Datagram application', () => {
     expect(handle.view).not.toHaveProperty('title');
     expect(handle.view.kind).toBe('table-records');
 
-    const consumed = value.app.handles.consume(value.owner.id, handle.id, 'table.records.list');
+    const consumed = await value.app.consumeResultHandle(
+      value.owner.id,
+      handle.id,
+      'table.records.list',
+    );
     expect(JSON.stringify(consumed.data)).toContain('Hidden Apples');
   });
 

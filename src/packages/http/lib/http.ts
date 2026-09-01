@@ -1,5 +1,6 @@
 import { ZodError } from 'zod';
 
+import { resultHandleCompositionSchema } from '../../application';
 import { DatagramError } from '../../application/errors';
 import type { DatagramApplicationPort } from '../../application/port';
 
@@ -140,6 +141,34 @@ export function createHttpHandler({ app, defaultActorId }: HttpHandlerOptions) {
             await body(request),
           ),
           201,
+        );
+      }
+
+      if (request.method === 'POST' && url.pathname === '/v1/agent/result-handles/compose') {
+        return json(
+          await app.composeResultHandle(
+            actorId,
+            resultHandleCompositionSchema.parse(await body(request)),
+          ),
+          201,
+        );
+      }
+
+      const resultHandle = url.pathname.match(/^\/v1\/result-handles\/([^/]+)$/);
+      if (request.method === 'POST' && resultHandle?.[1]) {
+        const input = (await body(request)) as { purpose?: unknown };
+        if (typeof input.purpose !== 'string' || input.purpose.length === 0) {
+          return json(
+            { error: { code: 'input.invalid', message: 'Invalid input' } },
+            400,
+          );
+        }
+        return json(
+          await app.consumeResultHandle(
+            actorId,
+            decodeURIComponent(resultHandle[1]),
+            input.purpose,
+          ),
         );
       }
 

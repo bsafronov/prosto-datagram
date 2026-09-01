@@ -5,7 +5,12 @@ import type {
   SubscriptionEvent,
 } from '../domain/model';
 import type { ActionRegistry, QueryRegistry } from './contracts';
-import type { IssuedResultHandle, ResultHandleBroker } from './result-handles';
+import type {
+  DataViewQueryDefinition,
+  IssuedResultHandle,
+  ResultHandleBroker,
+  ResultHandleComposition,
+} from './result-handles';
 
 export interface DatagramApplicationPort {
   readonly actions: ActionRegistry;
@@ -28,7 +33,22 @@ export interface DatagramApplicationPort {
     origin: OperationOrigin,
     name: string,
     input: unknown,
+    purpose?: string,
   ): Promise<IssuedResultHandle>;
+  reopenDataView(
+    actorId: string,
+    origin: OperationOrigin,
+    definition: DataViewQueryDefinition,
+  ): Promise<IssuedResultHandle>;
+  composeResultHandle(
+    actorId: string,
+    composition: ResultHandleComposition,
+  ): Promise<IssuedResultHandle>;
+  consumeResultHandle(
+    actorId: string,
+    handleId: string,
+    purpose: string,
+  ): Promise<QueryResult>;
   subscribe(
     actorId: string,
     options?: { readonly after?: number; readonly signal?: AbortSignal },
