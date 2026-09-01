@@ -36,7 +36,7 @@ Start the MCP Gateway over stdio:
 bun run mcp
 ```
 
-Set `DATAGRAM_ACTOR_ID` when the CLI or MCP process should act as someone other than the automatic Local Owner.
+Set `DATAGRAM_ACTOR_ID` to a verified Service identity before starting MCP. MCP does not fall back to the automatic Local Owner. CLI may use its explicit local-development default.
 
 Run an authoritative PostgreSQL Server Service with bearer-token authentication:
 

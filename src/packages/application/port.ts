@@ -16,6 +16,7 @@ export interface DatagramApplicationPort {
   readonly actions: ActionRegistry;
   readonly handles: ResultHandleBroker;
   readonly queries: QueryRegistry;
+  verifyServiceIdentity(actorId: string): Promise<{ readonly actorId: string }>;
   executeAction(
     actorId: string,
     origin: OperationOrigin,

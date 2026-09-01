@@ -125,6 +125,11 @@ export class DatagramApplication {
     this.queries = new QueryRegistry(this.#queryDefinitions());
   }
 
+  async verifyServiceIdentity(actorId: string): Promise<{ readonly actorId: string }> {
+    await this.#requirePerson(actorId);
+    return { actorId };
+  }
+
   async executeAction(
     actorId: string,
     origin: OperationOrigin,

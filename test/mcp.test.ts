@@ -1,0 +1,221 @@
+import { afterEach, expect, test } from 'bun:test';
+
+import {
+  InMemoryTransport,
+  type JSONRPCMessage,
+  type McpServer,
+} from '@modelcontextprotocol/server';
+
+import { DatagramError } from '../src/packages/application/errors';
+import { createMcpGateway } from '../src/packages/mcp/gateway';
+import { createRuntime, type DatagramRuntime } from '../src/packages/runtime';
+
+let runtime: DatagramRuntime | undefined;
+let server: McpServer | undefined;
+
+afterEach(async () => {
+  await server?.close();
+  server = undefined;
+  await runtime?.close();
+  runtime = undefined;
+});
+
+class McpTestClient {
+  readonly #pending = new Map<
+    number,
+    { reject: (error: Error) => void; resolve: (value: unknown) => void }
+  >();
+  readonly #transport: InMemoryTransport;
+  #requestId = 0;
+
+  constructor(transport: InMemoryTransport) {
+    this.#transport = transport;
+    transport.onmessage = (message) => this.#receive(message);
+  }
+
+  async start(): Promise<void> {
+    await this.#transport.start();
+  }
+
+  async initialize(): Promise<unknown> {
+    const initialized = await this.request('initialize', {
+      capabilities: {},
+      clientInfo: { name: 'datagram-test', version: '0.0.0' },
+      protocolVersion: '2025-11-25',
+    });
+    await this.#transport.send({ jsonrpc: '2.0', method: 'notifications/initialized' });
+    return initialized;
+  }
+
+  request(method: string, params?: Record<string, unknown>): Promise<unknown> {
+    const id = ++this.#requestId;
+    const response = new Promise<unknown>((resolve, reject) => {
+      this.#pending.set(id, { reject, resolve });
+    });
+    void this.#transport.send({ id, jsonrpc: '2.0', method, ...(params ? { params } : {}) });
+    return response;
+  }
+
+  #receive(message: JSONRPCMessage): void {
+    if (!('id' in message) || 'method' in message || typeof message.id !== 'number') return;
+    const pending = this.#pending.get(message.id);
+    if (!pending) return;
+    this.#pending.delete(message.id);
+    if ('error' in message) {
+      pending.reject(new Error(`${message.error.code}: ${message.error.message}`));
+      return;
+    }
+    pending.resolve(message.result);
+  }
+}
+
+async function connect() {
+  runtime = await createRuntime({ databasePath: ':memory:' });
+  server = await createMcpGateway({
+    app: runtime.app,
+    authenticateIdentity: () => ({ actorId: runtime!.owner.id }),
+  });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const client = new McpTestClient(clientTransport);
+  await client.start();
+  await server.connect(serverTransport);
+  return { client, runtime };
+}
+
+const call = (client: McpTestClient, name: string, args: Record<string, unknown>) =>
+  client.request('tools/call', { arguments: args, name });
+
+test('MCP requires authenticated identity mapped to an active Service person', async () => {
+  runtime = await createRuntime({ databasePath: ':memory:' });
+
+  await expect(
+    createMcpGateway({ app: runtime.app, authenticateIdentity: () => undefined }),
+  ).rejects.toMatchObject({ code: 'identity.unauthenticated' });
+  await expect(
+    createMcpGateway({
+      app: runtime.app,
+      authenticateIdentity: () => ({ actorId: 'person_missing' }),
+    }),
+  ).rejects.toMatchObject({ code: 'person.not-found' });
+});
+
+test('MCP initializes, discovers every shared contract, and executes Actions and Queries', async () => {
+  const value = await connect();
+  const initialized = await value.client.initialize();
+  expect(initialized).toMatchObject({
+    capabilities: { tools: {} },
+    serverInfo: { name: 'prosto-datagram' },
+  });
+
+  const listed = (await value.client.request('tools/list')) as {
+    tools: { inputSchema: unknown; name: string }[];
+  };
+  const tools = new Map(listed.tools.map((tool) => [tool.name, tool]));
+  expect([...tools.keys()].sort()).toEqual(
+    [
+      ...value.runtime.app.actions.catalog().map(({ name }) => name),
+      ...value.runtime.app.queries.catalog().map(({ name }) => name),
+      'result.compose',
+    ].sort(),
+  );
+  for (const contract of [
+    ...value.runtime.app.actions.catalog(),
+    ...value.runtime.app.queries.catalog(),
+  ]) {
+    expect(tools.get(contract.name)?.inputSchema).toMatchObject({ type: 'object' });
+  }
+
+  const marker = 'STORED_VALUE_MUST_NOT_LEAK';
+  const created = (await call(value.client, 'channel.create', {
+    title: marker,
+    typeId: 'table',
+  })) as { structuredContent: { subject: { id: string } } };
+  expect(JSON.stringify(created)).not.toContain(marker);
+  expect(created.structuredContent).toMatchObject({
+    action: 'channel.create',
+    operationId: expect.any(String),
+    subject: { id: expect.any(String), kind: 'channel' },
+  });
+
+  const queried = (await call(value.client, 'channel.list', {})) as {
+    structuredContent: {
+      expiresAt: string;
+      id: string;
+      purpose: string;
+      view: Record<string, unknown>;
+    };
+  };
+  expect(JSON.stringify(queried)).not.toContain(marker);
+  expect(queried.structuredContent).toEqual({
+    expiresAt: expect.any(String),
+    id: expect.any(String),
+    purpose: 'channel.list',
+    view: {
+      bindings: expect.any(Object),
+      commands: expect.any(Array),
+      kind: expect.any(String),
+      schemaVersion: 'datagram/view@1',
+    },
+  });
+  expect(queried.structuredContent).not.toHaveProperty('data');
+  expect(queried.structuredContent.view).not.toHaveProperty('title');
+});
+
+test('MCP success and error output never leaks stored or derived values', async () => {
+  const value = await connect();
+  await value.client.initialize();
+  const storedMarker = 'PRIVATE_STORED_MARKER';
+  const derivedMarker = 'PRIVATE_DERIVED_MARKER';
+  const outputs: unknown[] = [];
+
+  outputs.push(
+    await call(value.client, 'channel.create', { title: storedMarker, typeId: 'table' }),
+  );
+  const source = (await call(value.client, 'channel.list', {})) as {
+    structuredContent: { id: string; purpose: string };
+  };
+  outputs.push(source);
+  outputs.push(
+    await call(value.client, 'result.compose', {
+      handleId: source.structuredContent.id,
+      inputPurpose: source.structuredContent.purpose,
+      outputPurpose: 'chart.input',
+      transform: {
+        aggregations: [{ as: derivedMarker, operator: 'count' }],
+        kind: 'aggregate',
+      },
+    }),
+  );
+
+  Object.defineProperty(value.runtime.app, 'executeAction', {
+    configurable: true,
+    value: async () => {
+      throw new DatagramError('test.action-failed', storedMarker);
+    },
+  });
+  Object.defineProperty(value.runtime.app, 'prepareQuery', {
+    configurable: true,
+    value: async () => {
+      throw new DatagramError('test.query-failed', derivedMarker);
+    },
+  });
+  outputs.push(await call(value.client, 'channel.create', { title: 'safe', typeId: 'table' }));
+  outputs.push(await call(value.client, 'channel.list', {}));
+
+  const serialized = JSON.stringify(outputs);
+  expect(serialized).not.toContain(storedMarker);
+  expect(serialized).not.toContain(derivedMarker);
+  expect(serialized).not.toContain('stack');
+  expect(outputs.at(-2)).toMatchObject({
+    isError: true,
+    structuredContent: {
+      error: { code: 'test.action-failed', message: 'Action failed' },
+    },
+  });
+  expect(outputs.at(-1)).toMatchObject({
+    isError: true,
+    structuredContent: {
+      error: { code: 'test.query-failed', message: 'Query failed' },
+    },
+  });
+});
