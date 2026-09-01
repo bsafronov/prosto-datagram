@@ -2,10 +2,8 @@ import * as z from 'zod/v4';
 
 import {
   ChannelTypeRegistry,
-  consumeTableFieldConversionPlan,
   dictionaryLabelKey,
   normalizeDictionaryLabel,
-  planTableFieldConversion,
   validateTableFieldValue,
 } from '../../domain/channel-types';
 import { DatagramError, invariant } from '../../domain/errors';
@@ -596,7 +594,7 @@ export class DatagramApplication {
               invariant(contract.typeId === 'table' && selectedChannelId, 'channel-type.capability-denied', 'This Channel Type cannot emit Table transitions', 403);
               await requireSelectedChannel();
               const conversionPlan = intent.kind === 'convert'
-                ? consumeTableFieldConversionPlan(intent.plan, {
+                ? this.channelTypes.consumeTableFieldConversionPlan(contract.typeId, contract.typeVersion, intent.plan, {
                     actorId,
                     channelId: selectedChannelId,
                     serviceId: this.handles.serviceId,
@@ -939,7 +937,9 @@ export class DatagramApplication {
       displayFieldId: () => this.store.getTableDisplayFieldId(channelId),
       message: async (messageId) => scoped(await this.store.getMessage(messageId)),
       messages: () => this.store.listMessages(channelId),
-      planTableFieldConversion: (input) => planTableFieldConversion(
+      planTableFieldConversion: (input) => this.channelTypes.planTableFieldConversion(
+        selectedType.typeId,
+        selectedType.typeVersion,
         { actorId, channelId, serviceId: this.handles.serviceId },
         input,
         state,

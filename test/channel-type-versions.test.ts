@@ -30,6 +30,7 @@ describe('Channel Type version pinning', () => {
     expect(applicationSource).not.toContain('#typeQueries');
     expect(applicationSource).not.toMatch(/name:\s*'(?:chart|dictionary|discussion|table)\./);
     expect(applicationSource).not.toContain('operationBuilders');
+    expect(tableSource).not.toContain('issuedConversionPlans');
     const fieldUpdatePort = applicationSource.slice(
       applicationSource.indexOf('updateTableField: async'),
       applicationSource.indexOf('updateTableRecord: queueTableRecordUpdate'),
@@ -65,6 +66,95 @@ describe('Channel Type version pinning', () => {
     expect(() => new ChannelTypeRegistry([table, table])).toThrow(
       expect.objectContaining({ code: 'channel-type.duplicate' }),
     );
+  });
+
+  test('pins Field conversion planning and sealing to the exact installed version', async () => {
+    const table = bundledChannelTypes.find((definition) => definition.id === 'table')!;
+    const tableV2 = {
+      ...table,
+      planTableFieldConversion: async (
+        input: Parameters<NonNullable<typeof table.planTableFieldConversion>>[0],
+        state: Parameters<NonNullable<typeof table.planTableFieldConversion>>[1],
+        seal: Parameters<NonNullable<typeof table.planTableFieldConversion>>[2],
+      ) => {
+        const field = (await state.tableFields()).find((candidate) => candidate.id === input.fieldId)!;
+        const nextField = {
+          ...field,
+          defaultValue: 42,
+          type: input.targetType,
+          version: field.version + 1,
+        };
+        return seal({
+          field: nextField,
+          previousField: field,
+          preview: {
+            defaultFailure: 'v2-only',
+            failures: [],
+            fieldId: field.id,
+            observedVersion: field.version,
+            targetType: input.targetType,
+          },
+          purpose: input.resolutions === undefined ? 'preview' : 'execute',
+          recordUpdates: [],
+        }, field.id, field.version);
+      },
+      title: 'Table v2',
+      version: '2.0.0',
+    };
+    const registry = new ChannelTypeRegistry([table, tableV2]);
+    const store = new SqliteStore(':memory:');
+    stores.push(store);
+    await store.initialize();
+    const owner = await store.ensureLocalOwner();
+    const app = new DatagramApplication(store, registry);
+    const create = async (version: string) => (await app.executeAction(owner.id, 'cli', 'channel.create', {
+      title: `Table ${version}`,
+      typeId: 'table',
+      typeVersion: version,
+    })).subject!.id;
+    const v1ChannelId = await create('1.0.0');
+    const v2ChannelId = await create('2.0.0');
+    const add = async (channelId: string) => (await app.executeAction(owner.id, 'cli', 'table.field.add', {
+      channelId,
+      key: 'legacy',
+      label: 'Legacy',
+      required: false,
+      type: 'text',
+      unique: false,
+    })).subject!.id;
+    const v1FieldId = await add(v1ChannelId);
+    const v2FieldId = await add(v2ChannelId);
+    const preview = async (channelId: string, fieldId: string) => app.executeQuery(owner.id, 'cli', 'table.field.conversion.preview', {
+      channelId,
+      fieldId,
+      targetType: 'number',
+    });
+    expect((await preview(v1ChannelId, v1FieldId)).data).toMatchObject({ defaultFailure: null });
+    expect((await preview(v2ChannelId, v2FieldId)).data).toMatchObject({ defaultFailure: 'v2-only' });
+    for (const [channelId, fieldId] of [[v1ChannelId, v1FieldId], [v2ChannelId, v2FieldId]]) {
+      await app.executeAction(owner.id, 'cli', 'table.field.convert', {
+        channelId,
+        fieldId,
+        observedVersion: 1,
+        targetType: 'number',
+      });
+    }
+    expect((await store.listTableFields(v1ChannelId))[0]).not.toHaveProperty('defaultValue');
+    expect((await store.listTableFields(v2ChannelId))[0]).toMatchObject({ defaultValue: 42, type: 'number' });
+
+    const mockField = { ...(await store.listTableFields(v2ChannelId))[0]!, id: 'mock-field', type: 'text' as const, version: 1 };
+    const binding = { actorId: owner.id, channelId: v2ChannelId, serviceId: 'service-test' };
+    const crossVersionPlan = await registry.planTableFieldConversion('table', '2.0.0', binding, {
+      fieldId: mockField.id,
+      observedVersion: 1,
+      resolutions: [],
+      targetType: 'number',
+    }, {
+      channel: (await store.getChannel(v2ChannelId))!,
+      tableFields: async () => [mockField],
+    } as any);
+    expect(() => registry.consumeTableFieldConversionPlan('table', '1.0.0', crossVersionPlan, binding))
+      .toThrowError(expect.objectContaining({ code: 'channel-type.capability-denied' }));
   });
 
   test('bundled modules own typed contracts, rules, and semantic views', () => {

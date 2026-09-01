@@ -4,12 +4,18 @@ import { chartChannelType } from './channel-type-modules/chart';
 import type {
   ChannelActionCapabilities,
   ChannelQueryCapabilities,
+  ChannelTypeStatePort,
   ChannelViewDeclaration,
   ChannelViewInput,
 } from './channel-type-modules/contract';
 import { dictionaryChannelType } from './channel-type-modules/dictionary';
 import { tableChannelType } from './channel-type-modules/table';
-import { DatagramError } from './errors';
+import type {
+  SealTableFieldConversionPlan,
+  TableFieldConversionInput,
+  TrustedTableFieldConversionPlan,
+} from './channel-type-modules/table';
+import { DatagramError, invariant } from './errors';
 import {
   viewDefinitionSchema,
   type ChannelRole,
@@ -19,11 +25,7 @@ import {
 } from './model';
 
 export { dictionaryLabelKey, normalizeDictionaryLabel } from './channel-type-modules/dictionary';
-export {
-  consumeTableFieldConversionPlan,
-  planTableFieldConversion,
-  validateTableFieldValue,
-} from './channel-type-modules/table';
+export { validateTableFieldValue } from './channel-type-modules/table';
 export type { ChannelViewDeclaration, ChannelViewInput } from './channel-type-modules/contract';
 
 const channelContractSchema = z.object({
@@ -151,6 +153,13 @@ export const channelTypeDefinitionSchema = z.object({
   ),
   activityKinds: z.array(z.string()),
   id: z.string().min(1),
+  planTableFieldConversion: z.custom<(
+    input: TableFieldConversionInput,
+    state: ChannelTypeStatePort,
+    sealCanonicalPlan: SealTableFieldConversionPlan,
+  ) => Promise<TrustedTableFieldConversionPlan>>(
+    (value) => value === undefined || typeof value === 'function',
+  ).optional(),
   queries: z.array(channelContractSchema),
   recordKinds: z.array(z.enum(['dictionary-entry', 'discussion-message', 'table-record'])),
   stateRules: z.array(channelStateRuleSchema),
@@ -181,6 +190,7 @@ export const bundledChannelTypes: readonly ChannelTypeDefinition[] = [
 ];
 
 export class ChannelTypeRegistry {
+  readonly #conversionPlanIssuers = new Map<string, WeakSet<object>>();
   readonly #definitions = new Map<string, ChannelTypeDefinition>();
   readonly #handlers = new Map<string, (
     input: unknown,
@@ -228,6 +238,7 @@ export class ChannelTypeRegistry {
       }
       const frozen = deepFreeze(definition);
       this.#definitions.set(key, frozen);
+      this.#conversionPlanIssuers.set(key, new WeakSet());
       this.#versions.set(
         definition.id,
         [...(this.#versions.get(definition.id) ?? []), frozen].sort((left, right) =>
@@ -259,6 +270,48 @@ export class ChannelTypeRegistry {
       throw new DatagramError('channel-type.unknown', `Unknown Channel Type: ${id}`, 404);
     }
     return definitions.at(-1)!;
+  }
+
+  async planTableFieldConversion(
+    id: string,
+    version: string,
+    binding: Omit<TrustedTableFieldConversionPlan['binding'], 'fieldId' | 'observedVersion'>,
+    input: TableFieldConversionInput,
+    state: ChannelTypeStatePort,
+  ): Promise<TrustedTableFieldConversionPlan> {
+    const definition = this.require(id, version);
+    invariant(definition.planTableFieldConversion, 'channel-type.capability-denied', 'Selected Channel Type version does not own Field conversion planning', 403);
+    const key = ChannelTypeRegistry.key(id, version);
+    const issuer = this.#conversionPlanIssuers.get(key)!;
+    const seal: SealTableFieldConversionPlan = (payload, fieldId, observedVersion) => {
+      const sealed = deepFreeze(structuredClone({
+        ...payload,
+        binding: { ...binding, fieldId, observedVersion },
+      })) as TrustedTableFieldConversionPlan;
+      issuer.add(sealed);
+      return sealed;
+    };
+    return definition.planTableFieldConversion(input, state, seal);
+  }
+
+  consumeTableFieldConversionPlan(
+    id: string,
+    version: string,
+    value: TrustedTableFieldConversionPlan,
+    binding: Omit<TrustedTableFieldConversionPlan['binding'], 'fieldId' | 'observedVersion'>,
+  ): TrustedTableFieldConversionPlan {
+    const issuer = this.#conversionPlanIssuers.get(ChannelTypeRegistry.key(id, version));
+    invariant(value !== null && typeof value === 'object' && issuer?.delete(value), 'channel-type.capability-denied', 'Field conversion plan was not issued by the selected Channel Type version', 403);
+    invariant(value.purpose === 'execute', 'channel-type.capability-denied', 'Preview plans cannot emit Field transitions', 403);
+    invariant(
+      value.binding.actorId === binding.actorId &&
+        value.binding.channelId === binding.channelId &&
+        value.binding.serviceId === binding.serviceId,
+      'channel-type.capability-denied',
+      'Field conversion plan belongs to another execution scope',
+      403,
+    );
+    return value;
   }
 
   requireAction(id: string, version: string, name: string): z.ZodType | undefined {

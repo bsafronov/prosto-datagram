@@ -91,45 +91,21 @@ export interface TrustedTableFieldConversionPlan {
   }[];
 }
 
-const issuedConversionPlans = new WeakSet<object>();
-
-const freezeConversionPlan = <T>(value: T): T => {
-  if (value === null || typeof value !== 'object' || Object.isFrozen(value)) return value;
-  for (const child of Object.values(value)) freezeConversionPlan(child);
-  return Object.freeze(value);
-};
-
-const issueConversionPlan = (plan: TrustedTableFieldConversionPlan): TrustedTableFieldConversionPlan => {
-  const sealed = freezeConversionPlan(structuredClone(plan));
-  issuedConversionPlans.add(sealed);
-  return sealed;
-};
-
-export function consumeTableFieldConversionPlan(
-  value: TrustedTableFieldConversionPlan,
-  binding: Omit<TrustedTableFieldConversionPlan['binding'], 'fieldId' | 'observedVersion'>,
-): TrustedTableFieldConversionPlan {
-  invariant(value !== null && typeof value === 'object' && issuedConversionPlans.delete(value), 'channel-type.capability-denied', 'Field conversion plan was not issued by the selected Channel Type', 403);
-  invariant(value.purpose === 'execute', 'channel-type.capability-denied', 'Preview plans cannot emit Field transitions', 403);
-  invariant(
-    value.binding.actorId === binding.actorId &&
-      value.binding.channelId === binding.channelId &&
-      value.binding.serviceId === binding.serviceId,
-    'channel-type.capability-denied',
-    'Field conversion plan belongs to another execution scope',
-    403,
-  );
-  return value;
-}
+export type TableFieldConversionPlanPayload = Omit<TrustedTableFieldConversionPlan, 'binding'>;
+export type SealTableFieldConversionPlan = (
+  payload: TableFieldConversionPlanPayload,
+  fieldId: string,
+  observedVersion: number,
+) => TrustedTableFieldConversionPlan;
 
 export async function planTableFieldConversion(
-  binding: Omit<TrustedTableFieldConversionPlan['binding'], 'fieldId' | 'observedVersion'>,
   input: TableFieldConversionInput,
   state: ChannelTypeStatePort,
+  sealCanonicalPlan: SealTableFieldConversionPlan,
 ): Promise<TrustedTableFieldConversionPlan> {
   const field = (await state.tableFields()).find((candidate) => candidate.id === input.fieldId);
   invariant(field, 'table.field-not-found', 'Table Field not found', 404);
-  invariant(field.channelId === binding.channelId, 'table.field-not-found', 'Table Field does not belong to the selected Channel', 404);
+  invariant(field.channelId === state.channel.id, 'table.field-not-found', 'Table Field does not belong to the selected Channel', 404);
   invariant(field.tombstonedAt === undefined, 'table.field-tombstoned', 'Table Field is tombstoned', 409);
   invariant(field.version === input.observedVersion, 'table.field-conflict', 'Table Field changed after observation', 409);
   invariant(field.type !== input.targetType, 'table.field-type-unchanged', 'Target Field type must differ', 409);
@@ -171,8 +147,7 @@ export async function planTableFieldConversion(
   const preview = { defaultFailure, failures, fieldId: field.id, observedVersion: field.version, targetType: input.targetType };
   const requestedResolutions = input.resolutions;
   if (requestedResolutions === undefined && input.defaultResolution === undefined) {
-    const plan = { binding: { ...binding, fieldId: field.id, observedVersion: field.version }, field: nextField, previousField: field, preview, purpose: 'preview', recordUpdates: [] } satisfies TrustedTableFieldConversionPlan;
-    return issueConversionPlan(plan);
+    return sealCanonicalPlan({ field: nextField, previousField: field, preview, purpose: 'preview', recordUpdates: [] }, field.id, field.version);
   }
   invariant((defaultFailure !== null) === (input.defaultResolution !== undefined), 'table.field-conversion-default-unresolved', defaultFailure !== null ? 'Incompatible default value needs one explicit resolution' : 'Default resolution does not match an incompatible default', 409);
   const nextDefault = input.defaultResolution ? await resolveValue(input.defaultResolution) : field.defaultValue;
@@ -196,8 +171,7 @@ export async function planTableFieldConversion(
       value: updates.get(record.id)!,
     };
   });
-  const plan = { binding: { ...binding, fieldId: field.id, observedVersion: field.version }, field: nextField, previousField: field, preview, purpose: 'execute', recordUpdates } satisfies TrustedTableFieldConversionPlan;
-  return issueConversionPlan(plan);
+  return sealCanonicalPlan({ field: nextField, previousField: field, preview, purpose: 'execute', recordUpdates }, field.id, field.version);
 }
 
 export function validateTableFieldValue(field: TableField, rawValue: unknown): JsonValue {
@@ -495,6 +469,7 @@ export const tableChannelType = {
     ...discussionActivityKinds,
   ],
   id: 'table',
+  planTableFieldConversion,
   queries: [
     contract('table.describe', z.object({
       channelId: channelIdSchema,
