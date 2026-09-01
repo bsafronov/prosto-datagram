@@ -14,6 +14,13 @@ bun run check
 bun run cli init
 ```
 
+Run PostgreSQL conformance and the same acceptance journey against a real Server Store:
+
+```sh
+DATAGRAM_TEST_POSTGRES_URL='postgres://datagram:secret@127.0.0.1/datagram' \
+bun run test:postgres
+```
+
 Local commands use `datagram.sqlite` by default. Override it with `DATAGRAM_DB` or `--db PATH`.
 
 Create a Table Channel:

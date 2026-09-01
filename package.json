@@ -14,6 +14,7 @@
     "mcp": "bun src/mcp.ts",
     "serve": "bun src/server.ts",
     "test": "bun test",
+    "test:postgres": "bun -e 'if (!process.env.DATAGRAM_TEST_POSTGRES_URL) throw new Error(\"DATAGRAM_TEST_POSTGRES_URL is required\")' && bun test test/postgres-store.test.ts test/acceptance-journey.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
