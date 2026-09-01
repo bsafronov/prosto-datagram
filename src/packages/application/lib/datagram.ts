@@ -17,6 +17,8 @@ import type {
   ChannelNavigation,
   ChannelInvitation,
   ChannelRole,
+  ChartDefinition,
+  ChartPresentation,
   DictionaryEntry,
   DomainChange,
   JsonValue,
@@ -37,8 +39,10 @@ import type { ExecutionContext } from './contracts';
 import { ResultHandleBroker, transformResult } from './result-handles';
 import type {
   DataViewQueryDefinition,
+  DurableResultDefinition,
   IssuedResultHandle,
   ResultHandleComposition,
+  ResultHandleTransform,
 } from './result-handles';
 
 const roleRank: Readonly<Record<ChannelRole, number>> = {
@@ -73,6 +77,24 @@ const tableViewFilterSchema = z.object({
 const tableViewSortSchema = z.object({
   direction: z.enum(['ascending', 'descending']),
   fieldId: z.string().min(1),
+});
+
+const chartFilterSchema = z.object({
+  field: z.string().min(1),
+  operator: z.enum(['contains', 'equals', 'greater-than', 'is-empty', 'less-than']),
+  value: optionalJsonValueSchema,
+});
+
+const chartAggregationSchema = z.object({
+  as: z.string().trim().min(1).max(120),
+  field: z.string().min(1).optional(),
+  operator: z.enum(['average', 'count', 'maximum', 'minimum', 'sum']),
+});
+
+const chartPresentationSchema = z.object({
+  categoryField: z.string().min(1).optional(),
+  series: z.array(z.string().min(1)).min(1),
+  type: z.enum(['bar', 'line', 'pie']),
 });
 
 const fieldConversionResolutionSchema = z.object({
@@ -2573,6 +2595,185 @@ export class DatagramApplication {
         },
       }),
       defineAction({
+        description: 'Create a live Chart Channel from a compatible Result Handle.',
+        inputSchema: z.object({
+          handleId: z.string().min(1),
+          handlePurpose: z.string().min(1),
+          presentation: chartPresentationSchema,
+          title: z.string().trim().min(1).max(160),
+        }),
+        name: 'chart.create',
+        run: async (context, input) => {
+          const durable = await this.handles.consumeDefinition(
+            this.handles.serviceId,
+            context.actorId,
+            input.handleId,
+            input.handlePurpose,
+          );
+          const channelId = newId('channel');
+          const definition = await this.#chartDefinitionFromResult(
+            context.actorId,
+            channelId,
+            durable,
+            {
+              ...(input.presentation.categoryField === undefined
+                ? {}
+                : { categoryField: input.presentation.categoryField }),
+              series: input.presentation.series,
+              type: input.presentation.type,
+            },
+            1,
+          );
+          const type = this.channelTypes.require('chart');
+          const occurredAt = nowIso();
+          const channel: Channel = {
+            createdAt: occurredAt,
+            id: channelId,
+            ownerId: context.actorId,
+            title: input.title,
+            typeId: type.id,
+            typeVersion: type.version,
+            updatedAt: occurredAt,
+          };
+          return this.#commit(
+            context,
+            'chart.create',
+            channelId,
+            (operationId) => [
+              { channel, kind: 'channel.created' },
+              {
+                kind: 'membership.granted',
+                membership: {
+                  channelId,
+                  personId: context.actorId,
+                  role: 'owner',
+                },
+              },
+              { definition, kind: 'chart.definition-set' },
+              {
+                activity: this.#activity(
+                  context.actorId,
+                  channelId,
+                  'channel.created',
+                  operationId,
+                  occurredAt,
+                ),
+                kind: 'activity.appended',
+              },
+            ],
+            { id: channelId, kind: 'channel' },
+          );
+        },
+      }),
+      defineAction({
+        description: 'Replace a Chart live query and presentation definition.',
+        inputSchema: z.object({
+          aggregations: z.array(chartAggregationSchema).min(1),
+          channelId: z.string().min(1),
+          filters: z.array(chartFilterSchema).default([]),
+          grouping: z.array(z.string().min(1)).default([]),
+          observedVersion: z.number().int().positive(),
+          presentation: chartPresentationSchema,
+          sourceChannelId: z.string().min(1),
+        }),
+        name: 'chart.definition.update',
+        run: async (context, input) => {
+          await this.#requireChannel(input.channelId, 'chart');
+          await this.#requireRole(context.actorId, input.channelId, 'admin');
+          const current = await this.#requireChartDefinition(input.channelId);
+          invariant(
+            current.version === input.observedVersion,
+            'chart.definition-conflict',
+            'Chart definition changed after observation',
+            409,
+          );
+          const definition: ChartDefinition = {
+            aggregations: input.aggregations.map((aggregation) => ({
+              as: aggregation.as,
+              ...(aggregation.field === undefined ? {} : { field: aggregation.field }),
+              operator: aggregation.operator,
+            })),
+            channelId: input.channelId,
+            filters: input.filters.map((filter) => ({
+              field: filter.field,
+              operator: filter.operator,
+              ...(filter.value === undefined ? {} : { value: filter.value }),
+            })),
+            grouping: input.grouping,
+            presentation: {
+              ...(input.presentation.categoryField === undefined
+                ? {}
+                : { categoryField: input.presentation.categoryField }),
+              series: input.presentation.series,
+              type: input.presentation.type,
+            },
+            sourceChannelId: input.sourceChannelId,
+            version: current.version + 1,
+          };
+          await this.#validateChartDefinition(context.actorId, definition);
+          const occurredAt = nowIso();
+          return this.#commit(
+            context,
+            'chart.definition.update',
+            input.channelId,
+            (operationId) => [
+              {
+                definition,
+                expectedVersion: current.version,
+                kind: 'chart.definition-set',
+              },
+              {
+                activity: this.#activity(
+                  context.actorId,
+                  input.channelId,
+                  'chart.definition-changed',
+                  operationId,
+                  occurredAt,
+                ),
+                kind: 'activity.appended',
+              },
+            ],
+            { id: input.channelId, kind: 'channel' },
+          );
+        },
+      }),
+      defineAction({
+        description: 'Record an explicit meaningful Chart event.',
+        inputSchema: z.object({
+          channelId: z.string().min(1),
+          kind: z.enum(['insight', 'report', 'threshold']),
+        }),
+        name: 'chart.event.record',
+        run: async (context, input) => {
+          await this.#requireChannel(input.channelId, 'chart');
+          await this.#requireRole(context.actorId, input.channelId, 'contributor');
+          const occurredAt = nowIso();
+          const activityKind = {
+            insight: 'chart.insight-produced',
+            report: 'chart.report-produced',
+            threshold: 'chart.threshold-crossed',
+          }[input.kind]!;
+          return this.#commit(
+            context,
+            'chart.event.record',
+            input.channelId,
+            (operationId) => [
+              {
+                activity: this.#activity(
+                  context.actorId,
+                  input.channelId,
+                  activityKind,
+                  operationId,
+                  occurredAt,
+                ),
+                kind: 'activity.appended',
+              },
+            ],
+            { id: input.channelId, kind: 'channel' },
+          );
+        },
+      }),
+      defineAction({
         description: 'Post a Message in any Channel Discussion. Contributor role required.',
         inputSchema: z.object({
           channelId: z.string().min(1),
@@ -3347,6 +3548,60 @@ export class DatagramApplication {
         },
       }),
       defineQuery({
+        description: 'Execute and render one live Chart under Chart and source permissions.',
+        inputSchema: z.object({ channelId: z.string().min(1) }),
+        name: 'chart.open',
+        run: async (context, input): Promise<QueryResult> => {
+          const channel = await this.#requireChannel(input.channelId, 'chart');
+          const role = await this.#requireRole(context.actorId, input.channelId, 'viewer');
+          const definition = await this.#requireChartDefinition(input.channelId);
+          await this.#validateChartDefinition(context.actorId, definition);
+          let current = await this.executeQuery(
+            context.actorId,
+            context.origin,
+            'table.records.list',
+            { channelId: definition.sourceChannelId },
+          );
+          if (definition.filters.length > 0) {
+            current = transformResult(current, {
+              filters: definition.filters,
+              kind: 'filter',
+            });
+          }
+          if (definition.grouping.length > 0) {
+            current = transformResult(current, {
+              fields: definition.grouping,
+              kind: 'group',
+            });
+          }
+          current = transformResult(current, {
+            aggregations: definition.aggregations,
+            kind: 'aggregate',
+          });
+          return {
+            data: {
+              presentation: toJson(definition.presentation),
+              series: current.data,
+            },
+            view: {
+              bindings: {
+                presentation: '$result.presentation',
+                series: '$result.series',
+              },
+              commands:
+                roleRank[role] >= roleRank.admin
+                  ? ['chart.definition.update', 'chart.event.record']
+                  : roleRank[role] >= roleRank.contributor
+                    ? ['chart.event.record']
+                    : [],
+              kind: 'chart',
+              schemaVersion: 'datagram/view@1',
+              title: channel.title,
+            },
+          };
+        },
+      }),
+      defineQuery({
         description: 'List Messages in one Channel Discussion.',
         inputSchema: z.object({ channelId: z.string().min(1) }),
         name: 'discussion.messages.list',
@@ -3437,6 +3692,138 @@ export class DatagramApplication {
         },
       }),
     ];
+  }
+
+  async #chartDefinitionFromResult(
+    actorId: string,
+    channelId: string,
+    durable: DurableResultDefinition,
+    presentation: ChartPresentation,
+    version: number,
+  ): Promise<ChartDefinition> {
+    invariant(
+      durable.sources.length === 1 && durable.sources[0]!.queryName === 'table.records.list',
+      'chart.result-handle-incompatible',
+      'Result Handle must have one Table Record source',
+    );
+    const sourceInput = z
+      .object({
+        channelId: z.string().min(1),
+        includeTombstoned: z.boolean().default(false),
+        includeTombstonedFields: z.boolean().default(false),
+      })
+      .safeParse(durable.sources[0]!.input);
+    invariant(
+      sourceInput.success &&
+        !sourceInput.data.includeTombstoned &&
+        !sourceInput.data.includeTombstonedFields,
+      'chart.result-handle-incompatible',
+      'Result Handle must select active Table Records and Fields',
+    );
+    const transforms = durable.transforms.filter(
+      (transform): transform is Exclude<ResultHandleTransform, { readonly kind: 'pass' }> =>
+        transform.kind !== 'pass',
+    );
+    const kinds = transforms.map((transform) => transform.kind).join(',');
+    invariant(
+      /^(filter,)?(group,)?aggregate$/.test(kinds),
+      'chart.result-handle-incompatible',
+      'Result Handle must filter, optionally group, then aggregate once',
+    );
+    const filter = transforms.find((transform) => transform.kind === 'filter');
+    const group = transforms.find((transform) => transform.kind === 'group');
+    const aggregate = transforms.find((transform) => transform.kind === 'aggregate');
+    invariant(
+      aggregate?.kind === 'aggregate',
+      'chart.result-handle-incompatible',
+      'Result Handle must include aggregation',
+    );
+    const definition: ChartDefinition = {
+      aggregations: aggregate.aggregations.map((aggregation) => ({
+        as: aggregation.as,
+        ...(aggregation.field === undefined ? {} : { field: aggregation.field }),
+        operator: aggregation.operator,
+      })),
+      channelId,
+      filters:
+        filter?.kind === 'filter'
+          ? filter.filters.map((candidate) => ({
+              field: candidate.field,
+              operator: candidate.operator,
+              ...(candidate.value === undefined ? {} : { value: candidate.value }),
+            }))
+          : [],
+      grouping: group?.kind === 'group' ? group.fields : [],
+      presentation,
+      sourceChannelId: sourceInput.data.channelId,
+      version,
+    };
+    await this.#validateChartDefinition(actorId, definition);
+    return definition;
+  }
+
+  async #validateChartDefinition(
+    actorId: string,
+    definition: ChartDefinition,
+  ): Promise<void> {
+    await this.#requireChannel(definition.sourceChannelId, 'table');
+    await this.#requireRole(actorId, definition.sourceChannelId, 'viewer');
+    const fields = (await this.store.listTableFields(definition.sourceChannelId)).filter(
+      (field) => field.tombstonedAt === undefined,
+    );
+    const knownKeys = new Set(fields.map((field) => field.key));
+    const referencedSourceFields = [
+      ...definition.filters.map((filter) => filter.field),
+      ...definition.grouping,
+      ...definition.aggregations.flatMap((aggregation) =>
+        aggregation.field === undefined ? [] : [aggregation.field],
+      ),
+    ];
+    invariant(
+      referencedSourceFields.every((field) => knownKeys.has(field)),
+      'chart.definition-unknown-field',
+      'Chart definition references an unknown active Table Field',
+    );
+    invariant(
+      new Set(definition.grouping).size === definition.grouping.length,
+      'chart.definition-duplicate-group',
+      'Chart grouping Fields must be unique',
+    );
+    invariant(
+      definition.aggregations.length > 0 &&
+        new Set(definition.aggregations.map((aggregation) => aggregation.as)).size ===
+          definition.aggregations.length,
+      'chart.definition-invalid-aggregation',
+      'Chart needs uniquely named aggregations',
+    );
+    invariant(
+      definition.aggregations.every(
+        (aggregation) => aggregation.operator === 'count' || aggregation.field !== undefined,
+      ),
+      'chart.definition-invalid-aggregation',
+      'Non-count aggregation requires a source Field',
+    );
+    const aggregateNames = new Set(
+      definition.aggregations.map((aggregation) => aggregation.as),
+    );
+    invariant(
+      definition.presentation.series.every((series) => aggregateNames.has(series)) &&
+        (definition.presentation.categoryField === undefined ||
+          definition.grouping.includes(definition.presentation.categoryField)),
+      'chart.presentation-invalid-binding',
+      'Chart presentation must bind grouping and aggregation outputs',
+    );
+  }
+
+  async #requireChartDefinition(channelId: string): Promise<ChartDefinition> {
+    const definition = await this.store.getChartDefinition(channelId);
+    invariant(
+      definition,
+      'chart.definition-not-found',
+      'Chart definition does not exist',
+      404,
+    );
+    return definition;
   }
 
   async #requireTableRecord(channelId: string, recordId: string): Promise<TableRecord> {

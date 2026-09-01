@@ -76,8 +76,20 @@ export const bundledChannelTypes: readonly ChannelTypeDefinition[] = [
     views: ['table', 'discussion'],
   },
   {
-    actions: ['channel.create', ...discussionActions],
-    activityKinds: ['channel.created', 'chart.insight-produced', ...discussionActivityKinds],
+    actions: [
+      'chart.create',
+      'chart.definition.update',
+      'chart.event.record',
+      ...discussionActions,
+    ],
+    activityKinds: [
+      'channel.created',
+      'chart.definition-changed',
+      'chart.insight-produced',
+      'chart.threshold-crossed',
+      'chart.report-produced',
+      ...discussionActivityKinds,
+    ],
     id: 'chart',
     title: 'Chart',
     version: '1.0.0',

@@ -5,6 +5,7 @@ import {
 } from '../../application/views';
 
 const supportedKinds = new Set([
+  'chart',
   'channel-list',
   'dictionary',
   'discussion',

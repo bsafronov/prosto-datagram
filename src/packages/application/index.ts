@@ -6,6 +6,7 @@ export { DatagramApplication } from './lib/datagram';
 export type {
   AgentViewMetadata,
   DataViewQueryDefinition,
+  DurableResultDefinition,
   IssuedResultHandle,
   ResultAggregation,
   ResultFilter,

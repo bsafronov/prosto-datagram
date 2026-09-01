@@ -134,6 +134,34 @@ export interface TableView {
   readonly visibleFieldIds: readonly string[];
 }
 
+export interface ChartFilter {
+  readonly field: string;
+  readonly operator: 'contains' | 'equals' | 'greater-than' | 'is-empty' | 'less-than';
+  readonly value?: JsonValue;
+}
+
+export interface ChartAggregation {
+  readonly as: string;
+  readonly field?: string;
+  readonly operator: 'average' | 'count' | 'maximum' | 'minimum' | 'sum';
+}
+
+export interface ChartPresentation {
+  readonly categoryField?: string;
+  readonly series: readonly string[];
+  readonly type: 'bar' | 'line' | 'pie';
+}
+
+export interface ChartDefinition {
+  readonly aggregations: readonly ChartAggregation[];
+  readonly channelId: string;
+  readonly filters: readonly ChartFilter[];
+  readonly grouping: readonly string[];
+  readonly presentation: ChartPresentation;
+  readonly sourceChannelId: string;
+  readonly version: number;
+}
+
 export interface Message {
   readonly authorId: string;
   readonly channelId: string;
@@ -371,6 +399,11 @@ export type DomainChange =
       readonly restoredAt: string;
     }
   | { readonly kind: 'table.view-saved'; readonly view: TableView }
+  | {
+      readonly definition: ChartDefinition;
+      readonly expectedVersion?: number;
+      readonly kind: 'chart.definition-set';
+    }
   | { readonly kind: 'discussion.message-posted'; readonly message: Message }
   | {
       readonly kind: 'discussion.message-edited';

@@ -21,6 +21,7 @@ interface HandleEntry {
   readonly purpose: string;
   readonly serviceId: string;
   readonly sources: readonly ResultSourceAuthorization[];
+  readonly transforms: readonly ResultHandleTransform[];
   readonly view: AgentViewMetadata;
 }
 
@@ -61,6 +62,11 @@ export interface ResultHandleComposition {
   readonly inputPurpose: string;
   readonly outputPurpose: string;
   readonly transform: ResultHandleTransform;
+}
+
+export interface DurableResultDefinition {
+  readonly sources: readonly ResultSourceAuthorization[];
+  readonly transforms: readonly ResultHandleTransform[];
 }
 
 export interface DataViewQueryDefinition {
@@ -258,6 +264,7 @@ export class ResultHandleBroker {
       purpose,
       serviceId: this.serviceId,
       sources: [source],
+      transforms: [],
       view: sanitizeViewForAgent(result.view),
     });
   }
@@ -295,6 +302,7 @@ export class ResultHandleBroker {
       purpose: composition.outputPurpose,
       serviceId,
       sources: source.sources,
+      transforms: [...source.transforms, structuredClone(composition.transform)],
       view: source.view,
     });
   }
@@ -315,6 +323,20 @@ export class ResultHandleBroker {
         403,
       );
     }
+  }
+
+  async consumeDefinition(
+    serviceId: string,
+    actorId: string,
+    handleId: string,
+    purpose: string,
+  ): Promise<DurableResultDefinition> {
+    const entry = this.#require(serviceId, actorId, handleId, purpose);
+    await this.consume(serviceId, actorId, handleId, purpose);
+    return {
+      sources: structuredClone(entry.sources),
+      transforms: structuredClone(entry.transforms),
+    };
   }
 
   #issue(entry: HandleEntry): IssuedResultHandle {

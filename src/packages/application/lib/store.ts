@@ -4,6 +4,7 @@ import type {
   ChannelGroup,
   ChannelGroupEntry,
   ChannelInvitation,
+  ChartDefinition,
   ChannelListItem,
   ChannelMembership,
   ChannelNavigation,
@@ -25,6 +26,7 @@ export interface DatagramStore {
   getChannel(channelId: string): Promise<Channel | null>;
   getChannelGroup(groupId: string): Promise<ChannelGroup | null>;
   getChannelNavigation(channelId: string, personId: string): Promise<ChannelNavigation>;
+  getChartDefinition(channelId: string): Promise<ChartDefinition | null>;
   getDictionaryEntry(entryId: string): Promise<DictionaryEntry | null>;
   getInvitation(invitationId: string): Promise<ChannelInvitation | null>;
   getMessage(messageId: string): Promise<Message | null>;

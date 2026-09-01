@@ -11,6 +11,7 @@ import {
   type ChannelListItem,
   type ChannelMembership,
   type ChannelNavigation,
+  type ChartDefinition,
   type DatagramStore,
   type DictionaryEntry,
   type DomainChange,
@@ -112,6 +113,13 @@ interface TableViewRow {
   name: string;
   owner_id: string;
   visibility: TableView['visibility'];
+}
+
+interface ChartDefinitionRow {
+  channel_id: string;
+  definition_json: string;
+  source_channel_id: string;
+  version: number;
 }
 
 interface MessageRow {
@@ -303,6 +311,16 @@ const tableViewFromRow = (row: TableViewRow): TableView => {
     visibility: row.visibility,
   };
 };
+
+const chartDefinitionFromRow = (row: ChartDefinitionRow): ChartDefinition => ({
+  ...(JSON.parse(row.definition_json) as Pick<
+    ChartDefinition,
+    'aggregations' | 'filters' | 'grouping' | 'presentation'
+  >),
+  channelId: row.channel_id,
+  sourceChannelId: row.source_channel_id,
+  version: row.version,
+});
 
 const messageRevisionFromRow = (row: MessageRevisionRow): MessageRevision => ({
   createdAt: row.created_at,
@@ -545,6 +563,13 @@ export class SqliteStore implements DatagramStore {
         owner_id TEXT NOT NULL REFERENCES persons(id),
         definition_json TEXT NOT NULL,
         created_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS chart_definitions (
+        channel_id TEXT PRIMARY KEY REFERENCES channels(id),
+        source_channel_id TEXT NOT NULL REFERENCES channels(id),
+        definition_json TEXT NOT NULL,
+        version INTEGER NOT NULL DEFAULT 1
       );
 
       CREATE TABLE IF NOT EXISTS messages (
@@ -848,6 +873,13 @@ export class SqliteStore implements DatagramStore {
     return row
       ? navigationFromRow(row)
       : { channelId, muted: false, personId, pinned: false, position: 0 };
+  }
+
+  async getChartDefinition(channelId: string): Promise<ChartDefinition | null> {
+    const row = this.#database
+      .query('SELECT * FROM chart_definitions WHERE channel_id = ?')
+      .get(channelId) as ChartDefinitionRow | null;
+    return row ? chartDefinitionFromRow(row) : null;
   }
 
   async getInvitation(invitationId: string): Promise<ChannelInvitation | null> {
@@ -1303,6 +1335,9 @@ export class SqliteStore implements DatagramStore {
           change.channelId,
         ]);
         this.#database.run('DELETE FROM table_views WHERE channel_id = ?', [change.channelId]);
+        this.#database.run('DELETE FROM chart_definitions WHERE channel_id = ?', [
+          change.channelId,
+        ]);
         this.#database.run('DELETE FROM dictionary_entries WHERE channel_id = ?', [
           change.channelId,
         ]);
@@ -1773,6 +1808,42 @@ export class SqliteStore implements DatagramStore {
           ],
         );
         return;
+      case 'chart.definition-set': {
+        const serialized = JSON.stringify({
+          aggregations: change.definition.aggregations,
+          filters: change.definition.filters,
+          grouping: change.definition.grouping,
+          presentation: change.definition.presentation,
+        });
+        if (change.expectedVersion === undefined) {
+          this.#database.run(
+            `INSERT INTO chart_definitions
+              (channel_id, source_channel_id, definition_json, version)
+             VALUES (?, ?, ?, ?)`,
+            [
+              change.definition.channelId,
+              change.definition.sourceChannelId,
+              serialized,
+              change.definition.version,
+            ],
+          );
+          return;
+        }
+        const result = this.#database.run(
+          `UPDATE chart_definitions
+           SET source_channel_id = ?, definition_json = ?, version = ?
+           WHERE channel_id = ? AND version = ?`,
+          [
+            change.definition.sourceChannelId,
+            serialized,
+            change.definition.version,
+            change.definition.channelId,
+            change.expectedVersion,
+          ],
+        );
+        if (result.changes !== 1) throw new Error('Chart definition changed after observation');
+        return;
+      }
       case 'discussion.message-posted':
         if (change.message.revisions.length !== 1) {
           throw new Error('Posted Message must have exactly one initial revision');
