@@ -393,6 +393,18 @@ test('guided team init stores references and verifies an external PostgreSQL Ser
   expect(await readFile(secretPath, 'utf8')).toContain(secretMarker);
   expect(stopped).toBe(true);
   expect(closed).toBe(true);
+
+  const rerunOutput: string[] = [];
+  await runCli(['init'], {
+    ...host,
+    terminal: {
+      ...host.terminal,
+      input: scriptedInput(['1']),
+      writeOutput: (value) => rerunOutput.push(value),
+    },
+  });
+  expect(rerunOutput.join('')).toContain('Existing setup detected for profile "team".');
+  expect(rerunOutput.join('')).toContain('No changes made.');
 });
 
 test('guided team init reports PostgreSQL preflight failures without leaking the URL', async () => {

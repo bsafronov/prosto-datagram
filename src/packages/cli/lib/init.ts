@@ -12,10 +12,13 @@ import {
   type SetupJournal,
 } from './journal';
 import {
+  isServerProfile,
   parseProfile,
   profileNamePattern,
   readServiceProfile,
   type LocalServiceProfile,
+  type ServerServiceProfile,
+  type ServiceProfile,
   type StarterProgress,
 } from './profiles';
 
@@ -255,7 +258,7 @@ function actionSubjectId(
 async function saveProfile(
   host: CliHost,
   profilePath: string,
-  profile: LocalServiceProfile,
+  profile: ServiceProfile,
 ): Promise<void> {
   await host.filesystem.writeTextFileAtomic(profilePath, `${JSON.stringify(profile, null, 2)}\n`, {
     mode: 0o600,
@@ -325,15 +328,77 @@ async function confirmReviewedOperation(
   return answer === '' || answer === 'y' || answer === 'yes';
 }
 
+async function runExistingServerSetup(
+  host: CliHost,
+  read: ReadAnswer,
+  profile: ServerServiceProfile,
+): Promise<void> {
+  const command = resumeCommand(profile.name);
+  const report = await checkService(host, profile.name);
+  const incomplete = profile.setup?.core !== 'verified';
+  host.terminal.writeOutput(
+    `Existing setup detected for profile ${JSON.stringify(profile.name)}.\n` +
+      `Core: ${incomplete ? 'incomplete' : 'verified'}; Service: ${report.ok ? 'ready' : 'needs repair'}\n` +
+      'Choose reviewed operation:\n' +
+      '  1. Inspect only\n' +
+      `  2. Resume or repair verification${incomplete || !report.ok ? ' (Recommended)' : ''}\n` +
+      '  3. Update default profile selection\n' +
+      '  4. Cancel\n' +
+      `Selection [${incomplete || !report.ok ? '2' : '1'}]: `,
+  );
+  const rawChoice = normalized(await read());
+  const choice = rawChoice === '' ? (incomplete || !report.ok ? '2' : '1') : rawChoice;
+  if (choice === '4' || isCancel(choice)) {
+    host.terminal.writeOutput('Setup cancelled. No changes were made.\n');
+    return;
+  }
+  if (choice === '1') {
+    for (const check of report.checks) host.terminal.writeOutput(`${check.stage}: ${check.status}\n`);
+    host.terminal.writeOutput(`No changes made. Resume or repair: ${command}\n`);
+    return;
+  }
+  if (choice === '3') {
+    if (!(await confirmReviewedOperation(host, read, `Update only default profile selection to ${JSON.stringify(profile.name)}.\nNo Service data or other configuration will change.`))) {
+      host.terminal.writeOutput('Update cancelled. No changes were made.\n');
+      return;
+    }
+    await host.filesystem.writeTextFileAtomic(
+      join(host.directories.configuration, 'default-profile'),
+      `${profile.name}\n`,
+      { mode: 0o600 },
+    );
+    host.terminal.writeOutput('Default profile selection updated.\n');
+    return;
+  }
+  if (choice !== '2') {
+    throw new DatagramError('input.invalid', 'Choose 1, 2, 3, or 4.', 400);
+  }
+  if (!(await confirmReviewedOperation(host, read, `Resume or repair verification for ${JSON.stringify(profile.name)}.\nExisting PostgreSQL data, credentials, and unrelated configuration will not be changed.`))) {
+    host.terminal.writeOutput('Repair cancelled. No changes were made.\n');
+    return;
+  }
+  if (!report.ok) {
+    const failure = report.checks.find((check) => check.status === 'failed');
+    throw new DatagramError(
+      failure?.code ?? 'setup.repair-required',
+      `Repair stopped safely; Service failed verification. Repair: ${command}`,
+      400,
+    );
+  }
+  const profilePath = join(host.directories.configuration, 'profiles', `${profile.name}.json`);
+  await saveProfile(host, profilePath, { ...profile, setup: { core: 'verified' } });
+  host.terminal.writeOutput(`Setup metadata verified. Inspect: bunx prosto-datagram doctor --profile ${JSON.stringify(profile.name)}\n`);
+}
+
 async function runExistingSetup(
   host: CliHost,
   read: ReadAnswer,
   profileName: string,
 ): Promise<void> {
   const command = resumeCommand(profileName);
-  let profile: LocalServiceProfile;
+  let loadedProfile: ServiceProfile;
   try {
-    profile = await readServiceProfile(host, profileName);
+    loadedProfile = await readServiceProfile(host, profileName);
   } catch {
     throw new DatagramError(
       'setup.profile-repair-required',
@@ -341,6 +406,11 @@ async function runExistingSetup(
       400,
     );
   }
+  if (isServerProfile(loadedProfile)) {
+    await runExistingServerSetup(host, read, loadedProfile);
+    return;
+  }
+  const profile = loadedProfile;
   const profilePath = join(host.directories.configuration, 'profiles', `${profileName}.json`);
   let journalInvalid = false;
   let journal: SetupJournal;
