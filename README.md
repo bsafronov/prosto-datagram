@@ -4,22 +4,89 @@ Headless foundation for collaborative Channels: messages and structured data sha
 
 This repository contains the first executable scaffold. It implements Channel core, universal Discussion, typed Tables, Dictionaries, live Charts, SQLite Local Store, PostgreSQL Server Store, HTTP/CLI/MCP adapters, realtime Activity, opaque agent Result Handles, and a Codex skill. Workflows remain a subsequent slice.
 
-## Run it
+## Getting started
 
 Requires Bun 1.3.13 or newer.
 
-Start guided setup from the published package without a source checkout:
+Start guided setup. No source checkout or manual configuration file is required:
 
 ```sh
 bunx prosto-datagram init
 ```
 
-Setup can optionally preview and, after explicit consent, run
-`bun install --global prosto-datagram` for durable `datagram` and `datagram-mcp` commands. Declining
-keeps package-runner commands available. A failed optional installation does not invalidate the
-configured Service and can be resumed with the displayed command.
+Choose **Use on this machine** for a Local Service backed by SQLite in your operating-system user
+data directory. Choose **Run for a team** for a Server Service backed by either an externally owned
+PostgreSQL database or persistent Docker-managed PostgreSQL. Setup shows a redacted plan and writes
+nothing before Apply. Safe defaults use local-only exposure; public exposure requires explicit TLS
+or an existing HTTPS reverse proxy.
 
-Contributor setup:
+Setup creates a named **Service profile** containing non-secret host configuration and credential
+references. One profile is the default. Target another configured Service explicitly:
+
+```sh
+bunx prosto-datagram actions --profile team
+bunx prosto-datagram doctor --profile team
+```
+
+`doctor` verifies profile access, credentials, Store/runtime readiness, authenticated identity,
+managed infrastructure, and configured optional integrations. It reports the failing stage plus an
+exact repair command without showing credentials or Channel data. Rerun setup to inspect, repair,
+or resume an interrupted profile:
+
+```sh
+bunx prosto-datagram init --profile team
+```
+
+Repair and reruns preserve profiles, secrets, databases, managed volumes, Channels, and Records.
+They never perform destructive cleanup.
+
+### Managed PostgreSQL
+
+The Docker option creates one persistent PostgreSQL container and volume owned by the selected
+Service profile. Docker is never installed automatically. Operate that infrastructure explicitly:
+
+```sh
+bunx prosto-datagram postgres status --profile team
+bunx prosto-datagram postgres stop --profile team
+bunx prosto-datagram postgres start --profile team
+```
+
+Stopping PostgreSQL does not remove its container or volume. Back up the volume named in the setup
+receipt. These lifecycle commands are unavailable for external PostgreSQL because Datagram does not
+own that infrastructure.
+
+### Optional integrations and durable commands
+
+After core Service verification, compatible setups can optionally **Connect Codex**. This installs
+the packaged Datagram Codex skill, registers the profile-scoped MCP Gateway, and verifies the
+connection using the person's Service identity. Skipping or failing this optional stage leaves the
+Service usable; rerun `init --profile NAME` to resume it. Setup does not install generic agents or
+third-party Channel Types.
+
+Setup can also preview and, after explicit consent, run `bun install --global prosto-datagram` for
+durable `datagram` and `datagram-mcp` commands. Declining keeps the exact `bunx` commands shown in
+the receipt. A failed optional installation does not invalidate the configured Service.
+
+### Know the boundaries
+
+- A **Deployment Operator** configures and diagnoses one Datagram Service. Operator authority does
+  not grant access to Channel contents.
+- A **Channel Owner** owns one Channel and controls its membership. This is a Channel role, not a
+  Service infrastructure role.
+- A **Service profile** is local, non-secret operational configuration selecting one Service. It is
+  not Datagram domain data or a Store.
+- A **Channel Type** defines Channel behavior, Actions, Queries, records, and semantic views. The
+  guided starter uses the built-in Table Channel Type.
+- A **Codex skill** teaches Codex how to operate Datagram. It is host configuration, not a Channel
+  Type and not Service data.
+- The **MCP Gateway** exposes permission-checked Datagram Actions and zero-data agent Queries. It is
+  not a database interface and never gives Store-derived values to the model.
+
+Initial guided setup supports macOS and Linux. Windows setup, public answer files, generic
+multi-agent installation, standalone binaries, and automatic destructive cleanup are outside this
+release.
+
+## Contributor setup
 
 ```sh
 bun install

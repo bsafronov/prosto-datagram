@@ -35,7 +35,13 @@ async function command(
 
 async function runTests(connectionString: string): Promise<void> {
   await command(
-    ['bun', 'test', 'test/postgres-store.test.ts', 'test/acceptance-journey.test.ts'],
+    [
+      'bun',
+      'test',
+      'test/postgres-store.test.ts',
+      'test/acceptance-journey.test.ts',
+      'test/packaged-setup.test.ts',
+    ],
     { env: { ...Bun.env, DATAGRAM_TEST_POSTGRES_URL: connectionString } },
   );
 }
