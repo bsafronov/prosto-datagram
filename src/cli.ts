@@ -1,10 +1,11 @@
 #!/usr/bin/env bun
 
-import { runCli, writeCliFailure } from './packages/cli';
+import { createProcessCliHost, runCli, writeCliFailure } from './packages/cli';
 
+const host = createProcessCliHost();
 try {
-  await runCli(Bun.argv.slice(2));
+  await runCli(Bun.argv.slice(2), host);
 } catch (error) {
-  writeCliFailure(error);
-  process.exitCode = 1;
+  writeCliFailure(error, host);
+  host.setExitCode(1);
 }

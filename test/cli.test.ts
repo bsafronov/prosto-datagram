@@ -3,6 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+import { cliUsage, runCli, type CliHost } from '../src/packages/cli';
 import { createRuntime, type DatagramRuntime } from '../src/packages/runtime';
 
 const temporaryDirectories: string[] = [];
@@ -26,6 +27,86 @@ afterEach(async () => {
   await runtime?.close();
   runtime = undefined;
   await Promise.all(temporaryDirectories.splice(0).map((path) => rm(path, { recursive: true })));
+});
+
+test('CLI execution uses injected host services without touching process configuration', async () => {
+  const output: string[] = [];
+  const errors: string[] = [];
+  const runtimeOptions: unknown[] = [];
+  const serverOptions: unknown[] = [];
+  const exitCodes: number[] = [];
+  let terminationHandler: (() => void | Promise<void>) | undefined;
+  let serverStopped = false;
+  const injectedRuntime = await createRuntime({ databasePath: ':memory:' });
+  const serverRuntime = await createRuntime({ databasePath: ':memory:' });
+  const host: CliHost = {
+    terminal: {
+      input: {
+        async *[Symbol.asyncIterator]() {
+          yield 'scripted input';
+        },
+      },
+      inputIsInteractive: true,
+      outputIsInteractive: true,
+      writeOutput: (value) => output.push(value),
+      writeError: (value) => errors.push(value),
+    },
+    environment: {
+      get: (name) => (name === 'DATAGRAM_DB' ? '/injected/data/datagram.sqlite' : undefined),
+    },
+    filesystem: {
+      pathExists: () => Promise.resolve(false),
+      readTextFile: () => Promise.reject(new Error('unexpected filesystem read')),
+      writeTextFile: () => Promise.reject(new Error('unexpected filesystem write')),
+      makeDirectory: () => Promise.reject(new Error('unexpected directory creation')),
+    },
+    directories: {
+      configuration: '/injected/config',
+      data: '/injected/data',
+    },
+    currentDirectory: '/injected/current',
+    runExternalCommand: () => Promise.reject(new Error('unexpected external command')),
+    createRuntime: (options) => {
+      runtimeOptions.push(options);
+      return Promise.resolve(injectedRuntime);
+    },
+    startHttpServer: (options) => {
+      serverOptions.push(options);
+      return Promise.resolve({
+        identityMode: 'development',
+        runtime: serverRuntime,
+        server: {
+          url: new URL('http://127.0.0.1:4310/'),
+          stop: () => {
+            serverStopped = true;
+          },
+        },
+      });
+    },
+    onTermination: (handler) => {
+      terminationHandler = handler;
+    },
+    exit: (code) => exitCodes.push(code),
+    setExitCode: () => undefined,
+  };
+
+  await runCli(['--help'], host);
+  await runCli(['init'], host);
+  await runCli(['serve', '--port', '4310', '--db', '/injected/server.sqlite'], host);
+  await terminationHandler?.();
+
+  expect(output[0]).toBe(cliUsage);
+  expect(JSON.parse(output[1] ?? '')).toEqual({
+    databasePath: '/injected/data/datagram.sqlite',
+    owner: injectedRuntime.owner,
+  });
+  expect(runtimeOptions).toEqual([{ databasePath: '/injected/data/datagram.sqlite' }]);
+  expect(serverOptions).toEqual([{ databasePath: '/injected/server.sqlite', port: 4310 }]);
+  expect(errors).toEqual([
+    'Datagram HTTP listening on http://127.0.0.1:4310/ (development identity mode)\n',
+  ]);
+  expect(serverStopped).toBe(true);
+  expect(exitCodes).toEqual([0]);
 });
 
 test('CLI discovers and invokes shared contracts with trusted Query results', async () => {
