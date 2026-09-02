@@ -562,10 +562,12 @@ test('guided team init prefers native storage and persists only opaque provider 
   const postgresSecret = ['postgres', 'native', 'marker'].join('-');
   const connectionString = `postgres://operator:${postgresSecret}@localhost:5432/datagram?sslmode=disable`;
   const storedSecrets: string[] = [];
+  const storedAccounts: string[] = [];
   const provider: CredentialProvider = {
     kind: 'macos-keychain',
     availability: () => Promise.resolve({ available: true }),
     create: ({ account, secret }) => {
+      storedAccounts.push(account);
       storedSecrets.push(secret);
       return Promise.resolve({
         kind: 'native',
@@ -628,6 +630,8 @@ test('guided team init prefers native storage and persists only opaque provider 
   });
   expect(storedSecrets).toHaveLength(2);
   expect(storedSecrets).toContain(connectionString);
+  expect(storedAccounts[0]).toMatch(/^team:[0-9a-f-]+:postgres$/);
+  expect(storedAccounts[1]).toBe(storedAccounts[0]?.replace(/:postgres$/, ':operator'));
   expect(profileText).not.toContain(postgresSecret);
   expect(profileText).not.toContain(storedSecrets[1] ?? 'missing bearer secret');
   expect(output.join('')).not.toContain(postgresSecret);

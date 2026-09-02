@@ -119,14 +119,14 @@ async function envSecret(
 }
 
 async function collect(host: CliHost, read: ReadAnswer): Promise<Answers> {
-  host.terminal.writeOutput('[2/8] Team Service profile name [team] (or Cancel): ');
+  host.terminal.writeOutput('[2/9] Team Service profile name [team] (or Cancel): ');
   const rawProfileName = trim(await read());
   if (isCancel(rawProfileName)) throw new DatagramError('setup.cancelled', 'Setup cancelled.', 400);
   const profileName = rawProfileName || 'team';
   if (!profileNamePattern.test(profileName)) {
     throw new DatagramError('profile.name-invalid', 'Service profile name is invalid.', 400);
   }
-  host.terminal.writeOutput('[3/8] Deployment Operator display name (or Cancel): ');
+  host.terminal.writeOutput('[3/9] Deployment Operator display name (or Cancel): ');
   const displayName = trim(await read());
   if (isCancel(displayName)) throw new DatagramError('setup.cancelled', 'Setup cancelled.', 400);
   if (!displayName || displayName.length > 120) {
@@ -509,13 +509,16 @@ export async function runGuidedServerSetup(host: CliHost, read: ReadAnswer): Pro
   let bearerCredential = answers.bearerCredential;
   if (answers.credentialStorage === 'native') {
     const provider = capability(host.credentialProvider, 'credential.native-unavailable');
+    const accountPrefix = answers.managedPostgres
+      ? answers.profileName
+      : `${answers.profileName}:${crypto.randomUUID()}`;
     postgresCredential = await provider.create({
-      account: `${answers.profileName}:postgres`,
+      account: `${accountPrefix}:postgres`,
       label: `Prosto.Datagram ${answers.profileName} PostgreSQL`,
       secret: answers.connectionString,
     });
     bearerCredential = await provider.create({
-      account: `${answers.profileName}:operator`,
+      account: `${accountPrefix}:operator`,
       label: `Prosto.Datagram ${answers.profileName} operator`,
       secret: answers.bearerToken,
     });
