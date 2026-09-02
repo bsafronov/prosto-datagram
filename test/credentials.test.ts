@@ -50,22 +50,23 @@ test('Linux Secret Service adapter verifies the session and never puts secrets i
 
   expect(requests[0]).toMatchObject({
     command: 'secret-tool',
-    args: [
-      'search',
-      '--all',
-      'application',
-      'prosto-datagram-availability-probe',
-      'account',
-      'unconfigured',
-    ],
+    args: ['--help'],
+  });
+  expect(requests[1]).toMatchObject({
+    command: 'gdbus',
+    args: expect.arrayContaining(['--session', 'org.freedesktop.secrets']),
   });
   expect(requests.filter((request) => request.stdin === marker)).toHaveLength(2);
   expect(JSON.stringify(requests.map(({ stdin: _stdin, ...request }) => request))).not.toContain(marker);
 });
 
 test('native provider unavailability and command failures are explicit and redacted', async () => {
-  const unavailable = createNativeCredentialProvider('linux', () =>
-    Promise.resolve({ exitCode: 1, stdout: marker, stderr: marker }),
+  const unavailable = createNativeCredentialProvider('linux', (request) =>
+    Promise.resolve({
+      exitCode: request.command === 'secret-tool' && request.args[0] === '--help' ? 0 : 1,
+      stdout: marker,
+      stderr: marker,
+    }),
   );
   if (unavailable === undefined) throw new Error('expected Linux provider');
   expect(await unavailable.availability()).toEqual({

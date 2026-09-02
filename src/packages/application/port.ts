@@ -4,6 +4,7 @@ import type {
   QueryResult,
   SubscriptionEvent,
 } from '../domain/model';
+import type { Person } from './store';
 import type { ActionRegistry, QueryRegistry } from './contracts';
 import type { ChannelTypeContractSelector } from './contracts';
 import type {
@@ -18,6 +19,7 @@ export interface DatagramApplicationPort {
   readonly handles: ResultHandleBroker;
   readonly queries: QueryRegistry;
   verifyServiceIdentity(actorId: string): Promise<{ readonly actorId: string }>;
+  resolveServiceIdentity(actorId?: string): Promise<Person>;
   executeAction(
     actorId: string,
     origin: OperationOrigin,

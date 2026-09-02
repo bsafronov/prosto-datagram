@@ -1,5 +1,6 @@
 import { DatagramError, toPublicError } from '../../application/errors';
 import type { ChannelTypeContractSelector } from '../../application/contracts';
+import { createRemoteServiceApplication } from '../../remote-service-client';
 import { createProcessCliHost, type CliHost } from './host';
 import { runDoctor } from './doctor';
 import { runGuidedInit } from './init';
@@ -7,6 +8,7 @@ import {
   isServerProfile,
   readServiceProfile,
   resolveCredential,
+  resolveSelectedServiceProfile,
   resolveServiceTarget,
 } from './profiles';
 
@@ -199,52 +201,76 @@ export async function runCli(
     throw new DatagramError('cli.command-unknown', 'Unknown command', 400);
   }
 
-  const target = await resolveServiceTarget(host, {
+  const targetOptions = {
     actorId: option(args, '--actor'),
     databasePath: option(args, '--db'),
     profileName: option(args, '--profile'),
-  });
-  const runtime = await host.createRuntime({ databasePath: target.databasePath });
+  };
+  const selectedProfile = await resolveSelectedServiceProfile(host, targetOptions);
+  const target =
+    selectedProfile !== undefined && isServerProfile(selectedProfile)
+      ? undefined
+      : await resolveServiceTarget(host, targetOptions);
+  const remote = selectedProfile !== undefined && isServerProfile(selectedProfile);
+  const selector = channelType(args);
+  const remoteApp = remote
+    ? await createRemoteServiceApplication({
+        baseUrl:
+          selectedProfile.service.publicAccess?.kind === 'reverse-proxy'
+            ? new URL(selectedProfile.service.publicAccess.endpoint)
+            : new URL(
+                `${selectedProfile.service.publicAccess?.kind === 'direct-tls' ? 'https' : 'http'}://${selectedProfile.service.bind.hostname}:${selectedProfile.service.bind.port}/`,
+              ),
+        bearerToken: await resolveCredential(host, selectedProfile.identity.bearerCredential),
+        ...(selector === undefined ? {} : { channelType: selector }),
+        request: host.request ?? ((request) => fetch(request)),
+      })
+    : undefined;
+  const localRuntime = remote
+    ? undefined
+    : await host.createRuntime({ databasePath: target!.databasePath });
   try {
-    const actorId = target.actorId ?? runtime.owner.id;
-    const selector = channelType(args);
+    const activeApp = localRuntime?.app ?? remoteApp!;
+    const actorId = remote
+      ? selectedProfile.identity.personId
+      : target!.actorId ?? localRuntime!.owner.id;
     switch (command) {
       case 'actions':
-        output(host, runtime.app.actions.catalog(selector));
+        output(host, activeApp.actions.catalog(selector));
         break;
       case 'queries':
-        output(host, runtime.app.queries.catalog(selector));
+        output(host, activeApp.queries.catalog(selector));
         break;
       case 'action': {
         const name = required(args[1], 'Action name is required');
-        if (selector && !runtime.app.actions.list(selector).some((value) => value.name === name)) {
+        if (selector && !activeApp.actions.list(selector).some((value) => value.name === name)) {
           throw new DatagramError('action.unknown', `Unknown definition: ${name}`, 404);
         }
         output(
           host,
-          await runtime.app.executeAction(actorId, 'cli', name, input(args), selector),
+          await activeApp.executeAction(actorId, 'cli', name, input(args), selector),
         );
         break;
       }
       case 'query': {
         const name = required(args[1], 'Query name is required');
-        if (selector && !runtime.app.queries.list(selector).some((value) => value.name === name)) {
+        if (selector && !activeApp.queries.list(selector).some((value) => value.name === name)) {
           throw new DatagramError('query.unknown', `Unknown definition: ${name}`, 404);
         }
         output(
           host,
-          await runtime.app.executeQuery(actorId, 'cli', name, input(args), selector),
+          await activeApp.executeQuery(actorId, 'cli', name, input(args), selector),
         );
         break;
       }
       case 'agent-query': {
         const name = required(args[1], 'Query name is required');
-        if (selector && !runtime.app.queries.list(selector).some((value) => value.name === name)) {
+        if (selector && !activeApp.queries.list(selector).some((value) => value.name === name)) {
           throw new DatagramError('query.unknown', `Unknown definition: ${name}`, 404);
         }
         output(
           host,
-          await runtime.app.prepareQuery(actorId, 'agent', name, input(args), undefined, selector),
+          await activeApp.prepareQuery(actorId, 'agent', name, input(args), undefined, selector),
         );
         break;
       }
@@ -252,6 +278,6 @@ export async function runCli(
         throw new DatagramError('cli.command-unknown', 'Unknown command', 400);
     }
   } finally {
-    await runtime.close();
+    await localRuntime?.close();
   }
 }

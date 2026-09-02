@@ -101,12 +101,17 @@ async function checkServerService(
   host: CliHost,
   profile: ServerServiceProfile,
   completed: SuccessfulCheck[],
+  existing?: {
+    readonly connectionString: string;
+    readonly bearerToken: string;
+    readonly started: Awaited<ReturnType<NonNullable<CliHost['startServerService']>>>;
+  },
 ): Promise<DoctorReport> {
   let connectionString: string;
   let bearerToken: string;
   try {
-    connectionString = await resolveCredential(host, profile.service.postgres.credential);
-    bearerToken = await resolveCredential(host, profile.identity.bearerCredential);
+    connectionString = existing?.connectionString ?? await resolveCredential(host, profile.service.postgres.credential);
+    bearerToken = existing?.bearerToken ?? await resolveCredential(host, profile.identity.bearerCredential);
     completed.push({ status: 'ok', stage: 'target' });
   } catch (error) {
     return failed(
@@ -152,30 +157,33 @@ async function checkServerService(
       'server',
     );
   }
-  let started: Awaited<ReturnType<NonNullable<CliHost['startServerService']>>> | undefined;
+  let started = existing?.started;
+  const startedHere = started === undefined;
   try {
     if (host.startServerService === undefined || host.request === undefined) {
       throw new Error('server verification unavailable');
     }
-    started = await host.startServerService({
-      connectionString,
-      deploymentOperatorDisplayName: profile.identity.displayName,
-      deploymentOperatorId: profile.identity.personId,
-      deploymentOperatorToken: bearerToken,
-      hostname: profile.service.bind.hostname,
-      port: profile.service.bind.port,
-      serviceKey: profile.service.serviceKey,
-      ...(profile.service.publicAccess?.kind === 'direct-tls'
-        ? {
-            tls: {
-              certificate: await host.filesystem.readTextFile(
-                profile.service.publicAccess.certificatePath,
-              ),
-              key: await host.filesystem.readTextFile(profile.service.publicAccess.keyPath),
-            },
-          }
-        : {}),
-    });
+    if (started === undefined) {
+      started = await host.startServerService({
+        connectionString,
+        deploymentOperatorDisplayName: profile.identity.displayName,
+        deploymentOperatorId: profile.identity.personId,
+        deploymentOperatorToken: bearerToken,
+        hostname: profile.service.bind.hostname,
+        port: profile.service.bind.port,
+        serviceKey: profile.service.serviceKey,
+        ...(profile.service.publicAccess?.kind === 'direct-tls'
+          ? {
+              tls: {
+                certificate: await host.filesystem.readTextFile(
+                  profile.service.publicAccess.certificatePath,
+                ),
+                key: await host.filesystem.readTextFile(profile.service.publicAccess.keyPath),
+              },
+            }
+          : {}),
+      });
+    }
     const url =
       profile.service.publicAccess?.kind === 'reverse-proxy'
         ? new URL(profile.service.publicAccess.endpoint)
@@ -215,7 +223,7 @@ async function checkServerService(
       'server',
     );
   } finally {
-    if (started) {
+    if (startedHere && started) {
       await started.server.stop();
       await started.runtime.close();
     }
@@ -226,13 +234,18 @@ export async function checkService(
   host: CliHost,
   profileName: string,
   existingRuntime?: OpenDatagramRuntime,
+  existingServer?: {
+    readonly connectionString: string;
+    readonly bearerToken: string;
+    readonly started: Awaited<ReturnType<NonNullable<CliHost['startServerService']>>>;
+  },
 ): Promise<DoctorReport> {
   const completed: SuccessfulCheck[] = [];
   const profilePath = join(host.directories.configuration, 'profiles', `${profileName}.json`);
   try {
     const profile = await readServiceProfile(host, profileName);
     completed.push({ status: 'ok', stage: 'profile' });
-    if (isServerProfile(profile)) return checkServerService(host, profile, completed);
+    if (isServerProfile(profile)) return checkServerService(host, profile, completed, existingServer);
   } catch (error) {
     return failed(
       profileName,

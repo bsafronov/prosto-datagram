@@ -1,6 +1,7 @@
 import { join, resolve } from 'node:path';
 
 import { DatagramError } from '../../application/errors';
+import type { OpenDatagramRuntime } from '../../runtime';
 import type { CliHost } from './host';
 import { checkService } from './doctor';
 import { runGuidedServerSetup } from './server-setup';
@@ -170,18 +171,16 @@ async function runLegacyAdoption(
 
   const runtime = await host.openRuntime({ databasePath: legacy.databasePath });
   try {
-    const identity =
-      legacy.actorId === undefined
-        ? await runtime.store.findLocalOwner()
-        : await runtime.store.getPerson(legacy.actorId);
-    if (identity === undefined || identity === null) {
+    let identity;
+    try {
+      identity = await runtime.app.resolveServiceIdentity(legacy.actorId);
+    } catch {
       throw new DatagramError(
         'setup.adoption-identity-missing',
         'Adoption stopped safely because the existing Service identity could not be resolved. No profile was created.',
         400,
       );
     }
-    await runtime.app.verifyServiceIdentity(identity.id);
     const defaultProfilePath = join(host.directories.configuration, 'default-profile');
     host.terminal.writeOutput(
       'Review adoption plan\n' +
@@ -275,8 +274,9 @@ async function collectAnswers(
       if (answer === '' || answer === '1') {
         step = 1;
       } else if (answer === '2') {
-        await runGuidedServerSetup(host, read);
-        return { kind: 'team-complete' };
+        const team = await runGuidedServerSetup(host, read);
+        if (team === 'back') step = 0;
+        else return { kind: 'team-complete' };
       } else {
         host.terminal.writeOutput('Choose 1 or 2.\n');
       }
@@ -468,6 +468,86 @@ function journalFromProfile(profile: LocalServiceProfile): SetupJournal {
 
 function normalStarter(progress: JournalStarterProgress): StarterProgress | undefined {
   return isUncertainStarter(progress) ? undefined : progress;
+}
+
+function starterRank(progress: JournalStarterProgress): number {
+  switch (progress.status) {
+    case 'pending':
+    case 'channel-applying':
+      return 0;
+    case 'channel-created':
+    case 'field-applying':
+      return 1;
+    case 'field-created':
+    case 'record-applying':
+      return 2;
+    case 'complete':
+      return 3;
+  }
+}
+
+function reconcileStarterProgress(
+  journal: JournalStarterProgress,
+  profile: StarterProgress | undefined,
+): JournalStarterProgress {
+  if (!isUncertainStarter(journal) || profile === undefined) return journal;
+  return starterRank(profile) > starterRank(journal) ? profile : journal;
+}
+
+async function reconcileUncertainStarterAction(
+  runtime: OpenDatagramRuntime,
+  actorId: string,
+  progress: JournalStarterProgress,
+): Promise<StarterProgress | undefined> {
+  if (progress.status !== 'field-applying' && progress.status !== 'record-applying') {
+    return undefined;
+  }
+  const history = await runtime.app.executeQuery(actorId, 'cli', 'operation.history', {
+    channelId: progress.channelId,
+  });
+  if (!Array.isArray(history.data)) return undefined;
+  const priorOperationId =
+    progress.status === 'field-applying'
+      ? progress.channelOperationId
+      : progress.fieldOperationId;
+  const priorIndex = history.data.findIndex(
+    (operation) =>
+      typeof operation === 'object' &&
+      operation !== null &&
+      'id' in operation &&
+      operation.id === priorOperationId,
+  );
+  if (priorIndex < 0) return undefined;
+  const expectedIntent =
+    progress.status === 'field-applying' ? 'table.field.add' : 'table.record.create';
+  const candidates = history.data.slice(priorIndex + 1).filter(
+    (operation): operation is { readonly id: string } =>
+      typeof operation === 'object' &&
+      operation !== null &&
+      'actorId' in operation &&
+      operation.actorId === actorId &&
+      'origin' in operation &&
+      operation.origin === 'cli' &&
+      'intent' in operation &&
+      operation.intent === expectedIntent &&
+      'id' in operation &&
+      typeof operation.id === 'string',
+  );
+  if (candidates.length !== 1) return undefined;
+  return progress.status === 'field-applying'
+    ? {
+        status: 'field-created',
+        channelId: progress.channelId,
+        channelOperationId: progress.channelOperationId,
+        fieldOperationId: candidates[0]!.id,
+      }
+    : {
+        status: 'complete',
+        channelId: progress.channelId,
+        channelOperationId: progress.channelOperationId,
+        fieldOperationId: progress.fieldOperationId,
+        recordOperationId: candidates[0]!.id,
+      };
 }
 
 function clearFailure(journal: SetupJournal): SetupJournal {
@@ -687,6 +767,12 @@ async function runExistingSetup(
     journalInvalid = true;
     journal = journalFromProfile(profile);
   }
+  const reconciledStarter = reconcileStarterProgress(journal.starter, profile.setup?.starter);
+  if (reconciledStarter !== journal.starter) {
+    journal = { ...clearFailure(journal), starter: reconciledStarter };
+    await saveProgress(host, profilePath, profile, journal);
+    host.terminal.writeOutput('Reconciled committed starter Action from verified profile progress.\n');
+  }
   const report = await checkService(host, profileName);
   const coreReportOk =
     report.ok || report.checks.some((check) => check.status === 'failed' && check.stage === 'codex');
@@ -772,14 +858,33 @@ async function runExistingSetup(
     await saveProgress(host, profilePath, profile, journal);
   }
   if (isUncertainStarter(journal.starter)) {
-    throw new DatagramError(
-      'setup.effect-uncertain',
-      `Previous Action may have committed. It was not repeated. Inspect Service before repair. Repair: ${command}`,
-      409,
-    );
+    const runtime = await host.openRuntime({ databasePath: profile.service.databasePath });
+    try {
+      const reconciled = await reconcileUncertainStarterAction(
+        runtime,
+        profile.identity.personId,
+        journal.starter,
+      );
+      if (reconciled === undefined) {
+        throw new DatagramError(
+          'setup.effect-uncertain',
+          `Previous Action may have committed. It was not repeated. Inspect Service before repair. Repair: ${command}`,
+          409,
+        );
+      }
+      journal = { ...clearFailure(journal), starter: reconciled };
+      await saveProgress(host, profilePath, profile, journal);
+      host.terminal.writeOutput('Reconciled committed starter Action from Operation History.\n');
+    } finally {
+      await runtime.close();
+    }
   }
   if (journal.starter.status !== 'complete') {
-    const answers = await collectStarterAnswers(host, read, journal.starter);
+    const resumableStarter = normalStarter(journal.starter);
+    if (resumableStarter === undefined) {
+      throw new DatagramError('setup.effect-uncertain', 'Starter Action state remains uncertain.', 409);
+    }
+    const answers = await collectStarterAnswers(host, read, resumableStarter);
     if (answers.kind === 'cancelled') {
       host.terminal.writeOutput(`Core setup remains ready. Resume: ${command}\n`);
       return;

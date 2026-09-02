@@ -4,6 +4,7 @@ import { DatagramError } from '../../application/errors';
 import type { ServerServiceOptions } from '../../server';
 import type { CliHost } from './host';
 import type { CredentialReference } from './credentials';
+import { checkService } from './doctor';
 import { applyCodexIntegration, discoverCodexIntegration } from './integrations';
 import { saveSetupJournal, type SetupJournal } from './journal';
 import {
@@ -40,6 +41,7 @@ interface Answers {
 const envPattern = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const trim = (value: string) => value.trim();
 const isCancel = (value: string) => trim(value).toLowerCase() === 'cancel';
+const isBack = (value: string) => trim(value).toLowerCase() === 'back';
 
 function capability<T>(value: T | undefined, code: string): T {
   if (value === undefined) throw new DatagramError(code, 'Setup is unavailable on this host.', 500);
@@ -118,26 +120,29 @@ async function envSecret(
   return { reference: { kind: 'environment', name }, value };
 }
 
-async function collect(host: CliHost, read: ReadAnswer): Promise<Answers> {
-  host.terminal.writeOutput('[2/9] Team Service profile name [team] (or Cancel): ');
+async function collect(host: CliHost, read: ReadAnswer): Promise<Answers | undefined> {
+  host.terminal.writeOutput('[2/9] Team Service profile name [team] (or Back/Cancel): ');
   const rawProfileName = trim(await read());
   if (isCancel(rawProfileName)) throw new DatagramError('setup.cancelled', 'Setup cancelled.', 400);
+  if (isBack(rawProfileName)) return undefined;
   const profileName = rawProfileName || 'team';
   if (!profileNamePattern.test(profileName)) {
     throw new DatagramError('profile.name-invalid', 'Service profile name is invalid.', 400);
   }
-  host.terminal.writeOutput('[3/9] Deployment Operator display name (or Cancel): ');
+  host.terminal.writeOutput('[3/9] Deployment Operator display name (or Back/Cancel): ');
   const displayName = trim(await read());
   if (isCancel(displayName)) throw new DatagramError('setup.cancelled', 'Setup cancelled.', 400);
+  if (isBack(displayName)) return collect(host, read);
   if (!displayName || displayName.length > 120) {
     throw new DatagramError('setup.display-name-invalid', 'Enter 1-120 characters.', 400);
   }
   host.terminal.writeOutput(
     '[4/9] PostgreSQL\n  1. Existing PostgreSQL URL (externally owned)\n' +
-      '  2. Docker-managed persistent PostgreSQL\nSelection [1] (or Cancel): ',
+      '  2. Docker-managed persistent PostgreSQL\nSelection [1] (or Back/Cancel): ',
   );
   const databaseSource = trim(await read());
   if (isCancel(databaseSource)) throw new DatagramError('setup.cancelled', 'Setup cancelled.', 400);
+  if (isBack(databaseSource)) return collect(host, read);
   if (!['', '1', '2'].includes(databaseSource)) {
     throw new DatagramError('setup.postgres-choice-invalid', 'Choose 1 or 2.', 400);
   }
@@ -151,9 +156,10 @@ async function collect(host: CliHost, read: ReadAnswer): Promise<Answers> {
   let managedPostgres: ManagedPostgresCreate | undefined;
   let managedCredentialsReused = false;
   if (managed) {
-    host.terminal.writeOutput('PostgreSQL host port [5432] (or Cancel): ');
+    host.terminal.writeOutput('PostgreSQL host port [5432] (or Back/Cancel): ');
     const rawPostgresPort = trim(await read());
     if (isCancel(rawPostgresPort)) throw new DatagramError('setup.cancelled', 'Setup cancelled.', 400);
+    if (isBack(rawPostgresPort)) return collect(host, read);
     const postgresPort = rawPostgresPort ? Number(rawPostgresPort) : 5432;
     if (!Number.isInteger(postgresPort) || postgresPort < 1 || postgresPort > 65_535) {
       throw new DatagramError('setup.port-invalid', 'Port must be from 1 to 65535.', 400);
@@ -176,7 +182,7 @@ async function collect(host: CliHost, read: ReadAnswer): Promise<Answers> {
       `  1. System credential store (${host.credentialProvider?.kind}) (Recommended)\n` +
         '  2. Permission-restricted secret file\n' +
         (managed ? '' : '  3. Environment references (Advanced)\n') +
-        'Selection [1] (or Cancel): ',
+        'Selection [1] (or Back/Cancel): ',
     );
   } else {
     host.terminal.writeOutput(
@@ -184,11 +190,12 @@ async function collect(host: CliHost, read: ReadAnswer): Promise<Answers> {
         'Choose an explicit fallback:\n' +
         '  1. Permission-restricted secret file (Recommended fallback)\n' +
         (managed ? '' : '  2. Environment references (Advanced)\n') +
-        'Selection [1] (or Cancel): ',
+        'Selection [1] (or Back/Cancel): ',
     );
   }
   const storage = trim(await read());
   if (isCancel(storage)) throw new DatagramError('setup.cancelled', 'Setup cancelled.', 400);
+  if (isBack(storage)) return collect(host, read);
   const nativeSelected = nativeAvailability.available && (!storage || storage === '1');
   const fileSelected = nativeAvailability.available ? storage === '2' : !storage || storage === '1';
   const environmentSelected =
@@ -196,11 +203,12 @@ async function collect(host: CliHost, read: ReadAnswer): Promise<Answers> {
   if (nativeSelected || fileSelected) {
     credentialStorage = nativeSelected ? 'native' : 'file';
     if (!managed) {
-      host.terminal.writeOutput('Existing PostgreSQL URL (or Cancel): ');
+      host.terminal.writeOutput('Existing PostgreSQL URL (or Back/Cancel): ');
       connectionString = trim(await read());
       if (isCancel(connectionString)) {
         throw new DatagramError('setup.cancelled', 'Setup cancelled.', 400);
       }
+      if (isBack(connectionString)) return collect(host, read);
       bearerToken =
         crypto.randomUUID().replaceAll('-', '') + crypto.randomUUID().replaceAll('-', '');
     }
@@ -274,9 +282,11 @@ async function collect(host: CliHost, read: ReadAnswer): Promise<Answers> {
   }
   postgresUrl(connectionString);
   host.terminal.writeOutput(
-    '[6/9] Exposure\n  1. This host\n  2. Private network\n  3. Public\nSelection [1]: ',
+    '[6/9] Exposure\n  1. This host\n  2. Private network\n  3. Public\nSelection [1] (or Back/Cancel): ',
   );
   const exposureAnswer = trim(await read());
+  if (isCancel(exposureAnswer)) throw new DatagramError('setup.cancelled', 'Setup cancelled.', 400);
+  if (isBack(exposureAnswer)) return collect(host, read);
   const exposure: ServerExposure =
     !exposureAnswer || exposureAnswer === '1'
       ? 'host'
@@ -289,8 +299,10 @@ async function collect(host: CliHost, read: ReadAnswer): Promise<Answers> {
             })();
   let hostname = '127.0.0.1';
   if (exposure !== 'host') {
-    host.terminal.writeOutput('Explicit non-loopback bind hostname/address: ');
+    host.terminal.writeOutput('Explicit non-loopback bind hostname/address (or Back/Cancel): ');
     hostname = trim(await read());
+    if (isCancel(hostname)) throw new DatagramError('setup.cancelled', 'Setup cancelled.', 400);
+    if (isBack(hostname)) return collect(host, read);
     if (!hostname || ['127.0.0.1', '::1', 'localhost'].includes(hostname.toLowerCase())) {
       throw new DatagramError('setup.bind-invalid', 'Enter an explicit non-loopback bind address.', 400);
     }
@@ -299,12 +311,16 @@ async function collect(host: CliHost, read: ReadAnswer): Promise<Answers> {
   if (exposure === 'public') {
     host.terminal.writeOutput(
       '[7/9] Public TLS\n  1. Existing HTTPS reverse proxy\n' +
-        '  2. Direct TLS certificate/key\nSelection: ',
+        '  2. Direct TLS certificate/key\nSelection (or Back/Cancel): ',
     );
     const tls = trim(await read());
+    if (isCancel(tls)) throw new DatagramError('setup.cancelled', 'Setup cancelled.', 400);
+    if (isBack(tls)) return collect(host, read);
     if (tls === '1') {
-      host.terminal.writeOutput('Public HTTPS endpoint: ');
+      host.terminal.writeOutput('Public HTTPS endpoint (or Back/Cancel): ');
       const endpoint = trim(await read());
+      if (isCancel(endpoint)) throw new DatagramError('setup.cancelled', 'Setup cancelled.', 400);
+      if (isBack(endpoint)) return collect(host, read);
       let url: URL;
       try {
         url = new URL(endpoint);
@@ -320,10 +336,14 @@ async function collect(host: CliHost, read: ReadAnswer): Promise<Answers> {
       }
       publicAccess = { kind: 'reverse-proxy', endpoint: url.toString() };
     } else if (tls === '2') {
-      host.terminal.writeOutput('Absolute TLS certificate path: ');
+      host.terminal.writeOutput('Absolute TLS certificate path (or Back/Cancel): ');
       const certificatePath = trim(await read());
-      host.terminal.writeOutput('Absolute TLS private-key path: ');
+      if (isCancel(certificatePath)) throw new DatagramError('setup.cancelled', 'Setup cancelled.', 400);
+      if (isBack(certificatePath)) return collect(host, read);
+      host.terminal.writeOutput('Absolute TLS private-key path (or Back/Cancel): ');
       const keyPath = trim(await read());
+      if (isCancel(keyPath)) throw new DatagramError('setup.cancelled', 'Setup cancelled.', 400);
+      if (isBack(keyPath)) return collect(host, read);
       if (!isAbsolute(certificatePath) || !isAbsolute(keyPath)) {
         throw new DatagramError('setup.public-tls-required', 'TLS paths must be absolute.', 400);
       }
@@ -339,8 +359,10 @@ async function collect(host: CliHost, read: ReadAnswer): Promise<Answers> {
       );
     }
   }
-  host.terminal.writeOutput('[8/9] HTTP port [3100]: ');
+  host.terminal.writeOutput('[8/9] HTTP port [3100] (or Back/Cancel): ');
   const rawPort = trim(await read());
+  if (isCancel(rawPort)) throw new DatagramError('setup.cancelled', 'Setup cancelled.', 400);
+  if (isBack(rawPort)) return collect(host, read);
   const port = rawPort ? Number(rawPort) : 3100;
   if (!Number.isInteger(port) || port < 1 || port > 65_535) {
     throw new DatagramError('setup.port-invalid', 'Port must be from 1 to 65535.', 400);
@@ -363,23 +385,6 @@ async function collect(host: CliHost, read: ReadAnswer): Promise<Answers> {
   };
 }
 
-async function verifyHttp(host: CliHost, url: URL, token: string): Promise<void> {
-  const request = capability(host.request, 'setup.http-probe-unavailable');
-  for (const [path, authenticated] of [
-    ['/health', false],
-    ['/v1/actions', true],
-  ] as const) {
-    const response = await request(
-      new Request(new URL(path, url), {
-        ...(authenticated ? { headers: { authorization: `Bearer ${token}` } } : {}),
-        redirect: 'manual',
-        signal: AbortSignal.timeout(5_000),
-      }),
-    );
-    if (!response.ok) throw new Error('HTTP verification failed');
-  }
-}
-
 async function probePostgresReady(host: CliHost, connectionString: string): Promise<void> {
   const probe = capability(host.probePostgres, 'setup.postgres-probe-unavailable');
   const deadline = Date.now() + 30_000;
@@ -394,14 +399,19 @@ async function probePostgresReady(host: CliHost, connectionString: string): Prom
   }
 }
 
-export async function runGuidedServerSetup(host: CliHost, read: ReadAnswer): Promise<void> {
+export async function runGuidedServerSetup(
+  host: CliHost,
+  read: ReadAnswer,
+): Promise<'back' | 'complete'> {
   let answers: Answers;
   try {
-    answers = await collect(host, read);
+    const collected = await collect(host, read);
+    if (collected === undefined) return 'back';
+    answers = collected;
   } catch (error) {
     if (error instanceof DatagramError && error.code === 'setup.cancelled') {
       host.terminal.writeOutput('Setup cancelled. No changes were made.\n');
-      return;
+      return 'complete';
     }
     throw error;
   }
@@ -424,6 +434,20 @@ export async function runGuidedServerSetup(host: CliHost, read: ReadAnswer): Pro
         400,
       );
     }
+    if (state === 'stopped') {
+      try {
+        await capability(host.checkPort, 'setup.port-check-unavailable')(
+          '127.0.0.1',
+          managedPostgres.port,
+        );
+      } catch {
+        throw new DatagramError(
+          'setup.postgres-port-unavailable',
+          `Managed PostgreSQL is stopped and port ${managedPostgres.port} is unavailable. Free the port before Apply.`,
+          400,
+        );
+      }
+    }
     while (state === 'missing') {
       try {
         if (managedPostgres.port === answers.port) throw new Error('ports overlap');
@@ -439,7 +463,7 @@ export async function runGuidedServerSetup(host: CliHost, read: ReadAnswer): Pro
         const replacement = trim(await read());
         if (isCancel(replacement)) {
           host.terminal.writeOutput('Setup cancelled. No changes were made.\n');
-          return;
+          return 'complete';
         }
         const port = Number(replacement);
         if (!Number.isInteger(port) || port < 1 || port > 65_535) {
@@ -499,7 +523,7 @@ export async function runGuidedServerSetup(host: CliHost, read: ReadAnswer): Pro
   const consent = trim(await read()).toLowerCase();
   if (isCancel(consent) || consent === 'n' || consent === 'no') {
     host.terminal.writeOutput('Setup cancelled. No changes were made.\n');
-    return;
+    return 'complete';
   }
   if (!['', 'y', 'yes'].includes(consent)) {
     throw new DatagramError('setup.consent-invalid', 'Choose Y, n, or Cancel.', 400);
@@ -599,11 +623,19 @@ export async function runGuidedServerSetup(host: CliHost, read: ReadAnswer): Pro
       `${answers.profileName}\n`,
       { mode: 0o600 },
     );
-    const verificationUrl =
-      answers.publicAccess?.kind === 'reverse-proxy'
-        ? new URL(answers.publicAccess.endpoint)
-        : started.server.url;
-    await verifyHttp(host, verificationUrl, answers.bearerToken);
+    const verification = await checkService(host, answers.profileName, undefined, {
+      connectionString: answers.connectionString,
+      bearerToken: answers.bearerToken,
+      started,
+    });
+    if (!verification.ok) {
+      const failure = verification.checks.find((check) => check.status === 'failed');
+      throw new DatagramError(
+        failure?.code ?? 'setup.server-verification-failed',
+        failure?.recovery ?? 'Server Service verification failed.',
+        500,
+      );
+    }
     await host.filesystem.writeTextFile(
       profilePath,
       `${JSON.stringify({ ...profile, setup: { core: 'verified' } }, null, 2)}\n`,
@@ -691,4 +723,5 @@ export async function runGuidedServerSetup(host: CliHost, read: ReadAnswer): Pro
       await started.runtime.close();
     }
   }
+  return 'complete';
 }

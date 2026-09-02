@@ -105,6 +105,48 @@ export interface ResolvedServiceTarget {
   readonly profileName?: string;
 }
 
+export async function resolveSelectedServiceProfile(
+  host: CliHost,
+  options: TargetOptions,
+): Promise<ServiceProfile | undefined> {
+  if (options.profileName !== undefined) {
+    if (options.databasePath !== undefined || options.actorId !== undefined) {
+      throw new DatagramError(
+        'profile.target-conflict',
+        '`--profile` cannot be combined with `--db` or `--actor`. Choose one Service target.',
+        400,
+      );
+    }
+    return readServiceProfile(host, options.profileName);
+  }
+  if (
+    options.databasePath !== undefined ||
+    options.actorId !== undefined ||
+    host.environment.get('DATAGRAM_DB') !== undefined ||
+    host.environment.get('DATAGRAM_ACTOR_ID') !== undefined
+  ) {
+    return undefined;
+  }
+  const defaultProfilePath = join(host.directories.configuration, 'default-profile');
+  if (!(await host.filesystem.pathExists(defaultProfilePath))) return undefined;
+  let name: string;
+  try {
+    name = (await host.filesystem.readTextFile(defaultProfilePath)).trim();
+  } catch {
+    throw new DatagramError(
+      'profile.default-unreadable',
+      'The default Service profile could not be read. Check its permissions or run `datagram init` to choose a default.',
+      400,
+    );
+  }
+  if (!profileNamePattern.test(name)) {
+    throw invalidProfile(
+      'The default Service profile selection is invalid. Run `datagram init` to choose a default.',
+    );
+  }
+  return readServiceProfile(host, name);
+}
+
 function invalidProfile(message: string): DatagramError {
   return new DatagramError('profile.invalid', message, 400);
 }

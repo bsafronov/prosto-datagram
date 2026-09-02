@@ -138,14 +138,23 @@ class LinuxSecretServiceProvider extends CommandCredentialProvider {
 
   async availability(): Promise<CredentialProviderAvailability> {
     try {
-      const result = await this.command([
-        'search',
-        '--all',
-        'application',
-        'prosto-datagram-availability-probe',
-        'account',
-        'unconfigured',
-      ]);
+      const client = await this.command(['--help']);
+      if (client.exitCode !== 0) {
+        return { available: false, reason: 'Linux Secret Service client is not installed.' };
+      }
+      const result = await this.run({
+        command: 'gdbus',
+        args: [
+          'call',
+          '--session',
+          '--dest',
+          'org.freedesktop.secrets',
+          '--object-path',
+          '/org/freedesktop/secrets',
+          '--method',
+          'org.freedesktop.DBus.Peer.Ping',
+        ],
+      });
       return result.exitCode === 0
         ? { available: true }
         : { available: false, reason: 'Linux Secret Service has no usable unlocked user session.' };

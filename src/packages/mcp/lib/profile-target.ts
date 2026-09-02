@@ -55,6 +55,14 @@ export async function openMcpRuntimeTarget(
     const app = await createRemoteMcpApplication({
       baseUrl: serverUrl(profile),
       bearerToken,
+      ...(option(args, '--type-id') && option(args, '--type-version')
+        ? {
+            channelType: {
+              typeId: option(args, '--type-id')!,
+              typeVersion: option(args, '--type-version')!,
+            },
+          }
+        : {}),
       request: host.request ?? ((request) => fetch(request)),
     });
     return {

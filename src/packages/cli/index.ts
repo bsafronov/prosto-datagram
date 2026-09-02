@@ -39,6 +39,7 @@ export {
   isServerProfile,
   readServiceProfile,
   resolveCredential,
+  resolveSelectedServiceProfile,
   resolveServiceTarget,
   type LocalServiceProfile,
   type ResolvedServiceTarget,

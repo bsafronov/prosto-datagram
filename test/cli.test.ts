@@ -426,6 +426,28 @@ test('guided team init stores references and verifies an external PostgreSQL Ser
   });
 });
 
+test('guided team wizard supports Back across team choices before Apply', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'datagram-guided-server-back-'));
+  temporaryDirectories.push(directory);
+  const configuration = join(directory, 'configuration');
+  const output: string[] = [];
+  await runCli(
+    ['init'],
+    localSetupHost(
+      configuration,
+      join(directory, 'data'),
+      ['2', 'team', 'Back', 'revised', 'Operator', 'Back', 'final', 'Operator', '', 'Cancel'],
+      output,
+    ),
+  );
+
+  const rendered = output.join('');
+  expect(rendered.match(/Team Service profile name/g)?.length).toBe(3);
+  expect(rendered).toContain('Selection [1] (or Back/Cancel)');
+  expect(rendered).toContain('Setup cancelled. No changes were made.');
+  expect(await pathExists(configuration)).toBe(false);
+});
+
 test('guided team init provisions persistent profile-owned PostgreSQL and exposes safe lifecycle', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'datagram-guided-managed-postgres-'));
   temporaryDirectories.push(directory);
@@ -551,6 +573,49 @@ test('managed PostgreSQL setup explains missing Docker before Apply without inst
     message: expect.stringContaining('choose an existing PostgreSQL URL'),
   });
   expect(externalCommands).toEqual([]);
+  expect(await pathExists(join(configuration, 'profiles', 'team.json'))).toBe(false);
+});
+
+test('stopped managed PostgreSQL checks its host port before Apply', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'datagram-guided-stopped-postgres-port-'));
+  temporaryDirectories.push(directory);
+  const configuration = join(directory, 'configuration');
+  const secretDirectory = join(configuration, 'secrets');
+  await mkdir(secretDirectory, { recursive: true });
+  await writeFile(
+    join(secretDirectory, 'team.json'),
+    `${JSON.stringify({
+      postgresUrl: 'postgres://datagram:password@127.0.0.1:5432/datagram?sslmode=disable',
+      bearerToken: 'operator-token',
+    })}\n`,
+  );
+  let ensureCount = 0;
+  const host: CliHost = {
+    ...localSetupHost(
+      configuration,
+      join(directory, 'data'),
+      ['2', 'team', 'Operator', '2', '', '', '', ''],
+      [],
+    ),
+    dockerPostgres: {
+      available: () => Promise.resolve(true),
+      ensure: () => {
+        ensureCount += 1;
+        return Promise.resolve();
+      },
+      start: () => Promise.resolve(),
+      stop: () => Promise.resolve(),
+      status: () => Promise.resolve('stopped'),
+    },
+    checkPort: (_hostname, port) =>
+      port === 5432 ? Promise.reject(new Error('occupied')) : Promise.resolve(),
+  };
+
+  expect(runCli(['init'], host)).rejects.toMatchObject({
+    code: 'setup.postgres-port-unavailable',
+    message: expect.stringContaining('before Apply'),
+  });
+  expect(ensureCount).toBe(0);
   expect(await pathExists(join(configuration, 'profiles', 'team.json'))).toBe(false);
 });
 
@@ -994,6 +1059,75 @@ test('ordinary commands target the default or explicitly selected Service profil
   });
 });
 
+test('ordinary action, query, and agent-query commands support Server Service profiles', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'datagram-cli-server-profile-'));
+  temporaryDirectories.push(directory);
+  const configuration = join(directory, 'configuration');
+  const profiles = join(configuration, 'profiles');
+  const secretPath = join(configuration, 'server-secrets.json');
+  await mkdir(profiles, { recursive: true });
+  await writeFile(secretPath, `${JSON.stringify({ postgresUrl: 'unused', bearerToken: 'token' })}\n`);
+  await writeFile(
+    join(profiles, 'team.json'),
+    `${JSON.stringify({
+      version: 1,
+      name: 'team',
+      service: {
+        kind: 'server',
+        infrastructure: { kind: 'external-postgres' },
+        serviceKey: 'service_team',
+        postgres: { credential: { kind: 'file', path: secretPath, key: 'postgresUrl' } },
+        bind: { exposure: 'host', hostname: '127.0.0.1', port: 4310 },
+      },
+      identity: {
+        personId: 'person_team',
+        displayName: 'Team Operator',
+        bearerCredential: { kind: 'file', path: secretPath, key: 'bearerToken' },
+      },
+    })}\n`,
+  );
+  await writeFile(join(configuration, 'default-profile'), 'team\n');
+  const output: string[] = [];
+  const requested: string[] = [];
+  const inputSchema = { type: 'object', properties: {}, additionalProperties: false };
+  const host: CliHost = {
+    ...localSetupHost(configuration, join(directory, 'data'), [], output),
+    request: async (request) => {
+      const url = new URL(request.url);
+      requested.push(`${request.method} ${url.pathname}`);
+      expect(request.headers.get('authorization')).toBe('Bearer token');
+      if (request.method === 'GET' && url.pathname === '/v1/actions') {
+        return Response.json({ actions: [{ name: 'channel.create', description: 'Create', inputSchema }] });
+      }
+      if (request.method === 'GET' && url.pathname === '/v1/queries') {
+        return Response.json({ queries: [{ name: 'channel.list', description: 'List', inputSchema }] });
+      }
+      if (url.pathname === '/v1/actions/channel.create') {
+        return Response.json({ action: 'channel.create', operationId: 'operation_server' });
+      }
+      if (url.pathname === '/v1/queries/channel.list') {
+        return Response.json({ data: [], view: { bindings: {}, commands: [], kind: 'channel-list', schemaVersion: 'datagram/view@1', title: 'Channels' } });
+      }
+      if (url.pathname === '/v1/agent/queries/channel.list') {
+        return Response.json({ id: 'result_server', expiresAt: '2099-01-01T00:00:00.000Z', purpose: 'channel.list', view: { bindings: {}, commands: [], kind: 'channel-list', schemaVersion: 'datagram/view@1' } });
+      }
+      return Response.json({ error: { code: 'test.unexpected' } }, { status: 404 });
+    },
+  };
+
+  await runCli(['actions', '--profile', 'team'], host);
+  await runCli(['queries', '--profile', 'team'], host);
+  await runCli(['action', 'channel.create', '--profile', 'team'], host);
+  await runCli(['query', 'channel.list'], host);
+  await runCli(['agent-query', 'channel.list', '--profile', 'team'], host);
+
+  expect(requested).toContain('POST /v1/actions/channel.create');
+  expect(requested).toContain('POST /v1/queries/channel.list');
+  expect(requested).toContain('POST /v1/agent/queries/channel.list');
+  expect(output.join('')).toContain('operation_server');
+  expect(output.join('')).toContain('result_server');
+});
+
 test('serve resolves its database from the selected Service profile', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'datagram-cli-profile-serve-'));
   temporaryDirectories.push(directory);
@@ -1363,7 +1497,7 @@ test('planned setup resumes safely when interruption happened before profile per
   ).toMatchObject({ core: 'verified', starter: { status: 'complete' } });
 });
 
-test('uncertain Action commit is never repeated automatically', async () => {
+test('uncertain Action commit reconciles verified profile progress without repeating it', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'datagram-guided-uncertain-'));
   temporaryDirectories.push(directory);
   const configuration = join(directory, 'configuration');
@@ -1397,28 +1531,44 @@ test('uncertain Action commit is never repeated automatically', async () => {
       },
     })}\n`,
   );
+  const profilePath = join(configuration, 'profiles', 'personal.json');
   const profile = JSON.parse(
-    await readFile(join(configuration, 'profiles', 'personal.json'), 'utf8'),
+    await readFile(profilePath, 'utf8'),
   ) as { service: { databasePath: string }; setup: { starter: { channelId: string } } };
+  await writeFile(
+    profilePath,
+    `${JSON.stringify({
+      ...profile,
+      setup: {
+        core: 'verified',
+        starter: {
+          status: 'field-created',
+          channelId: journal.starter.channelId,
+          channelOperationId: journal.starter.channelOperationId,
+          fieldOperationId: journal.starter.fieldOperationId,
+        },
+      },
+    })}\n`,
+  );
   runtime = await createRuntime({ databasePath: profile.service.databasePath });
   const before = await runtime.store.listOperations(profile.setup.starter.channelId);
   await runtime.close();
   runtime = undefined;
 
-  await expect(
-    runCli(
-      ['init', '--profile', 'personal'],
-      localSetupHost(configuration, data, ['', ''], []),
-    ),
-  ).rejects.toMatchObject({
-    code: 'setup.effect-uncertain',
-    message: expect.stringContaining('was not repeated'),
-  });
+  const resumedOutput: string[] = [];
+  await runCli(
+    ['init', '--profile', 'personal'],
+    localSetupHost(configuration, data, ['', ''], resumedOutput),
+  );
+  expect(resumedOutput.join('')).toContain('Reconciled committed starter Action');
 
   runtime = await createRuntime({ databasePath: profile.service.databasePath });
   expect(await runtime.store.listOperations(profile.setup.starter.channelId)).toHaveLength(
     before.length,
   );
+  expect(JSON.parse(await readFile(journalPath, 'utf8'))).toMatchObject({
+    starter: { status: 'complete' },
+  });
 });
 
 test('guided init cancellation before Apply leaves no profile or SQLite data', async () => {
