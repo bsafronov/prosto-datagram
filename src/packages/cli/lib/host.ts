@@ -1,4 +1,5 @@
 import { access, chmod, lstat, mkdir, open, readFile, rename, stat, writeFile } from 'node:fs/promises';
+import { constants } from 'node:fs';
 import { createServer } from 'node:net';
 import { homedir, platform } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -37,11 +38,14 @@ export interface CliFileSystem {
   writeTextFileAtomic(path: string, value: string, options?: { readonly mode?: number }): Promise<void>;
   makeDirectory(path: string, options?: { readonly recursive?: boolean }): Promise<void>;
   writePrivateTextFile?(path: string, value: string): Promise<void>;
+  canWritePath?(path: string): Promise<boolean>;
+  isSymbolicLink?(path: string): Promise<boolean>;
 }
 
 export interface CliPlatformDirectories {
   readonly configuration: string;
   readonly data: string;
+  readonly agentSkills?: string;
 }
 
 export interface ExternalCommandRequest {
@@ -185,8 +189,31 @@ export function createProcessCliHost(): CliHost {
           throw new Error('Secret file owner or permissions are unsafe');
         }
       },
+      canWritePath: async (path) => {
+        let candidate = path;
+        while (true) {
+          try {
+            await access(candidate, constants.W_OK);
+            return true;
+          } catch {
+            const parent = join(candidate, '..');
+            if (parent === candidate) return false;
+            candidate = parent;
+          }
+        }
+      },
+      isSymbolicLink: async (path) => {
+        try {
+          return (await lstat(path)).isSymbolicLink();
+        } catch {
+          return false;
+        }
+      },
     },
-    directories: resolvePlatformDirectories(platform(), homedir(), process.env),
+    directories: {
+      ...resolvePlatformDirectories(platform(), homedir(), process.env),
+      agentSkills: join(homedir(), '.agents', 'skills'),
+    },
     currentDirectory: process.cwd(),
     runExternalCommand,
     ...(credentialProvider === undefined ? {} : { credentialProvider }),

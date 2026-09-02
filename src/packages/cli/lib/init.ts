@@ -5,6 +5,11 @@ import type { CliHost } from './host';
 import { checkService } from './doctor';
 import { runGuidedServerSetup } from './server-setup';
 import {
+  applyCodexIntegration,
+  discoverCodexIntegration,
+  type CodexIntegrationProgress,
+} from './integrations';
+import {
   isUncertainStarter,
   readSetupJournal,
   saveSetupJournal,
@@ -470,6 +475,85 @@ function clearFailure(journal: SetupJournal): SetupJournal {
   return rest;
 }
 
+function codexProgress(journal: SetupJournal): CodexIntegrationProgress {
+  return journal.codex?.status === 'skill-installed'
+    ? { skill: 'verified', mcp: 'pending' }
+    : journal.codex?.status === 'verified'
+      ? { skill: 'verified', mcp: 'verified' }
+      : { skill: 'pending', mcp: 'pending' };
+}
+
+async function runCodexStep(
+  host: CliHost,
+  read: ReadAnswer,
+  journal: SetupJournal,
+): Promise<{ readonly journal: SetupJournal; readonly summary: string }> {
+  if (
+    journal.codex === undefined ||
+    journal.codex.status === 'skipped' ||
+    journal.codex.status === 'verified'
+  ) {
+    return {
+      journal,
+      summary:
+        journal.codex?.status === 'verified'
+          ? 'verified'
+          : journal.codex?.status === 'skipped'
+            ? `skipped (${journal.codex.reason})`
+            : 'not configured',
+    };
+  }
+  const discovery = await discoverCodexIntegration(
+    host,
+    journal.profileName,
+    journal.core === 'verified',
+  );
+  if (!discovery.available) {
+    const next: SetupJournal = {
+      ...journal,
+      codex: { status: 'unavailable', reason: discovery.reason },
+    };
+    await saveSetupJournal(host, next);
+    host.terminal.writeOutput(`Connect Codex unavailable: ${discovery.reason}.\n`);
+    return { journal: next, summary: `unavailable (${discovery.reason})` };
+  }
+  const plan = discovery.plan;
+  host.terminal.writeOutput(
+    '[optional] Connect Codex\n' +
+      `  Skill: install Datagram-owned files at ${plan.skillDestination}\n` +
+      `  MCP: codex mcp add ${plan.mcpServerName} -- ${plan.command} --profile ${JSON.stringify(plan.profileName)}\n` +
+      `  Credential reference: ${plan.credentialReference}\n` +
+      '  Authority: selected person; Store-derived values remain outside agent output\n' +
+      'Connect Codex now? [y/N]: ',
+  );
+  const answer = normalized(await read()).toLowerCase();
+  if (answer !== 'y' && answer !== 'yes') {
+    const next: SetupJournal = {
+      ...clearFailure(journal),
+      codex: { status: 'skipped', reason: 'operator skipped' },
+    };
+    await saveSetupJournal(host, next);
+    host.terminal.writeOutput('Connect Codex skipped: operator skipped.\n');
+    return { journal: next, summary: 'skipped (operator skipped)' };
+  }
+  const result = await applyCodexIntegration(host, plan, codexProgress(journal));
+  const next: SetupJournal =
+    result.status === 'verified'
+      ? { ...clearFailure(journal), codex: { status: 'verified' } }
+      : {
+          ...journal,
+          codex: {
+            status: result.progress.skill === 'verified' ? 'skill-installed' : 'pending',
+          },
+          failure: { stage: 'codex', code: 'setup.codex-partial' },
+        };
+  await saveSetupJournal(host, next);
+  host.terminal.writeOutput(
+    `${result.summary}\n${result.recovery === undefined ? '' : `Recovery: ${result.recovery}\n`}`,
+  );
+  return { journal: next, summary: result.status === 'verified' ? 'verified' : 'partial failure' };
+}
+
 async function saveProgress(
   host: CliHost,
   profilePath: string,
@@ -499,20 +583,35 @@ async function runExistingServerSetup(
   profile: ServerServiceProfile,
 ): Promise<void> {
   const command = resumeCommand(profile.name);
+  const journal =
+    (await readSetupJournal(host, profile.name)) ??
+    ({
+      version: 1,
+      profileName: profile.name,
+      core: profile.setup?.core ?? 'applied',
+      starter: { status: 'pending' },
+      durableInstall: 'skipped',
+      codex: { status: 'pending' },
+    } satisfies SetupJournal);
   const report = await checkService(host, profile.name);
-  const incomplete = profile.setup?.core !== 'verified';
+  const coreReportOk =
+    report.ok || report.checks.some((check) => check.status === 'failed' && check.stage === 'codex');
+  const incomplete =
+    profile.setup?.core !== 'verified' ||
+    journal.codex?.status === 'pending' ||
+    journal.codex?.status === 'skill-installed';
   host.terminal.writeOutput(
     `Existing setup detected for profile ${JSON.stringify(profile.name)}.\n` +
-      `Core: ${incomplete ? 'incomplete' : 'verified'}; Service: ${report.ok ? 'ready' : 'needs repair'}\n` +
+      `Core: ${profile.setup?.core ?? 'incomplete'}; Service: ${coreReportOk ? 'ready' : 'needs repair'}; Codex: ${journal.codex?.status ?? 'not configured'}\n` +
       'Choose reviewed operation:\n' +
       '  1. Inspect only\n' +
-      `  2. Resume or repair verification${incomplete || !report.ok ? ' (Recommended)' : ''}\n` +
+      `  2. Resume or repair verification${incomplete || !coreReportOk ? ' (Recommended)' : ''}\n` +
       '  3. Update default profile selection\n' +
       '  4. Cancel\n' +
-      `Selection [${incomplete || !report.ok ? '2' : '1'}]: `,
+      `Selection [${incomplete || !coreReportOk ? '2' : '1'}]: `,
   );
   const rawChoice = normalized(await read());
-  const choice = rawChoice === '' ? (incomplete || !report.ok ? '2' : '1') : rawChoice;
+  const choice = rawChoice === '' ? (incomplete || !coreReportOk ? '2' : '1') : rawChoice;
   if (choice === '4' || isCancel(choice)) {
     host.terminal.writeOutput('Setup cancelled. No changes were made.\n');
     return;
@@ -542,7 +641,7 @@ async function runExistingServerSetup(
     host.terminal.writeOutput('Repair cancelled. No changes were made.\n');
     return;
   }
-  if (!report.ok) {
+  if (!coreReportOk) {
     const failure = report.checks.find((check) => check.status === 'failed');
     throw new DatagramError(
       failure?.code ?? 'setup.repair-required',
@@ -552,7 +651,10 @@ async function runExistingServerSetup(
   }
   const profilePath = join(host.directories.configuration, 'profiles', `${profile.name}.json`);
   await saveProfile(host, profilePath, { ...profile, setup: { core: 'verified' } });
-  host.terminal.writeOutput(`Setup metadata verified. Inspect: bunx prosto-datagram doctor --profile ${JSON.stringify(profile.name)}\n`);
+  const next = await runCodexStep(host, read, { ...journal, core: 'verified' });
+  host.terminal.writeOutput(
+    `Setup metadata verified. Codex integration: ${next.summary}. Inspect: bunx prosto-datagram doctor --profile ${JSON.stringify(profile.name)}\n`,
+  );
 }
 
 async function runExistingSetup(
@@ -586,18 +688,22 @@ async function runExistingSetup(
     journal = journalFromProfile(profile);
   }
   const report = await checkService(host, profileName);
+  const coreReportOk =
+    report.ok || report.checks.some((check) => check.status === 'failed' && check.stage === 'codex');
   const incomplete =
     journalInvalid ||
     journal.core !== 'verified' ||
     journal.starter.status !== 'complete' ||
-    journal.durableInstall === 'pending';
+    journal.durableInstall === 'pending' ||
+    journal.codex?.status === 'pending' ||
+    journal.codex?.status === 'skill-installed';
   host.terminal.writeOutput(
     `Existing setup detected for profile ${JSON.stringify(profileName)}.\n` +
-      `Core: ${journal.core}; starter: ${journal.starter.status}; Service: ${report.ok ? 'ready' : 'needs repair'}; journal: ${journalInvalid ? 'needs repair' : 'valid'}\n` +
+      `Core: ${journal.core}; starter: ${journal.starter.status}; Service: ${coreReportOk ? 'ready' : 'needs repair'}; Codex: ${journal.codex?.status ?? 'not configured'}; journal: ${journalInvalid ? 'needs repair' : 'valid'}\n` +
       'Choose reviewed operation:\n' +
       '  1. Inspect only\n' +
       `  2. Resume incomplete stages${incomplete ? ' (Recommended)' : ''}\n` +
-      `  3. Repair setup metadata${!report.ok || journalInvalid ? ' (Recommended)' : ''}\n` +
+      `  3. Repair setup metadata${!coreReportOk || journalInvalid ? ' (Recommended)' : ''}\n` +
       '  4. Update default profile selection\n' +
       '  5. Cancel\n' +
       `Selection [${journalInvalid ? '3' : incomplete ? '2' : '1'}]: `,
@@ -658,7 +764,7 @@ async function runExistingSetup(
     host.terminal.writeOutput('Resume cancelled. No changes were made.\n');
     return;
   }
-  if (!report.ok) {
+  if (!coreReportOk) {
     throw new DatagramError('setup.repair-required', `Resume stopped safely; Service needs repair. Repair: ${command}`, 400);
   }
   if (journal.core !== 'verified') {
@@ -760,9 +866,14 @@ async function runExistingSetup(
       host.terminal.writeOutput(`Optional install remains pending. Resume: ${command}\n`);
     }
   }
+  if (journal.codex !== undefined && journal.codex.status !== 'skipped' && journal.codex.status !== 'verified') {
+    ({ journal } = await runCodexStep(host, read, journal));
+  }
   host.terminal.writeOutput(
-    journal.durableInstall === 'pending'
-      ? `Core setup complete. Optional install remains pending. Resume: ${command}\n`
+    journal.durableInstall === 'pending' ||
+      journal.codex?.status === 'pending' ||
+      journal.codex?.status === 'skill-installed'
+      ? `Core setup complete. Optional setup remains resumable. Resume: ${command}\n`
       : `Setup complete. Profile ${JSON.stringify(profileName)} is ready.\n`,
   );
 }
@@ -811,6 +922,7 @@ export async function runGuidedInit(host: CliHost, requestedProfileName?: string
     core: 'planned',
     starter: { status: 'pending' },
     durableInstall: result.durableInstall === undefined ? 'skipped' : 'pending',
+    codex: { status: 'pending' },
   };
   await saveSetupJournal(host, journal);
   let runtime;
@@ -1020,6 +1132,9 @@ export async function runGuidedInit(host: CliHost, requestedProfileName?: string
     }
   }
 
+  const codex = await runCodexStep(host, read, journal);
+  journal = codex.journal;
+
   host.terminal.writeOutput(
     'Setup complete.\n' +
       `Profile: ${result.profileName} (default)\nService: Local Service (ready)\n` +
@@ -1027,8 +1142,9 @@ export async function runGuidedInit(host: CliHost, requestedProfileName?: string
       `Identity: ${runtime.owner.displayName} (${runtime.owner.id})\n` +
       `First Channel: ${firstChannelId}\n` +
       `Durable commands: ${durableInstallStatus}\n` +
+      `Codex integration: ${codex.summary}\n` +
       `CLI: bunx prosto-datagram actions --profile ${JSON.stringify(result.profileName)}\n` +
-      `MCP: DATAGRAM_DB=${JSON.stringify(databasePath)} DATAGRAM_ACTOR_ID=${JSON.stringify(runtime.owner.id)} bunx --package prosto-datagram datagram-mcp\n` +
+      `MCP: bunx --package prosto-datagram datagram-mcp --profile ${JSON.stringify(result.profileName)}\n` +
       'Reconfigure: bunx prosto-datagram init\n',
   );
 }

@@ -25,10 +25,27 @@ export interface SetupJournal {
   readonly core: 'planned' | 'applied' | 'verified';
   readonly starter: JournalStarterProgress;
   readonly durableInstall: 'skipped' | 'pending' | 'verified';
+  readonly codex?:
+    | { readonly status: 'pending' | 'skill-installed' | 'verified' }
+    | { readonly status: 'skipped' | 'unavailable'; readonly reason: string };
   readonly failure?: {
-    readonly stage: 'core' | 'starter' | 'durable-install';
+    readonly stage: 'core' | 'starter' | 'durable-install' | 'codex';
     readonly code: string;
   };
+}
+
+function validCodex(value: unknown): boolean {
+  if (value === undefined) return true;
+  if (typeof value !== 'object' || value === null || !('status' in value)) return false;
+  const item = value as Record<string, unknown>;
+  if (['pending', 'skill-installed', 'verified'].includes(String(item.status))) {
+    return hasOnlyKeys(item, ['status']);
+  }
+  return (
+    ['skipped', 'unavailable'].includes(String(item.status)) &&
+    typeof item.reason === 'string' &&
+    hasOnlyKeys(item, ['status', 'reason'])
+  );
 }
 
 export function setupJournalPath(host: CliHost, profileName: string): string {
@@ -94,6 +111,7 @@ export function parseSetupJournal(value: string, expectedProfileName: string): S
       'core',
       'starter',
       'durableInstall',
+      'codex',
       'failure',
     ]) ||
     journal.version !== 1 ||
@@ -101,11 +119,12 @@ export function parseSetupJournal(value: string, expectedProfileName: string): S
     !['planned', 'applied', 'verified'].includes(String(journal.core)) ||
     !validStarter(journal.starter) ||
     !['skipped', 'pending', 'verified'].includes(String(journal.durableInstall)) ||
+    !validCodex(journal.codex) ||
     (failure !== undefined &&
       (typeof failure !== 'object' ||
         failure === null ||
         !hasOnlyKeys(failure as Record<string, unknown>, ['stage', 'code']) ||
-        !['core', 'starter', 'durable-install'].includes(String((failure as Record<string, unknown>).stage)) ||
+        !['core', 'starter', 'durable-install', 'codex'].includes(String((failure as Record<string, unknown>).stage)) ||
         !isControlId((failure as Record<string, unknown>).code)))
   ) {
     throw new DatagramError('setup.journal-invalid', 'Setup journal is invalid.', 400);

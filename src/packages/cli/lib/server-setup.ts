@@ -4,6 +4,8 @@ import { DatagramError } from '../../application/errors';
 import type { ServerServiceOptions } from '../../server';
 import type { CliHost } from './host';
 import type { CredentialReference } from './credentials';
+import { applyCodexIntegration, discoverCodexIntegration } from './integrations';
+import { saveSetupJournal, type SetupJournal } from './journal';
 import {
   parseProfile,
   profileNamePattern,
@@ -408,6 +410,60 @@ export async function runGuidedServerSetup(host: CliHost, read: ReadAnswer): Pro
       `${JSON.stringify({ ...profile, setup: { core: 'verified' } }, null, 2)}\n`,
       { mode: 0o600 },
     );
+    let journal: SetupJournal = {
+      version: 1,
+      profileName: answers.profileName,
+      core: 'verified',
+      starter: { status: 'pending' },
+      durableInstall: 'skipped',
+      codex: { status: 'pending' },
+    };
+    const discovery = await discoverCodexIntegration(host, answers.profileName, true);
+    let codexSummary: string;
+    if (!discovery.available) {
+      journal = {
+        ...journal,
+        codex: { status: 'unavailable', reason: discovery.reason },
+      };
+      codexSummary = `unavailable (${discovery.reason})`;
+      host.terminal.writeOutput(`Connect Codex unavailable: ${discovery.reason}.\n`);
+    } else {
+      const plan = discovery.plan;
+      host.terminal.writeOutput(
+        '[optional] Connect Codex\n' +
+          `  Skill: install Datagram-owned files at ${plan.skillDestination}\n` +
+          `  MCP: codex mcp add ${plan.mcpServerName} -- ${plan.command} --profile ${JSON.stringify(plan.profileName)}\n` +
+          `  Credential reference: ${plan.credentialReference}\n` +
+          '  Authority: selected person; Store-derived values remain outside agent output\n' +
+          'Connect Codex now? [y/N]: ',
+      );
+      const connect = trim(await read()).toLowerCase();
+      if (connect !== 'y' && connect !== 'yes') {
+        journal = { ...journal, codex: { status: 'skipped', reason: 'operator skipped' } };
+        codexSummary = 'skipped (operator skipped)';
+        host.terminal.writeOutput('Connect Codex skipped: operator skipped.\n');
+      } else {
+        const integrationResult = await applyCodexIntegration(host, plan);
+        journal =
+          integrationResult.status === 'verified'
+            ? { ...journal, codex: { status: 'verified' } }
+            : {
+                ...journal,
+                codex: {
+                  status:
+                    integrationResult.progress.skill === 'verified'
+                      ? 'skill-installed'
+                      : 'pending',
+                },
+                failure: { stage: 'codex', code: 'setup.codex-partial' },
+              };
+        codexSummary = integrationResult.status === 'verified' ? 'verified' : 'partial failure';
+        host.terminal.writeOutput(
+          `${integrationResult.summary}\n${integrationResult.recovery === undefined ? '' : `Recovery: ${integrationResult.recovery}\n`}`,
+        );
+      }
+    }
+    await saveSetupJournal(host, journal);
     host.terminal.writeOutput(
       'Setup complete.\n' +
         `Profile: ${answers.profileName} (default)\n` +
@@ -415,6 +471,7 @@ export async function runGuidedServerSetup(host: CliHost, read: ReadAnswer): Pro
         `Exposure: ${answers.exposure}; bind=${answers.hostname}:${answers.port}\n` +
         `Identity: ${started.runtime.deploymentOperator.displayName} (${started.runtime.deploymentOperator.id})\n` +
         'Doctor: PostgreSQL, port, HTTP health, and authenticated operator access verified\n' +
+        `Codex integration: ${codexSummary}\n` +
         `Start: bunx prosto-datagram serve --profile ${JSON.stringify(answers.profileName)}\n` +
         `Check: bunx prosto-datagram doctor --profile ${JSON.stringify(answers.profileName)}\n` +
         'Optional next step: invite teammates after the Service is running.\n',

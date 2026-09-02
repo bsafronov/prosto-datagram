@@ -3,6 +3,8 @@ import { join } from 'node:path';
 import { DatagramError } from '../../application/errors';
 import type { OpenDatagramRuntime } from '../../runtime';
 import type { CliHost } from './host';
+import { verifyCodexIntegration } from './integrations';
+import { readSetupJournal } from './journal';
 import {
   readServiceProfile,
   isServerProfile,
@@ -12,7 +14,7 @@ import {
   type ServerServiceProfile,
 } from './profiles';
 
-export type DoctorStage = 'profile' | 'target' | 'runtime' | 'identity';
+export type DoctorStage = 'profile' | 'target' | 'runtime' | 'identity' | 'codex';
 
 interface SuccessfulCheck {
   readonly status: 'ok';
@@ -36,7 +38,7 @@ export interface DoctorReport {
   readonly target?: ResolvedServiceTarget;
 }
 
-const stages: readonly DoctorStage[] = ['profile', 'target', 'runtime', 'identity'];
+const stages: readonly DoctorStage[] = ['profile', 'target', 'runtime', 'identity', 'codex'];
 
 function repairCommand(profileName: string): string {
   return `Run \`bunx prosto-datagram init --profile ${JSON.stringify(profileName)}\` to repair this profile.`;
@@ -62,6 +64,37 @@ function failed(
     serviceKind,
     checks: [...completed, { status: 'failed', stage, code, recovery, context, technicalContext }],
   };
+}
+
+async function checkCodex(
+  host: CliHost,
+  profileName: string,
+  serviceKind: 'local' | 'server',
+  completed: SuccessfulCheck[],
+): Promise<DoctorReport | undefined> {
+  const journal = await readSetupJournal(host, profileName).catch(() => undefined);
+  if (
+    journal?.codex?.status !== 'skill-installed' &&
+    journal?.codex?.status !== 'verified' &&
+    journal?.failure?.stage !== 'codex'
+  ) {
+    return undefined;
+  }
+  const integration = await verifyCodexIntegration(host, profileName);
+  if (!integration.ok) {
+    return failed(
+      profileName,
+      'codex',
+      'doctor.codex-unready',
+      `Run \`bunx prosto-datagram init --profile ${JSON.stringify(profileName)}\` to resume Connect Codex.`,
+      { profile: profileName, integration: 'codex' },
+      { reason: integration.reason ?? 'verification failed' },
+      completed,
+      serviceKind,
+    );
+  }
+  completed.push({ status: 'ok', stage: 'codex' });
+  return undefined;
 }
 
 async function checkServerService(
@@ -146,6 +179,8 @@ async function checkServerService(
     );
     if (!health.ok || !actions.ok) throw new Error('verification failed');
     completed.push({ status: 'ok', stage: 'identity' });
+    const codexFailure = await checkCodex(host, profile.name, 'server', completed);
+    if (codexFailure !== undefined) return codexFailure;
     return {
       ok: true,
       profileName: profile.name,
@@ -238,7 +273,6 @@ export async function checkService(
   try {
     await runtime.app.verifyServiceIdentity(target.actorId ?? '');
     completed.push({ status: 'ok', stage: 'identity' });
-    return { ok: true, profileName, serviceKind: 'local', checks: completed, target };
   } catch (error) {
     return failed(
       profileName,
@@ -256,6 +290,10 @@ export async function checkService(
   } finally {
     if (closeRuntime) await runtime.close();
   }
+
+  const codexFailure = await checkCodex(host, profileName, 'local', completed);
+  if (codexFailure !== undefined) return codexFailure;
+  return { ok: true, profileName, serviceKind: 'local', checks: completed, target };
 }
 
 function renderContext(context: Readonly<Record<string, string>>): string {

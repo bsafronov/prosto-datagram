@@ -17,3 +17,23 @@ export type {
   NativeCredentialReference,
   NativeCredentialProviderKind,
 } from './credentials';
+export {
+  applyCodexIntegration,
+  discoverCodexIntegration,
+  verifyCodexIntegration,
+  type CodexIntegrationDiscovery,
+  type CodexIntegrationPlan,
+  type CodexIntegrationProgress,
+  type CodexIntegrationResult,
+} from './lib/integrations';
+export {
+  isServerProfile,
+  readServiceProfile,
+  resolveCredential,
+  resolveServiceTarget,
+  type LocalServiceProfile,
+  type ResolvedServiceTarget,
+  type ServerServiceProfile,
+  type ServiceProfile,
+  type TargetOptions,
+} from './lib/profiles';

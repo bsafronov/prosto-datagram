@@ -6,6 +6,16 @@ import type { ChannelTypeContractSelector } from '../../application/contracts';
 import { DatagramError } from '../../application/errors';
 import type { DatagramApplicationPort } from '../../application/port';
 
+export type McpApplicationPort = Pick<
+  DatagramApplicationPort,
+  | 'actions'
+  | 'queries'
+  | 'verifyServiceIdentity'
+  | 'executeAction'
+  | 'prepareQuery'
+  | 'composeResultHandle'
+>;
+
 export interface AuthenticatedMcpIdentity {
   readonly actorId: string;
 }
@@ -16,7 +26,7 @@ export type McpIdentityAuthenticator = () =>
   | undefined;
 
 export interface McpGatewayOptions {
-  readonly app: DatagramApplicationPort;
+  readonly app: McpApplicationPort;
   readonly authenticateIdentity: McpIdentityAuthenticator;
   readonly channelType?: ChannelTypeContractSelector;
 }
@@ -28,7 +38,7 @@ interface SafeToolError {
   };
 }
 
-type ActionReceipt = Awaited<ReturnType<DatagramApplicationPort['executeAction']>>;
+type ActionReceipt = Awaited<ReturnType<McpApplicationPort['executeAction']>>;
 
 const actionOutput = (receipt: ActionReceipt): ActionReceipt => ({
   action: receipt.action,
