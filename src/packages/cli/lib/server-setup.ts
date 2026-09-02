@@ -7,6 +7,10 @@ import type { CredentialReference } from './credentials';
 import { applyCodexIntegration, discoverCodexIntegration } from './integrations';
 import { saveSetupJournal, type SetupJournal } from './journal';
 import {
+  managedPostgresDefinition,
+  type ManagedPostgresCreate,
+} from './docker-postgres';
+import {
   parseProfile,
   profileNamePattern,
   type ServerExposure,
@@ -29,6 +33,8 @@ interface Answers {
   readonly hostname: string;
   readonly port: number;
   readonly publicAccess?: PublicAccess;
+  readonly managedPostgres?: ManagedPostgresCreate;
+  readonly managedCredentialsReused?: boolean;
 }
 
 const envPattern = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -64,6 +70,28 @@ function postgresUrl(value: string): URL {
     );
   }
   return url;
+}
+
+function managedPostgresFromUrl(profileName: string, value: string): ManagedPostgresCreate {
+  const url = postgresUrl(value);
+  const port = Number(url.port || '5432');
+  if (
+    !['127.0.0.1', 'localhost'].includes(url.hostname.toLowerCase()) ||
+    url.username !== 'datagram' ||
+    url.pathname !== '/datagram' ||
+    !url.password ||
+    !Number.isInteger(port)
+  ) {
+    throw new DatagramError(
+      'setup.managed-credential-invalid',
+      'Existing managed PostgreSQL credentials are invalid. Repair them explicitly; no data was changed.',
+      400,
+    );
+  }
+  return {
+    ...managedPostgresDefinition(profileName, port),
+    password: decodeURIComponent(url.password),
+  };
 }
 
 async function envSecret(
@@ -105,48 +133,126 @@ async function collect(host: CliHost, read: ReadAnswer): Promise<Answers> {
     throw new DatagramError('setup.display-name-invalid', 'Enter 1-120 characters.', 400);
   }
   host.terminal.writeOutput(
-    '[4/8] Credentials\n',
+    '[4/9] PostgreSQL\n  1. Existing PostgreSQL URL (externally owned)\n' +
+      '  2. Docker-managed persistent PostgreSQL\nSelection [1] (or Cancel): ',
   );
-  const nativeAvailability = host.credentialProvider === undefined
-    ? { available: false as const, reason: 'Native credential storage is unsupported on this platform.' }
-    : await host.credentialProvider.availability();
+  const databaseSource = trim(await read());
+  if (isCancel(databaseSource)) throw new DatagramError('setup.cancelled', 'Setup cancelled.', 400);
+  if (!['', '1', '2'].includes(databaseSource)) {
+    throw new DatagramError('setup.postgres-choice-invalid', 'Choose 1 or 2.', 400);
+  }
+  const managed = databaseSource === '2';
+  let connectionString: string | undefined;
+  let bearerToken: string | undefined;
+  let postgresCredential: CredentialReference | undefined;
+  let bearerCredential: CredentialReference | undefined;
+  let secretPath: string | undefined;
+  let credentialStorage: Answers['credentialStorage'];
+  let managedPostgres: ManagedPostgresCreate | undefined;
+  let managedCredentialsReused = false;
+  if (managed) {
+    host.terminal.writeOutput('PostgreSQL host port [5432] (or Cancel): ');
+    const rawPostgresPort = trim(await read());
+    if (isCancel(rawPostgresPort)) throw new DatagramError('setup.cancelled', 'Setup cancelled.', 400);
+    const postgresPort = rawPostgresPort ? Number(rawPostgresPort) : 5432;
+    if (!Number.isInteger(postgresPort) || postgresPort < 1 || postgresPort > 65_535) {
+      throw new DatagramError('setup.port-invalid', 'Port must be from 1 to 65535.', 400);
+    }
+    const password = crypto.randomUUID().replaceAll('-', '') + crypto.randomUUID().replaceAll('-', '');
+    bearerToken = crypto.randomUUID().replaceAll('-', '') + crypto.randomUUID().replaceAll('-', '');
+    connectionString = `postgres://datagram:${password}@127.0.0.1:${postgresPort}/datagram?sslmode=disable`;
+    managedPostgres = { ...managedPostgresDefinition(profileName, postgresPort), password };
+  }
+  const nativeAvailability =
+    host.credentialProvider === undefined
+      ? {
+          available: false as const,
+          reason: 'Native credential storage is unsupported on this platform.',
+        }
+      : await host.credentialProvider.availability();
+  host.terminal.writeOutput('Credentials\n');
   if (nativeAvailability.available) {
     host.terminal.writeOutput(
       `  1. System credential store (${host.credentialProvider?.kind}) (Recommended)\n` +
         '  2. Permission-restricted secret file\n' +
-        '  3. Environment references (Advanced)\nSelection [1] (or Cancel): ',
+        (managed ? '' : '  3. Environment references (Advanced)\n') +
+        'Selection [1] (or Cancel): ',
     );
   } else {
     host.terminal.writeOutput(
       `  System credential store unavailable: ${nativeAvailability.reason}\n` +
         'Choose an explicit fallback:\n' +
         '  1. Permission-restricted secret file (Recommended fallback)\n' +
-        '  2. Environment references (Advanced)\nSelection [1] (or Cancel): ',
+        (managed ? '' : '  2. Environment references (Advanced)\n') +
+        'Selection [1] (or Cancel): ',
     );
   }
   const storage = trim(await read());
   if (isCancel(storage)) throw new DatagramError('setup.cancelled', 'Setup cancelled.', 400);
-  let connectionString: string;
-  let bearerToken: string;
-  let postgresCredential: CredentialReference | undefined;
-  let bearerCredential: CredentialReference | undefined;
-  let secretPath: string | undefined;
-  let credentialStorage: Answers['credentialStorage'];
   const nativeSelected = nativeAvailability.available && (!storage || storage === '1');
   const fileSelected = nativeAvailability.available ? storage === '2' : !storage || storage === '1';
-  const environmentSelected = nativeAvailability.available ? storage === '3' : storage === '2';
+  const environmentSelected =
+    !managed && (nativeAvailability.available ? storage === '3' : storage === '2');
   if (nativeSelected || fileSelected) {
-    host.terminal.writeOutput('Existing PostgreSQL URL (or Cancel): ');
-    connectionString = trim(await read());
-    if (isCancel(connectionString)) throw new DatagramError('setup.cancelled', 'Setup cancelled.', 400);
-    bearerToken = crypto.randomUUID().replaceAll('-', '') + crypto.randomUUID().replaceAll('-', '');
-    if (nativeSelected) {
-      credentialStorage = 'native';
-    } else {
-      credentialStorage = 'file';
+    credentialStorage = nativeSelected ? 'native' : 'file';
+    if (!managed) {
+      host.terminal.writeOutput('Existing PostgreSQL URL (or Cancel): ');
+      connectionString = trim(await read());
+      if (isCancel(connectionString)) {
+        throw new DatagramError('setup.cancelled', 'Setup cancelled.', 400);
+      }
+      bearerToken =
+        crypto.randomUUID().replaceAll('-', '') + crypto.randomUUID().replaceAll('-', '');
+    }
+    if (fileSelected) {
       secretPath = join(host.directories.configuration, 'secrets', `${profileName}.json`);
       postgresCredential = { kind: 'file', path: secretPath, key: 'postgresUrl' };
       bearerCredential = { kind: 'file', path: secretPath, key: 'bearerToken' };
+      if (managed && (await host.filesystem.pathExists(secretPath))) {
+        try {
+          const stored = JSON.parse(await host.filesystem.readTextFile(secretPath)) as Record<
+            string,
+            unknown
+          >;
+          if (typeof stored.postgresUrl !== 'string' || typeof stored.bearerToken !== 'string') {
+            throw new Error('missing credential');
+          }
+          managedPostgres = managedPostgresFromUrl(profileName, stored.postgresUrl);
+          connectionString = stored.postgresUrl;
+          bearerToken = stored.bearerToken;
+          managedCredentialsReused = true;
+        } catch (error) {
+          if (error instanceof DatagramError) throw error;
+          throw new DatagramError(
+            'setup.managed-credential-invalid',
+            'Existing managed PostgreSQL credentials are invalid. Repair them explicitly; no data was changed.',
+            400,
+          );
+        }
+      }
+    } else if (managed) {
+      const provider = capability(host.credentialProvider, 'credential.native-unavailable');
+      const postgresReference = {
+        kind: 'native' as const,
+        provider: provider.kind,
+        service: 'prosto-datagram' as const,
+        account: `${profileName}:postgres`,
+      };
+      const bearerReference = { ...postgresReference, account: `${profileName}:operator` };
+      try {
+        const stored = await Promise.all([
+          provider.resolve(postgresReference),
+          provider.resolve(bearerReference),
+        ]);
+        managedPostgres = managedPostgresFromUrl(profileName, stored[0]);
+        connectionString = stored[0];
+        bearerToken = stored[1];
+        postgresCredential = postgresReference;
+        bearerCredential = bearerReference;
+        managedCredentialsReused = true;
+      } catch {
+        // Missing credentials are created only after review; existing infrastructure is checked first.
+      }
     }
   } else if (environmentSelected) {
     credentialStorage = 'environment';
@@ -159,13 +265,16 @@ async function collect(host: CliHost, read: ReadAnswer): Promise<Answers> {
   } else {
     throw new DatagramError(
       'setup.credential-choice-invalid',
-      nativeAvailability.available ? 'Choose 1, 2, or 3.' : 'Choose 1 or 2.',
+      nativeAvailability.available && !managed ? 'Choose 1, 2, or 3.' : 'Choose 1 or 2.',
       400,
     );
   }
+  if (connectionString === undefined || bearerToken === undefined) {
+    throw new DatagramError('credential.value-missing', 'Credential values were not created.', 500);
+  }
   postgresUrl(connectionString);
   host.terminal.writeOutput(
-    '[5/8] Exposure\n  1. This host\n  2. Private network\n  3. Public\nSelection [1]: ',
+    '[6/9] Exposure\n  1. This host\n  2. Private network\n  3. Public\nSelection [1]: ',
   );
   const exposureAnswer = trim(await read());
   const exposure: ServerExposure =
@@ -189,7 +298,7 @@ async function collect(host: CliHost, read: ReadAnswer): Promise<Answers> {
   let publicAccess: PublicAccess;
   if (exposure === 'public') {
     host.terminal.writeOutput(
-      '[6/8] Public TLS\n  1. Existing HTTPS reverse proxy\n' +
+      '[7/9] Public TLS\n  1. Existing HTTPS reverse proxy\n' +
         '  2. Direct TLS certificate/key\nSelection: ',
     );
     const tls = trim(await read());
@@ -230,7 +339,7 @@ async function collect(host: CliHost, read: ReadAnswer): Promise<Answers> {
       );
     }
   }
-  host.terminal.writeOutput('[7/8] HTTP port [3100]: ');
+  host.terminal.writeOutput('[8/9] HTTP port [3100]: ');
   const rawPort = trim(await read());
   const port = rawPort ? Number(rawPort) : 3100;
   if (!Number.isInteger(port) || port < 1 || port > 65_535) {
@@ -249,6 +358,8 @@ async function collect(host: CliHost, read: ReadAnswer): Promise<Answers> {
     hostname,
     port,
     ...(publicAccess ? { publicAccess } : {}),
+    ...(managedPostgres ? { managedPostgres } : {}),
+    ...(managed ? { managedCredentialsReused } : {}),
   };
 }
 
@@ -269,6 +380,20 @@ async function verifyHttp(host: CliHost, url: URL, token: string): Promise<void>
   }
 }
 
+async function probePostgresReady(host: CliHost, connectionString: string): Promise<void> {
+  const probe = capability(host.probePostgres, 'setup.postgres-probe-unavailable');
+  const deadline = Date.now() + 30_000;
+  while (true) {
+    try {
+      await probe(connectionString);
+      return;
+    } catch (error) {
+      if (Date.now() >= deadline) throw error;
+      await Bun.sleep(250);
+    }
+  }
+}
+
 export async function runGuidedServerSetup(host: CliHost, read: ReadAnswer): Promise<void> {
   let answers: Answers;
   try {
@@ -280,19 +405,70 @@ export async function runGuidedServerSetup(host: CliHost, read: ReadAnswer): Pro
     }
     throw error;
   }
-  const parsedUrl = postgresUrl(answers.connectionString);
-  host.terminal.writeOutput('Preflight: PostgreSQL connectivity and HTTP port.\n');
-  try {
-    await capability(host.probePostgres, 'setup.postgres-probe-unavailable')(
-      answers.connectionString,
-    );
-  } catch {
-    throw new DatagramError(
-      'setup.postgres-unreachable',
-      'PostgreSQL is unreachable. Check URL, TLS, permissions, and network route.',
-      400,
-    );
+  host.terminal.writeOutput('Preflight: PostgreSQL infrastructure and HTTP port.\n');
+  if (answers.managedPostgres) {
+    let managedPostgres = answers.managedPostgres;
+    const docker = capability(host.dockerPostgres, 'setup.docker-probe-unavailable');
+    if (!(await docker.available())) {
+      throw new DatagramError(
+        'setup.docker-unavailable',
+        'Docker is unavailable. Install or start Docker yourself, then retry; or choose an existing PostgreSQL URL. Docker was not installed.',
+        400,
+      );
+    }
+    let state = await docker.status(managedPostgres);
+    if (state !== 'missing' && !answers.managedCredentialsReused) {
+      throw new DatagramError(
+        'setup.managed-credential-unavailable',
+        'Managed PostgreSQL already exists, but its credentials could not be recovered. Repair credentials explicitly; no data was changed.',
+        400,
+      );
+    }
+    while (state === 'missing') {
+      try {
+        if (managedPostgres.port === answers.port) throw new Error('ports overlap');
+        await capability(host.checkPort, 'setup.port-check-unavailable')(
+          '127.0.0.1',
+          managedPostgres.port,
+        );
+        break;
+      } catch {
+        host.terminal.writeOutput(
+          `PostgreSQL port ${managedPostgres.port} is unavailable. Choose another port before Apply (or Cancel): `,
+        );
+        const replacement = trim(await read());
+        if (isCancel(replacement)) {
+          host.terminal.writeOutput('Setup cancelled. No changes were made.\n');
+          return;
+        }
+        const port = Number(replacement);
+        if (!Number.isInteger(port) || port < 1 || port > 65_535) {
+          throw new DatagramError('setup.port-invalid', 'Port must be from 1 to 65535.', 400);
+        }
+        const password = managedPostgres.password;
+        managedPostgres = { ...managedPostgresDefinition(answers.profileName, port), password };
+        answers = {
+          ...answers,
+          connectionString: `postgres://datagram:${password}@127.0.0.1:${port}/datagram?sslmode=disable`,
+          managedPostgres,
+        };
+        state = await docker.status(managedPostgres);
+      }
+    }
+  } else {
+    try {
+      await capability(host.probePostgres, 'setup.postgres-probe-unavailable')(
+        answers.connectionString,
+      );
+    } catch {
+      throw new DatagramError(
+        'setup.postgres-unreachable',
+        'PostgreSQL is unreachable. Check URL, TLS, permissions, and network route.',
+        400,
+      );
+    }
   }
+  const parsedUrl = postgresUrl(answers.connectionString);
   try {
     await capability(host.checkPort, 'setup.port-check-unavailable')(answers.hostname, answers.port);
   } catch {
@@ -304,8 +480,15 @@ export async function runGuidedServerSetup(host: CliHost, read: ReadAnswer): Pro
   }
   const profilePath = join(host.directories.configuration, 'profiles', `${answers.profileName}.json`);
   host.terminal.writeOutput(
-    '[8/8] Review plan\n' +
-      '  Service: Server Service; external PostgreSQL (no infrastructure lifecycle ownership)\n' +
+    '[9/9] Review plan\n' +
+      (answers.managedPostgres
+        ? '  Service: Server Service; Docker-managed PostgreSQL owned by this profile\n' +
+          `  Image download: ${answers.managedPostgres.image}\n` +
+          `  Generated infrastructure: container=${answers.managedPostgres.containerName}; volume=${answers.managedPostgres.volumeName}\n` +
+          `  PostgreSQL port: 127.0.0.1:${answers.managedPostgres.port}\n` +
+          `  Data location: persistent Docker volume ${answers.managedPostgres.volumeName}\n` +
+          '  Lifecycle: stop, repair, reconfiguration, and setup reruns never remove database data\n'
+        : '  Service: Server Service; external PostgreSQL (no infrastructure lifecycle ownership)\n') +
       `  PostgreSQL: postgresql://[redacted]:${parsedUrl.port || '5432'}/[redacted] sslmode=${parsedUrl.searchParams.get('sslmode') ?? 'default'}\n` +
       `  Profile: ${answers.profileName} (default)\n` +
       `  Deployment Operator: ${answers.displayName}\n` +
@@ -326,14 +509,13 @@ export async function runGuidedServerSetup(host: CliHost, read: ReadAnswer): Pro
   let bearerCredential = answers.bearerCredential;
   if (answers.credentialStorage === 'native') {
     const provider = capability(host.credentialProvider, 'credential.native-unavailable');
-    const accountPrefix = `${answers.profileName}:${crypto.randomUUID()}`;
     postgresCredential = await provider.create({
-      account: `${accountPrefix}:postgres`,
+      account: `${answers.profileName}:postgres`,
       label: `Prosto.Datagram ${answers.profileName} PostgreSQL`,
       secret: answers.connectionString,
     });
     bearerCredential = await provider.create({
-      account: `${accountPrefix}:operator`,
+      account: `${answers.profileName}:operator`,
       label: `Prosto.Datagram ${answers.profileName} operator`,
       secret: answers.bearerToken,
     });
@@ -357,6 +539,12 @@ export async function runGuidedServerSetup(host: CliHost, read: ReadAnswer): Pro
     existing?.service.kind === 'server' ? existing.service.serviceKey : `service_${crypto.randomUUID()}`;
   let started: Awaited<ReturnType<NonNullable<CliHost['startServerService']>>> | undefined;
   try {
+    if (answers.managedPostgres) {
+      await capability(host.dockerPostgres, 'setup.docker-probe-unavailable').ensure(
+        answers.managedPostgres,
+      );
+      await probePostgresReady(host, answers.connectionString);
+    }
     const options: ServerServiceOptions = {
       connectionString: answers.connectionString,
       deploymentOperatorDisplayName: answers.displayName,
@@ -382,7 +570,15 @@ export async function runGuidedServerSetup(host: CliHost, read: ReadAnswer): Pro
       name: answers.profileName,
       service: {
         kind: 'server',
-        infrastructure: { kind: 'external-postgres' },
+        infrastructure: answers.managedPostgres
+          ? {
+              kind: 'docker-postgres',
+              image: answers.managedPostgres.image,
+              containerName: answers.managedPostgres.containerName,
+              volumeName: answers.managedPostgres.volumeName,
+              port: answers.managedPostgres.port,
+            }
+          : { kind: 'external-postgres' },
         serviceKey,
         postgres: { credential: postgresCredential },
         bind: { exposure: answers.exposure, hostname: answers.hostname, port: answers.port },
@@ -467,13 +663,17 @@ export async function runGuidedServerSetup(host: CliHost, read: ReadAnswer): Pro
     host.terminal.writeOutput(
       'Setup complete.\n' +
         `Profile: ${answers.profileName} (default)\n` +
-        'Service: Server Service (ready); PostgreSQL ownership: external\n' +
+        `Service: Server Service (ready); PostgreSQL ownership: ${answers.managedPostgres ? `profile ${answers.profileName}` : 'external'}\n` +
         `Exposure: ${answers.exposure}; bind=${answers.hostname}:${answers.port}\n` +
         `Identity: ${started.runtime.deploymentOperator.displayName} (${started.runtime.deploymentOperator.id})\n` +
         'Doctor: PostgreSQL, port, HTTP health, and authenticated operator access verified\n' +
         `Codex integration: ${codexSummary}\n` +
         `Start: bunx prosto-datagram serve --profile ${JSON.stringify(answers.profileName)}\n` +
         `Check: bunx prosto-datagram doctor --profile ${JSON.stringify(answers.profileName)}\n` +
+        (answers.managedPostgres
+          ? `PostgreSQL lifecycle: bunx prosto-datagram postgres start|stop|status --profile ${JSON.stringify(answers.profileName)}\n` +
+            `Backups: protect Docker volume ${answers.managedPostgres.volumeName}; Datagram never deletes it automatically.\n`
+          : '') +
         'Optional next step: invite teammates after the Service is running.\n',
     );
   } catch {

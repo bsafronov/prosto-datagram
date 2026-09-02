@@ -121,6 +121,16 @@ async function checkServerService(
     );
   }
   try {
+    if (profile.service.infrastructure.kind === 'docker-postgres') {
+      if (host.dockerPostgres === undefined || !(await host.dockerPostgres.available())) {
+        throw new Error('docker unavailable');
+      }
+      const state = await host.dockerPostgres.status({
+        profileName: profile.name,
+        ...profile.service.infrastructure,
+      });
+      if (state !== 'running') throw new Error(`managed postgres ${state}`);
+    }
     if (host.probePostgres === undefined) throw new Error('probe unavailable');
     await host.probePostgres(connectionString);
     completed.push({ status: 'ok', stage: 'runtime' });
@@ -129,9 +139,15 @@ async function checkServerService(
       profile.name,
       'runtime',
       'doctor.runtime-unready',
-      'Check PostgreSQL availability, TLS mode, credentials, and network route.',
+      profile.service.infrastructure.kind === 'docker-postgres'
+        ? `Run \`bunx prosto-datagram postgres start --profile ${JSON.stringify(profile.name)}\`, then retry.`
+        : 'Check PostgreSQL availability, TLS mode, credentials, and network route.',
       { profile: profile.name, service: 'server' },
-      { adapter: 'postgres', credentialReference: 'configured' },
+      {
+        adapter:
+          profile.service.infrastructure.kind === 'docker-postgres' ? 'docker-postgres' : 'postgres',
+        credentialReference: 'configured',
+      },
       completed,
       'server',
     );

@@ -345,7 +345,7 @@ test('guided team init stores references and verifies an external PostgreSQL Ser
   const base = localSetupHost(
     configuration,
     join(directory, 'data'),
-    ['2', 'team', 'Ada Operator', '', connectionString, '', '', 'yes'],
+    ['2', 'team', 'Ada Operator', '', '', connectionString, '', '', 'yes'],
     output,
   );
   let stopped = false;
@@ -420,6 +420,138 @@ test('guided team init stores references and verifies an external PostgreSQL Ser
   });
   expect(rerunOutput.join('')).toContain('Existing setup detected for profile "team".');
   expect(rerunOutput.join('')).toContain('No changes made.');
+  expect(runCli(['postgres', 'status', '--profile', 'team'], host)).rejects.toMatchObject({
+    code: 'postgres.not-managed',
+    message: expect.stringContaining('External PostgreSQL lifecycle is unchanged'),
+  });
+});
+
+test('guided team init provisions persistent profile-owned PostgreSQL and exposes safe lifecycle', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'datagram-guided-managed-postgres-'));
+  temporaryDirectories.push(directory);
+  const configuration = join(directory, 'configuration');
+  const output: string[] = [];
+  const base = localSetupHost(
+    configuration,
+    join(directory, 'data'),
+    ['2', 'team', 'Ada Operator', '2', '', '', '', '', '55432', 'yes'],
+    output,
+  );
+  let state: 'missing' | 'stopped' | 'running' = 'missing';
+  let ensureCount = 0;
+  const checkedPorts: number[] = [];
+  const host: CliHost = {
+    ...base,
+    dockerPostgres: {
+      available: () => Promise.resolve(true),
+      ensure: () => {
+        ensureCount += 1;
+        state = 'running';
+        return Promise.resolve();
+      },
+      start: () => {
+        state = 'running';
+        return Promise.resolve();
+      },
+      stop: () => {
+        state = 'stopped';
+        return Promise.resolve();
+      },
+      status: () => Promise.resolve(state),
+    },
+    probePostgres: () => Promise.resolve(),
+    checkPort: (_hostname, port) => {
+      checkedPorts.push(port);
+      if (port === 5432) return Promise.reject(new Error('occupied'));
+      return Promise.resolve();
+    },
+    startServerService: (() =>
+      Promise.resolve({
+        runtime: {
+          deploymentOperator: {
+            id: 'person_managed_operator',
+            displayName: 'Ada Operator',
+            isOperator: true,
+            createdAt: '2026-09-02T00:00:00.000Z',
+          },
+          close: () => Promise.resolve(),
+        },
+        server: { url: new URL('http://127.0.0.1:3100/'), stop: () => undefined },
+      })) as unknown as NonNullable<CliHost['startServerService']>,
+    request: (request) => {
+      if (request.url.endsWith('/v1/actions')) {
+        expect(request.headers.get('authorization')).toMatch(/^Bearer /);
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }));
+    },
+  };
+
+  await runCli(['init'], host);
+
+  const profilePath = join(configuration, 'profiles', 'team.json');
+  const profileText = await readFile(profilePath, 'utf8');
+  expect(JSON.parse(profileText)).toMatchObject({
+    service: {
+      infrastructure: {
+        kind: 'docker-postgres',
+        image: expect.stringContaining('postgres:17-alpine@sha256:'),
+        containerName: 'prosto-datagram-postgres-team',
+        volumeName: 'prosto-datagram-postgres-team-data',
+        port: 55432,
+      },
+    },
+    setup: { core: 'verified' },
+  });
+  const rendered = output.join('');
+  expect(rendered).toContain('Docker-managed PostgreSQL owned by this profile');
+  expect(rendered).toContain('Image download: postgres:17-alpine@sha256:');
+  expect(rendered).toContain('persistent Docker volume prosto-datagram-postgres-team-data');
+  expect(rendered).toContain('never remove database data');
+  expect(rendered).not.toMatch(/postgres:\/\/datagram:[^[]/);
+  expect(ensureCount).toBe(1);
+  expect(checkedPorts).toEqual([5432, 55432, 3100]);
+  expect(rendered).toContain('PostgreSQL port 5432 is unavailable. Choose another port before Apply');
+
+  await runCli(['postgres', 'stop', '--profile', 'team'], host);
+  expect(String(state)).toBe('stopped');
+  await runCli(['postgres', 'start', '--profile', 'team'], host);
+  expect(String(state)).toBe('running');
+  await runCli(['postgres', 'status', '--profile', 'team'], host);
+  expect(output.join('')).toContain('Managed PostgreSQL: running; profile="team"');
+});
+
+test('managed PostgreSQL setup explains missing Docker before Apply without installing it', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'datagram-guided-no-docker-'));
+  temporaryDirectories.push(directory);
+  const configuration = join(directory, 'configuration');
+  const externalCommands: unknown[] = [];
+  const base = localSetupHost(
+    configuration,
+    join(directory, 'data'),
+    ['2', 'team', 'Operator', '2', '', '', '', ''],
+    [],
+    (request) => {
+      externalCommands.push(request);
+      return Promise.resolve({ exitCode: 0, stdout: '', stderr: '' });
+    },
+  );
+  const host: CliHost = {
+    ...base,
+    dockerPostgres: {
+      available: () => Promise.resolve(false),
+      ensure: () => Promise.reject(new Error('must not apply')),
+      start: () => Promise.reject(new Error('must not start')),
+      stop: () => Promise.reject(new Error('must not stop')),
+      status: () => Promise.reject(new Error('must not inspect')),
+    },
+  };
+
+  expect(runCli(['init'], host)).rejects.toMatchObject({
+    code: 'setup.docker-unavailable',
+    message: expect.stringContaining('choose an existing PostgreSQL URL'),
+  });
+  expect(externalCommands).toEqual([]);
+  expect(await pathExists(join(configuration, 'profiles', 'team.json'))).toBe(false);
 });
 
 test('guided team init prefers native storage and persists only opaque provider references', async () => {
@@ -448,7 +580,7 @@ test('guided team init prefers native storage and persists only opaque provider 
   const base = localSetupHost(
     configuration,
     join(directory, 'data'),
-    ['2', 'team', 'Ada Operator', '', connectionString, '', '', 'yes'],
+    ['2', 'team', 'Ada Operator', '', '', connectionString, '', '', 'yes'],
     output,
   );
   const host: CliHost = {
@@ -513,7 +645,7 @@ test('guided team init requires an explicit fallback when native storage is unav
     ...localSetupHost(
       configuration,
       join(directory, 'data'),
-      ['2', 'team', 'Operator', 'cancel'],
+      ['2', 'team', 'Operator', '', 'cancel'],
       output,
     ),
     credentialProvider: {
@@ -540,7 +672,7 @@ test('guided team init reports PostgreSQL preflight failures without leaking the
     ...localSetupHost(
       join(directory, 'configuration'),
       join(directory, 'data'),
-      ['2', 'team', 'Operator', '', `postgres://u:${marker}@localhost/db?sslmode=disable`, '', ''],
+      ['2', 'team', 'Operator', '', '', `postgres://u:${marker}@localhost/db?sslmode=disable`, '', ''],
       [],
     ),
     probePostgres: () => Promise.reject(new Error(`password=${marker}`)),
@@ -567,6 +699,7 @@ test('guided team init blocks public plaintext exposure before Apply', async () 
       '2',
       'team',
       'Operator',
+      '',
       '',
       'postgres://u:p@localhost/datagram?sslmode=disable',
       '3',

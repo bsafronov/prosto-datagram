@@ -18,10 +18,9 @@ import {
   type ServerOptions,
   type ServerServiceOptions,
 } from '../../server';
-import {
-  createNativeCredentialProvider,
-} from './credentials';
+import { createNativeCredentialProvider } from './credentials';
 import type { CredentialProvider } from './credentials';
+import { createDockerPostgresPort, type DockerPostgresPort } from './docker-postgres';
 
 export interface CliTerminal {
   readonly input: AsyncIterable<string | Uint8Array>;
@@ -88,6 +87,7 @@ export interface CliHost {
   checkPort?(hostname: string, port: number): Promise<void>;
   startServerService?(options: ServerServiceOptions): ReturnType<typeof startServerService>;
   request?(request: Request): Promise<Response>;
+  dockerPostgres?: DockerPostgresPort;
   onTermination(handler: () => void | Promise<void>): void;
   exit(code: number): void;
   setExitCode(code: number): void;
@@ -140,7 +140,7 @@ export function createProcessCliHost(): CliHost {
     return { exitCode, stderr, stdout };
   };
   const credentialProvider = createNativeCredentialProvider(platform(), runExternalCommand);
-  return {
+  const host: CliHost = {
     terminal: {
       input: process.stdin,
       inputIsInteractive: process.stdin.isTTY,
@@ -245,4 +245,5 @@ export function createProcessCliHost(): CliHost {
       process.exitCode = code;
     },
   };
+  return { ...host, dockerPostgres: createDockerPostgresPort(host.runExternalCommand) };
 }

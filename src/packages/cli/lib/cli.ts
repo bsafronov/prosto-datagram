@@ -13,6 +13,7 @@ import {
 export const cliUsage = `Usage:
   datagram init [--profile NAME]
   datagram doctor --profile NAME [--verbose]
+  datagram postgres start|stop|status --profile NAME
   datagram actions|queries [--type-id ID --type-version VERSION] [--profile NAME | --db PATH]
   datagram action NAME [--type-id ID --type-version VERSION] [--input JSON] [--profile NAME | --actor ID --db PATH]
   datagram query NAME [--type-id ID --type-version VERSION] [--input JSON] [--profile NAME | --actor ID --db PATH]
@@ -77,12 +78,53 @@ export async function runCli(
     return;
   }
 
+  if (command === 'postgres') {
+    const operation = args[1];
+    if (!['start', 'stop', 'status'].includes(operation ?? '')) {
+      throw new DatagramError('input.invalid', 'Choose PostgreSQL lifecycle operation: start, stop, or status.', 400);
+    }
+    const profileName = required(option(args, '--profile'), '`postgres` requires --profile NAME');
+    const profile = await readServiceProfile(host, profileName);
+    if (!isServerProfile(profile) || profile.service.infrastructure.kind !== 'docker-postgres') {
+      throw new DatagramError(
+        'postgres.not-managed',
+        `Service profile ${JSON.stringify(profileName)} does not own PostgreSQL infrastructure. External PostgreSQL lifecycle is unchanged.`,
+        400,
+      );
+    }
+    if (host.dockerPostgres === undefined || !(await host.dockerPostgres.available())) {
+      throw new DatagramError(
+        'docker.unavailable',
+        'Docker is unavailable. Install or start Docker yourself, then retry. Docker was not installed.',
+        400,
+      );
+    }
+    const definition = { profileName, ...profile.service.infrastructure };
+    if (operation === 'start') await host.dockerPostgres.start(definition);
+    if (operation === 'stop') await host.dockerPostgres.stop(definition);
+    const status = await host.dockerPostgres.status(definition);
+    host.terminal.writeOutput(
+      `Managed PostgreSQL: ${status}; profile=${JSON.stringify(profileName)}; data=${profile.service.infrastructure.volumeName}\n`,
+    );
+    return;
+  }
+
   if (command === 'serve') {
     const rawPort = option(args, '--port');
     const profileName = option(args, '--profile');
     if (profileName !== undefined) {
       const profile = await readServiceProfile(host, profileName);
       if (isServerProfile(profile)) {
+        if (profile.service.infrastructure.kind === 'docker-postgres') {
+          if (host.dockerPostgres === undefined || !(await host.dockerPostgres.available())) {
+            throw new DatagramError(
+              'docker.unavailable',
+              'Docker is unavailable. Install or start Docker yourself, then retry. Docker was not installed.',
+              400,
+            );
+          }
+          await host.dockerPostgres.start({ profileName, ...profile.service.infrastructure });
+        }
         if (host.startServerService === undefined) {
           throw new DatagramError('server.unavailable', 'Server Service startup is unavailable.', 500);
         }

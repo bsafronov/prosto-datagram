@@ -18,6 +18,15 @@ export type {
   NativeCredentialProviderKind,
 } from './credentials';
 export {
+  createDockerPostgresPort,
+  managedPostgresDefinition,
+  managedPostgresImage,
+  type DockerPostgresPort,
+  type ManagedPostgresCreate,
+  type ManagedPostgresDefinition,
+  type ManagedPostgresState,
+} from './lib/docker-postgres';
+export {
   applyCodexIntegration,
   discoverCodexIntegration,
   verifyCodexIntegration,

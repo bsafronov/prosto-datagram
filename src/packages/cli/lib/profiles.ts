@@ -30,7 +30,15 @@ export interface ServerServiceProfile {
   readonly name: string;
   readonly service: {
     readonly kind: 'server';
-    readonly infrastructure: { readonly kind: 'external-postgres' };
+    readonly infrastructure:
+      | { readonly kind: 'external-postgres' }
+      | {
+          readonly kind: 'docker-postgres';
+          readonly image: string;
+          readonly containerName: string;
+          readonly volumeName: string;
+          readonly port: number;
+        };
     readonly serviceKey: string;
     readonly postgres: { readonly credential: CredentialReference };
     readonly bind: {
@@ -189,7 +197,7 @@ function isServerService(value: unknown): value is ServerServiceProfile['service
   const exposure = bind?.exposure;
   if (
     service.kind !== 'server' ||
-    infrastructure?.kind !== 'external-postgres' ||
+    !['external-postgres', 'docker-postgres'].includes(String(infrastructure?.kind)) ||
     typeof service.serviceKey !== 'string' ||
     service.serviceKey.length === 0 ||
     !isCredentialReference(postgres?.credential) ||
@@ -200,6 +208,19 @@ function isServerService(value: unknown): value is ServerServiceProfile['service
     !Number.isInteger(bind.port) ||
     bind.port < 1 ||
     bind.port > 65_535
+  ) return false;
+  if (
+    infrastructure?.kind === 'docker-postgres' &&
+    (typeof infrastructure.image !== 'string' ||
+      !infrastructure.image.startsWith('postgres:') ||
+      typeof infrastructure.containerName !== 'string' ||
+      infrastructure.containerName.length === 0 ||
+      typeof infrastructure.volumeName !== 'string' ||
+      infrastructure.volumeName.length === 0 ||
+      typeof infrastructure.port !== 'number' ||
+      !Number.isInteger(infrastructure.port) ||
+      infrastructure.port < 1 ||
+      infrastructure.port > 65_535)
   ) return false;
   if (exposure !== 'public') return publicAccess === undefined;
   return (
