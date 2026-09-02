@@ -1,4 +1,4 @@
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 
 import { DatagramError } from '../../application/errors';
 import type { CliHost } from './host';
@@ -38,6 +38,13 @@ interface DurableInstallPlan {
   readonly command: 'bun';
   readonly args: readonly ['install', '--global', 'prosto-datagram'];
   readonly executablePaths: readonly [string, string];
+}
+
+interface LegacyLocalService {
+  readonly actorId?: string;
+  readonly databasePath: string;
+  readonly databaseSource: 'current-directory' | 'environment';
+  readonly environmentDatabasePath?: string;
 }
 
 const durableInstallCommand = 'bun install --global prosto-datagram';
@@ -81,6 +88,164 @@ function createAnswerReader(host: CliHost): ReadAnswer {
     }
     return result.value;
   };
+}
+
+async function detectLegacyLocalService(host: CliHost): Promise<LegacyLocalService | undefined> {
+  const environmentDatabasePath = host.environment.get('DATAGRAM_DB');
+  const configuredPath =
+    environmentDatabasePath === undefined || environmentDatabasePath === ''
+      ? 'datagram.sqlite'
+      : environmentDatabasePath;
+  if (configuredPath === ':memory:') return undefined;
+  const databasePath = resolve(host.currentDirectory, configuredPath);
+  if (!(await host.filesystem.pathExists(databasePath))) return undefined;
+  const actorId = host.environment.get('DATAGRAM_ACTOR_ID');
+  return {
+    ...(actorId === undefined || actorId === '' ? {} : { actorId }),
+    databasePath,
+    databaseSource:
+      environmentDatabasePath === undefined || environmentDatabasePath === ''
+        ? 'current-directory'
+        : 'environment',
+    ...(environmentDatabasePath === undefined || environmentDatabasePath === ''
+      ? {}
+      : { environmentDatabasePath }),
+  };
+}
+
+async function runLegacyAdoption(
+  host: CliHost,
+  read: ReadAnswer,
+  legacy: LegacyLocalService,
+  requestedProfileName?: string,
+): Promise<boolean> {
+  host.terminal.writeOutput(
+    'Existing Local Service detected.\n' +
+      `  Source: ${legacy.databaseSource === 'environment' ? 'legacy environment configuration' : 'current-directory SQLite'}\n` +
+      `  SQLite data: ${legacy.databasePath}\n` +
+      (legacy.environmentDatabasePath === undefined
+        ? ''
+        : `  DATAGRAM_DB: ${legacy.environmentDatabasePath}\n`) +
+      (legacy.actorId === undefined ? '' : `  DATAGRAM_ACTOR_ID: ${legacy.actorId}\n`) +
+      'Choose operation:\n' +
+      '  1. Preview adoption into a named profile (Recommended)\n' +
+      '  2. Set up a separate new Service\n' +
+      '  3. Cancel\n' +
+      'Selection [1]: ',
+  );
+  const rawChoice = normalized(await read());
+  const choice = rawChoice === '' ? '1' : rawChoice;
+  if (choice === '3' || isCancel(choice)) {
+    host.terminal.writeOutput('Adoption cancelled. No changes were made.\n');
+    return true;
+  }
+  if (choice === '2') return false;
+  if (choice !== '1') {
+    throw new DatagramError('input.invalid', 'Choose 1, 2, or 3.', 400);
+  }
+
+  const initialProfileName = requestedProfileName ?? defaultProfileName;
+  host.terminal.writeOutput(
+    `Name the adopted Service profile\nProfile name [${initialProfileName}] (or Cancel): `,
+  );
+  const profileAnswer = normalized(await read());
+  if (isCancel(profileAnswer)) {
+    host.terminal.writeOutput('Adoption cancelled. No changes were made.\n');
+    return true;
+  }
+  const profileName = profileAnswer === '' ? initialProfileName : profileAnswer;
+  if (!profileNamePattern.test(profileName)) {
+    throw new DatagramError('profile.name-invalid', 'Profile name is invalid.', 400);
+  }
+  const profilePath = join(host.directories.configuration, 'profiles', `${profileName}.json`);
+  if (await host.filesystem.pathExists(profilePath)) {
+    await runExistingSetup(host, read, profileName);
+    return true;
+  }
+
+  const runtime = await host.openRuntime({ databasePath: legacy.databasePath });
+  try {
+    const identity =
+      legacy.actorId === undefined
+        ? await runtime.store.findLocalOwner()
+        : await runtime.store.getPerson(legacy.actorId);
+    if (identity === undefined || identity === null) {
+      throw new DatagramError(
+        'setup.adoption-identity-missing',
+        'Adoption stopped safely because the existing Service identity could not be resolved. No profile was created.',
+        400,
+      );
+    }
+    await runtime.app.verifyServiceIdentity(identity.id);
+    const defaultProfilePath = join(host.directories.configuration, 'default-profile');
+    host.terminal.writeOutput(
+      'Review adoption plan\n' +
+        `  Service: Local Service\n  Profile: ${profileName}\n` +
+        `  Configuration: ${profilePath}\n` +
+        `  Default profile selection: ${defaultProfilePath} -> ${profileName}\n` +
+        `  SQLite data reference: ${legacy.databasePath}\n` +
+        `  Identity person ID: ${identity.id}\n` +
+        `  Identity display name: ${identity.displayName}\n` +
+        (legacy.environmentDatabasePath === undefined
+          ? ''
+          : `  Legacy DATAGRAM_DB value: ${legacy.environmentDatabasePath}\n`) +
+        (legacy.actorId === undefined
+          ? ''
+          : `  Legacy DATAGRAM_ACTOR_ID value: ${legacy.actorId}\n`) +
+        '  Existing SQLite data: referenced in place; not moved, rewritten, or deleted\n' +
+        '  Secrets: none\n' +
+        'Adopt this existing Service? [Y/n] (or Cancel): ',
+    );
+    const answer = normalized(await read()).toLowerCase();
+    if (isCancel(answer) || answer === 'n' || answer === 'no') {
+      host.terminal.writeOutput('Adoption cancelled. No changes were made.\n');
+      return true;
+    }
+    if (answer !== '' && answer !== 'y' && answer !== 'yes') {
+      throw new DatagramError('input.invalid', 'Choose Y, n, or Cancel.', 400);
+    }
+
+    const profile: LocalServiceProfile = {
+      version: 1,
+      name: profileName,
+      service: { kind: 'local', databasePath: legacy.databasePath },
+      identity: { personId: identity.id, displayName: identity.displayName },
+      setup: { core: 'verified', starter: { status: 'pending' } },
+    };
+    const journal: SetupJournal = {
+      version: 1,
+      profileName,
+      core: 'verified',
+      starter: { status: 'pending' },
+      durableInstall: 'skipped',
+    };
+    await host.filesystem.makeDirectory(join(host.directories.configuration, 'profiles'), {
+      recursive: true,
+    });
+    await saveProgress(host, profilePath, profile, journal);
+    await host.filesystem.writeTextFileAtomic(defaultProfilePath, `${profileName}\n`, {
+      mode: 0o600,
+    });
+    const verification = await checkService(host, profileName, runtime);
+    if (!verification.ok) {
+      const failure = verification.checks.find((check) => check.status === 'failed');
+      throw new DatagramError(
+        failure?.code ?? 'setup.adoption-verification-failed',
+        `Adopted profile failed Doctor verification. Repair: ${resumeCommand(profileName)}`,
+        500,
+      );
+    }
+    host.terminal.writeOutput(
+      'Adoption complete. Existing SQLite data and identity are intact.\n' +
+        `Profile: ${profileName} (default)\n` +
+        `SQLite data: ${legacy.databasePath}\n` +
+        `Identity: ${identity.displayName} (${identity.id})\n` +
+        `Doctor: bunx prosto-datagram doctor --profile ${JSON.stringify(profileName)}\n`,
+    );
+    return true;
+  } finally {
+    await runtime.close();
+  }
 }
 
 async function collectAnswers(
@@ -615,6 +780,10 @@ export async function runGuidedInit(host: CliHost, requestedProfileName?: string
   const existingName = await existingSetupName(host, requestedProfileName);
   if (existingName !== undefined) {
     await runExistingSetup(host, read, existingName);
+    return;
+  }
+  const legacy = await detectLegacyLocalService(host);
+  if (legacy !== undefined && (await runLegacyAdoption(host, read, legacy, requestedProfileName))) {
     return;
   }
   host.terminal.writeOutput(

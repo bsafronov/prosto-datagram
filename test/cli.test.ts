@@ -1,5 +1,15 @@
 import { afterEach, expect, test } from 'bun:test';
-import { access, mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import {
+  access,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rename,
+  rm,
+  stat,
+  writeFile,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -53,6 +63,10 @@ function localSetupHost(
   runExternalCommand: CliHost['runExternalCommand'] = () =>
     Promise.reject(new Error('unexpected external command')),
   failAction?: string,
+  legacy?: {
+    readonly currentDirectory?: string;
+    readonly environment?: Readonly<Record<string, string | undefined>>;
+  },
 ): CliHost {
   return {
     terminal: {
@@ -62,7 +76,7 @@ function localSetupHost(
       writeOutput: (value) => output.push(value),
       writeError: () => undefined,
     },
-    environment: { get: () => undefined },
+    environment: { get: (name) => legacy?.environment?.[name] },
     filesystem: {
       pathExists,
       readTextFile: (path) => readFile(path, 'utf8'),
@@ -75,7 +89,7 @@ function localSetupHost(
       makeDirectory: (path, options) => mkdir(path, options).then(() => undefined),
     },
     directories: { configuration, data },
-    currentDirectory: '/unrelated/current-directory',
+    currentDirectory: legacy?.currentDirectory ?? '/unrelated/current-directory',
     runExternalCommand,
     createRuntime: async (options) => {
       const created = await createRuntime(options);
@@ -454,6 +468,124 @@ test('guided team init blocks public plaintext exposure before Apply', async () 
   expect(runCli(['init'], host)).rejects.toMatchObject({ code: 'setup.public-tls-required' });
   expect(await pathExists(join(configuration, 'profiles', 'team.json'))).toBe(false);
   expect(await pathExists(join(configuration, 'secrets', 'team.json'))).toBe(false);
+});
+
+test('guided init adopts current-directory SQLite by reference and keeps identity and data intact', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'datagram-guided-adopt-'));
+  temporaryDirectories.push(directory);
+  const configuration = join(directory, 'configuration');
+  const data = join(directory, 'data');
+  const databasePath = join(directory, 'datagram.sqlite');
+  let legacyRuntime = await createRuntime({
+    databasePath,
+    ownerDisplayName: 'Existing Operator',
+  });
+  const existingIdentity = legacyRuntime.owner;
+  const receipt = await legacyRuntime.app.executeAction(
+    existingIdentity.id,
+    'cli',
+    'channel.create',
+    { title: 'Existing private work', typeId: 'table' },
+  );
+  const existingChannelId = receipt.subject?.id ?? '';
+  await legacyRuntime.close();
+  const databaseBefore = await readFile(databasePath);
+
+  const output: string[] = [];
+  await runCli(
+    ['init'],
+    localSetupHost(configuration, data, ['', 'adopted', ''], output, undefined, undefined, {
+      currentDirectory: directory,
+    }),
+  );
+
+  const profilePath = join(configuration, 'profiles', 'adopted.json');
+  const profile = JSON.parse(await readFile(profilePath, 'utf8')) as {
+    service: { databasePath: string };
+    identity: { displayName: string; personId: string };
+  };
+  expect(profile).toMatchObject({
+    service: { databasePath },
+    identity: {
+      displayName: existingIdentity.displayName,
+      personId: existingIdentity.id,
+    },
+  });
+  expect(await readFile(join(configuration, 'default-profile'), 'utf8')).toBe('adopted\n');
+  expect(
+    JSON.parse(await readFile(join(configuration, 'setup-journals', 'adopted.json'), 'utf8')),
+  ).toMatchObject({
+    profileName: 'adopted',
+    core: 'verified',
+    starter: { status: 'pending' },
+    durableInstall: 'skipped',
+  });
+  expect(await readFile(databasePath)).toEqual(databaseBefore);
+
+  legacyRuntime = await createRuntime({ databasePath });
+  expect(legacyRuntime.owner.id).toBe(existingIdentity.id);
+  expect(await legacyRuntime.store.getChannel(existingChannelId)).toMatchObject({
+    id: existingChannelId,
+    title: 'Existing private work',
+  });
+  await legacyRuntime.close();
+
+  const doctorOutput: string[] = [];
+  await runCli(
+    ['doctor', '--profile', 'adopted'],
+    localSetupHost(configuration, data, [], doctorOutput),
+  );
+  expect(doctorOutput.join('')).toContain('Service ready. profile="adopted" kind=local');
+
+  const rerunOutput: string[] = [];
+  await runCli(
+    ['init', '--profile', 'adopted'],
+    localSetupHost(configuration, data, ['1'], rerunOutput),
+  );
+  expect(rerunOutput.join('')).toContain('Existing setup detected');
+  expect(rerunOutput.join('')).toContain('journal: valid');
+  expect(await readdir(join(configuration, 'profiles'))).toEqual(['adopted.json']);
+  expect(output.join('')).not.toContain('Existing private work');
+  expect(output.join('')).toContain('referenced in place; not moved, rewritten, or deleted');
+});
+
+test('guided init previews legacy environment values and cancellation creates no profile', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'datagram-guided-adopt-cancel-'));
+  temporaryDirectories.push(directory);
+  const configuration = join(directory, 'configuration');
+  const data = join(directory, 'data');
+  const relativeDatabasePath = join('legacy', 'existing.sqlite');
+  const databasePath = join(directory, relativeDatabasePath);
+  await mkdir(join(directory, 'legacy'), { recursive: true });
+  const legacyRuntime = await createRuntime({
+    databasePath,
+    ownerDisplayName: 'Environment Operator',
+  });
+  const actorId = legacyRuntime.owner.id;
+  await legacyRuntime.close();
+  const databaseBefore = await readFile(databasePath);
+  const output: string[] = [];
+
+  await runCli(
+    ['init'],
+    localSetupHost(configuration, data, ['', '', 'Cancel'], output, undefined, undefined, {
+      currentDirectory: directory,
+      environment: {
+        DATAGRAM_ACTOR_ID: actorId,
+        DATAGRAM_DB: relativeDatabasePath,
+      },
+    }),
+  );
+
+  const rendered = output.join('');
+  expect(rendered).toContain('legacy environment configuration');
+  expect(rendered).toContain(`DATAGRAM_DB: ${relativeDatabasePath}`);
+  expect(rendered).toContain(`DATAGRAM_ACTOR_ID: ${actorId}`);
+  expect(rendered).toContain(`SQLite data reference: ${databasePath}`);
+  expect(rendered).toContain('Adoption cancelled. No changes were made.');
+  expect(await pathExists(join(configuration, 'profiles', 'local.json'))).toBe(false);
+  expect(await pathExists(join(configuration, 'default-profile'))).toBe(false);
+  expect(await readFile(databasePath)).toEqual(databaseBefore);
 });
 
 test('guided init previews and runs durable installation only after consent', async () => {
