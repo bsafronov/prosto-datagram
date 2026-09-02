@@ -102,7 +102,10 @@ function legacyDatabasePath(host: CliHost, value: string | undefined): string {
   return resolve(host.currentDirectory, value ?? 'datagram.sqlite');
 }
 
-async function readProfile(host: CliHost, profileName: string): Promise<LocalServiceProfile> {
+export async function readServiceProfile(
+  host: CliHost,
+  profileName: string,
+): Promise<LocalServiceProfile> {
   if (!profileNamePattern.test(profileName)) {
     throw new DatagramError(
       'profile.name-invalid',
@@ -145,7 +148,7 @@ export async function resolveServiceTarget(
         400,
       );
     }
-    const profile = await readProfile(host, options.profileName);
+    const profile = await readServiceProfile(host, options.profileName);
     return {
       actorId: profile.identity.personId,
       databasePath: profile.service.databasePath,
@@ -192,7 +195,7 @@ export async function resolveServiceTarget(
       'The default Service profile selection is invalid. Run `datagram init` to choose a default.',
     );
   }
-  const profile = await readProfile(host, defaultProfileName);
+  const profile = await readServiceProfile(host, defaultProfileName);
   return {
     actorId: profile.identity.personId,
     databasePath: profile.service.databasePath,

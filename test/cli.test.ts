@@ -9,7 +9,7 @@ import {
   runCli,
   type CliHost,
 } from '../src/packages/cli';
-import { createRuntime, type DatagramRuntime } from '../src/packages/runtime';
+import { createRuntime, openRuntime, type DatagramRuntime } from '../src/packages/runtime';
 
 const temporaryDirectories: string[] = [];
 let runtime: DatagramRuntime | undefined;
@@ -91,6 +91,7 @@ function localSetupHost(
         }),
       };
     },
+    openRuntime,
     startHttpServer: () => Promise.reject(new Error('unexpected HTTP server')),
     onTermination: () => undefined,
     exit: () => undefined,
@@ -165,6 +166,7 @@ test('CLI execution uses injected host services without touching process configu
       runtimeOptions.push(options);
       return Promise.resolve(injectedRuntime);
     },
+    openRuntime,
     startHttpServer: (options) => {
       serverOptions.push(options);
       return Promise.resolve({
@@ -469,6 +471,140 @@ test('profile selection fails actionably instead of guessing a Service target', 
   expect(
     runCli(['actions', '--profile', 'personal', '--db', 'other.sqlite'], host),
   ).rejects.toMatchObject({ code: 'profile.target-conflict' });
+});
+
+test('doctor reports concise readiness without inspecting Channel data', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'datagram-doctor-ready-'));
+  temporaryDirectories.push(directory);
+  const configuration = join(directory, 'configuration');
+  const databasePath = join(directory, 'ready.sqlite');
+  const seeded = await createRuntime({ databasePath, ownerDisplayName: 'Ready Operator' });
+  await writeProfile(
+    configuration,
+    'ready',
+    databasePath,
+    seeded.owner.id,
+    seeded.owner.displayName,
+  );
+  await seeded.close();
+  const output: string[] = [];
+
+  await runCli(
+    ['doctor', '--profile', 'ready'],
+    localSetupHost(configuration, join(directory, 'data'), [], output),
+  );
+
+  expect(output.join('')).toBe(
+    'profile: ok\ntarget: ok\nruntime: ok\nidentity: ok\n' +
+      'Service ready. profile="ready" kind=local\nChannel data: not inspected\n',
+  );
+  expect(output.join('')).not.toContain('Ready Operator');
+});
+
+test('doctor gives a stable redacted profile failure and safe verbose context', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'datagram-doctor-profile-'));
+  temporaryDirectories.push(directory);
+  const configuration = join(directory, 'configuration');
+  const profileDirectory = join(configuration, 'profiles');
+  await mkdir(profileDirectory, { recursive: true });
+  await writeFile(join(profileDirectory, 'broken.json'), '{"credential":"do-not-print"');
+  const output: string[] = [];
+  const exitCodes: number[] = [];
+  const host: CliHost = {
+    ...localSetupHost(configuration, join(directory, 'data'), [], output),
+    setExitCode: (code) => exitCodes.push(code),
+  };
+
+  await runCli(['doctor', '--profile', 'broken', '--verbose'], host);
+
+  const rendered = output.join('');
+  expect(rendered).toContain('profile: failed');
+  expect(rendered).toContain('Code: doctor.profile-unreadable');
+  expect(rendered).toContain('Stage: profile');
+  expect(rendered).toContain(
+    'Recovery: Run `bunx prosto-datagram init` to repair profile "broken".',
+  );
+  expect(rendered).toContain('causeCode="profile.invalid"');
+  expect(rendered).not.toContain('do-not-print');
+  expect(rendered).not.toContain('credential');
+  expect(exitCodes).toEqual([1]);
+});
+
+test('doctor redacts runtime errors and reports the failing stage', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'datagram-doctor-runtime-'));
+  temporaryDirectories.push(directory);
+  const configuration = join(directory, 'configuration');
+  const databasePath = join(directory, 'unavailable.sqlite');
+  await writeFile(databasePath, 'present');
+  await writeProfile(configuration, 'offline', databasePath, 'person_configured', 'Operator');
+  const output: string[] = [];
+  const host: CliHost = {
+    ...localSetupHost(configuration, join(directory, 'data'), [], output),
+    openRuntime: () => Promise.reject(new Error('password=do-not-print host=private-host')),
+  };
+
+  await runCli(['doctor', '--profile', 'offline', '--verbose'], host);
+
+  const rendered = output.join('');
+  expect(rendered).toContain('profile: ok');
+  expect(rendered).toContain('target: ok');
+  expect(rendered).toContain('runtime: failed');
+  expect(rendered).toContain('Code: doctor.runtime-unready');
+  expect(rendered).toContain('Stage: runtime');
+  expect(rendered).toContain('adapter="sqlite"');
+  expect(rendered).not.toContain('do-not-print');
+  expect(rendered).not.toContain('private-host');
+  expect(rendered).not.toContain('password');
+});
+
+test('doctor does not create a missing configured Store while diagnosing it', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'datagram-doctor-missing-store-'));
+  temporaryDirectories.push(directory);
+  const configuration = join(directory, 'configuration');
+  const databasePath = join(directory, 'missing.sqlite');
+  await writeProfile(configuration, 'missing-store', databasePath, 'person_configured', 'Operator');
+  const output: string[] = [];
+
+  await runCli(
+    ['doctor', '--profile', 'missing-store'],
+    localSetupHost(configuration, join(directory, 'data'), [], output),
+  );
+
+  expect(output.join('')).toContain('Code: doctor.runtime-unready');
+  expect(await pathExists(databasePath)).toBe(false);
+});
+
+test('doctor verifies identity without bootstrapping or exposing its configured value', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'datagram-doctor-identity-'));
+  temporaryDirectories.push(directory);
+  const configuration = join(directory, 'configuration');
+  const databasePath = join(directory, 'empty.sqlite');
+  const emptyRuntime = await openRuntime({ databasePath });
+  await emptyRuntime.close();
+  await writeProfile(
+    configuration,
+    'identity',
+    databasePath,
+    'person_secret-shaped-value',
+    'Stored Display Value',
+  );
+  const output: string[] = [];
+  const base = localSetupHost(configuration, join(directory, 'data'), [], output);
+  const host: CliHost = {
+    ...base,
+    createRuntime: () => Promise.reject(new Error('doctor must not bootstrap an owner')),
+  };
+
+  await runCli(['doctor', '--profile', 'identity', '--verbose'], host);
+
+  const rendered = output.join('');
+  expect(rendered).toContain('identity: failed');
+  expect(rendered).toContain('Code: doctor.identity-invalid');
+  expect(rendered).toContain('Stage: identity');
+  expect(rendered).toContain('causeCode="person.not-found"');
+  expect(rendered).toContain('identityReference="configured"');
+  expect(rendered).not.toContain('person_secret-shaped-value');
+  expect(rendered).not.toContain('Stored Display Value');
 });
 
 test('legacy environment and explicit database and actor inputs remain compatible', async () => {

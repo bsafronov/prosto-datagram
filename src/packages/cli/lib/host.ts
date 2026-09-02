@@ -2,7 +2,13 @@ import { access, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { homedir, platform } from 'node:os';
 import { join } from 'node:path';
 
-import { createRuntime, type DatagramRuntime, type RuntimeOptions } from '../../runtime';
+import {
+  createRuntime,
+  openRuntime,
+  type DatagramRuntime,
+  type OpenDatagramRuntime,
+  type RuntimeOptions,
+} from '../../runtime';
 import { startHttpServer, type ServerOptions } from '../../server';
 
 export interface CliTerminal {
@@ -57,6 +63,7 @@ export interface CliHost {
   readonly currentDirectory: string;
   runExternalCommand(request: ExternalCommandRequest): Promise<ExternalCommandResult>;
   createRuntime(options?: RuntimeOptions): Promise<DatagramRuntime>;
+  openRuntime(options?: Pick<RuntimeOptions, 'databasePath'>): Promise<OpenDatagramRuntime>;
   startHttpServer(options?: ServerOptions): Promise<CliHttpServer>;
   onTermination(handler: () => void | Promise<void>): void;
   exit(code: number): void;
@@ -122,6 +129,7 @@ export function createProcessCliHost(): CliHost {
       return { exitCode, stderr, stdout };
     },
     createRuntime,
+    openRuntime,
     startHttpServer,
     onTermination: (handler) => {
       process.once('SIGINT', handler);

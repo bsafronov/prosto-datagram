@@ -1,11 +1,13 @@
 import { DatagramError, toPublicError } from '../../application/errors';
 import type { ChannelTypeContractSelector } from '../../application/contracts';
 import { createProcessCliHost, type CliHost } from './host';
+import { runDoctor } from './doctor';
 import { runGuidedInit } from './init';
 import { resolveServiceTarget } from './profiles';
 
 export const cliUsage = `Usage:
   datagram init
+  datagram doctor --profile NAME [--verbose]
   datagram actions|queries [--type-id ID --type-version VERSION] [--profile NAME | --db PATH]
   datagram action NAME [--type-id ID --type-version VERSION] [--input JSON] [--profile NAME | --actor ID --db PATH]
   datagram query NAME [--type-id ID --type-version VERSION] [--input JSON] [--profile NAME | --actor ID --db PATH]
@@ -95,6 +97,11 @@ export async function runCli(
 
   if (command === 'init') {
     await runGuidedInit(host);
+    return;
+  }
+
+  if (command === 'doctor') {
+    await runDoctor(host, option(args, '--profile'), args.includes('--verbose'));
     return;
   }
 

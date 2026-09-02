@@ -2,6 +2,7 @@ import { join } from 'node:path';
 
 import { DatagramError } from '../../application/errors';
 import type { CliHost } from './host';
+import { checkService } from './doctor';
 import {
   parseProfile,
   profileNamePattern,
@@ -297,21 +298,17 @@ export async function runGuidedInit(host: CliHost): Promise<void> {
     await host.filesystem.writeTextFile(defaultProfilePath, `${result.profileName}\n`, { mode: 0o600 });
 
     host.terminal.writeOutput('[3/3] Verifying profile, Store, runtime, and identity\n');
-    if (!(await host.filesystem.pathExists(databasePath))) {
-      throw new Error('SQLite Store verification failed');
+    const verification = await checkService(host, result.profileName, runtime);
+    if (!verification.ok) {
+      const failure = verification.checks.find((check) => check.status === 'failed');
+      throw new DatagramError(
+        failure?.code ?? 'setup.verification-failed',
+        failure === undefined
+          ? 'Setup verification failed. Run `datagram init` to repair it.'
+          : `Setup verification failed at ${failure.stage}. Profile ${JSON.stringify(result.profileName)}. ${failure.recovery}`,
+        500,
+      );
     }
-    const savedProfile = parseProfile(
-      await host.filesystem.readTextFile(profilePath),
-      result.profileName,
-    );
-    if (
-      savedProfile.service.databasePath !== databasePath ||
-      savedProfile.identity.personId !== runtime.owner.id
-    ) {
-      throw new Error('Profile verification failed');
-    }
-    await runtime.app.verifyServiceIdentity(runtime.owner.id);
-    if (runtime.app.actions.catalog().length === 0) throw new Error('Runtime verification failed');
 
     let starter = profile.setup?.starter ?? ({ status: 'pending' } as const);
     profile = { ...profile, setup: { core: 'verified', starter } };
