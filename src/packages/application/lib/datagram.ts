@@ -149,6 +149,14 @@ export class DatagramApplication {
     return { actorId };
   }
 
+  async resolveServiceIdentity(actorId?: string): Promise<Person> {
+    const person =
+      actorId === undefined ? await this.store.findLocalOwner() : await this.store.getPerson(actorId);
+    invariant(person !== undefined && person !== null, 'identity.not-found', 'Service identity does not exist', 404);
+    await this.verifyServiceIdentity(person.id);
+    return person;
+  }
+
   async executeAction(
     actorId: string,
     origin: OperationOrigin,

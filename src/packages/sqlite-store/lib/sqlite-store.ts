@@ -884,7 +884,7 @@ export class SqliteStore implements DatagramStore {
     }
   }
 
-  async ensureLocalOwner(displayName = 'Local Owner'): Promise<Person> {
+  async findLocalOwner(): Promise<Person | undefined> {
     const existing = this.#database
       .query(
         `SELECT * FROM persons
@@ -892,7 +892,12 @@ export class SqliteStore implements DatagramStore {
          ORDER BY created_at LIMIT 1`,
       )
       .get() as PersonRow | null;
-    if (existing) return personFromRow(existing);
+    return existing === null ? undefined : personFromRow(existing);
+  }
+
+  async ensureLocalOwner(displayName = 'Local Owner'): Promise<Person> {
+    const existing = await this.findLocalOwner();
+    if (existing !== undefined) return existing;
 
     const person: Person = {
       createdAt: nowIso(),

@@ -1,8 +1,12 @@
 {
   "name": "prosto-datagram",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.1.0",
   "type": "module",
+  "files": [
+    "README.md",
+    "skills/prosto-datagram",
+    "src"
+  ],
   "bin": {
     "datagram": "./src/cli.ts",
     "datagram-mcp": "./src/mcp.ts"

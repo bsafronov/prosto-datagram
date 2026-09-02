@@ -124,6 +124,13 @@ export class PostgresStore implements DatagramStore {
     return this.#bootstrapOperator({ displayName });
   }
 
+  async findLocalOwner(): Promise<Person | undefined> {
+    const state = await this.#state();
+    return state.persons
+      .filter((person) => person.isOperator && person.deactivatedAt === undefined)
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt))[0];
+  }
+
   async commit(operation: Operation): Promise<void> {
     if (!this.#initialized) throw new Error('PostgreSQL Store is not initialized');
     await this.#client.begin(async (sql) => {

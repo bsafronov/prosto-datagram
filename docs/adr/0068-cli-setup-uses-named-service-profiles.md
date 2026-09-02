@@ -1,0 +1,3 @@
+# CLI setup uses named Service profiles
+
+The interactive `datagram init` journey stores non-secret configuration for one Datagram Service in a named Service profile, supports one default profile plus an explicit profile override, and keeps credentials in a system credential store or an explicit secure fallback referenced by the profile. Setup is safe to rerun: it previews changes, commits core configuration before optional integrations and starter Actions, and resumes failed optional steps without overwriting unrelated configuration. This replaces environment-only and current-directory-only setup so one person can use multiple Local and Server Services predictably.

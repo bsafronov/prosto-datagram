@@ -22,6 +22,7 @@ export interface DatagramStore {
   close(): Promise<void>;
   commit(operation: Operation): Promise<void>;
   ensureLocalOwner(displayName?: string): Promise<Person>;
+  findLocalOwner(): Promise<Person | undefined>;
   getActivity(activityId: string): Promise<ChannelActivity | null>;
   getChannel(channelId: string): Promise<Channel | null>;
   getChannelGroup(groupId: string): Promise<ChannelGroup | null>;
