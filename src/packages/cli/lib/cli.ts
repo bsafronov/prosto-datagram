@@ -2,19 +2,25 @@ import { DatagramError, toPublicError } from '../../application/errors';
 import type { ChannelTypeContractSelector } from '../../application/contracts';
 import { createProcessCliHost, type CliHost } from './host';
 import { runGuidedInit } from './init';
+import { resolveServiceTarget } from './profiles';
 
 export const cliUsage = `Usage:
   datagram init
-  datagram actions|queries [--type-id ID --type-version VERSION] [--db PATH]
-  datagram action NAME [--type-id ID --type-version VERSION] [--input JSON] [--actor ID] [--db PATH]
-  datagram query NAME [--type-id ID --type-version VERSION] [--input JSON] [--actor ID] [--db PATH]
-  datagram agent-query NAME [--type-id ID --type-version VERSION] [--input JSON] [--actor ID] [--db PATH]
-  datagram serve [--port NUMBER] [--db PATH]
+  datagram actions|queries [--type-id ID --type-version VERSION] [--profile NAME | --db PATH]
+  datagram action NAME [--type-id ID --type-version VERSION] [--input JSON] [--profile NAME | --actor ID --db PATH]
+  datagram query NAME [--type-id ID --type-version VERSION] [--input JSON] [--profile NAME | --actor ID --db PATH]
+  datagram agent-query NAME [--type-id ID --type-version VERSION] [--input JSON] [--profile NAME | --actor ID --db PATH]
+  datagram serve [--port NUMBER] [--profile NAME | --db PATH]
 `;
 
 function option(args: readonly string[], name: string): string | undefined {
   const index = args.indexOf(name);
-  return index === -1 ? undefined : args[index + 1];
+  if (index === -1) return undefined;
+  const value = args[index + 1];
+  if (value === undefined || value.startsWith('--')) {
+    throw new DatagramError('input.invalid', `${name} requires a value`, 400);
+  }
+  return value;
 }
 
 function required(value: string | undefined, message: string): string {
@@ -66,9 +72,13 @@ export async function runCli(
 
   if (command === 'serve') {
     const rawPort = option(args, '--port');
-    const databasePath = option(args, '--db');
+    const target = await resolveServiceTarget(host, {
+      actorId: option(args, '--actor'),
+      databasePath: option(args, '--db'),
+      profileName: option(args, '--profile'),
+    });
     const { identityMode, runtime, server } = await host.startHttpServer({
-      ...(databasePath === undefined ? {} : { databasePath }),
+      databasePath: target.databasePath,
       ...(rawPort === undefined ? {} : { port: Number(rawPort) }),
     });
     host.terminal.writeError(
@@ -88,14 +98,18 @@ export async function runCli(
     return;
   }
 
-  const databasePath = option(args, '--db');
-  const configuredDatabasePath = databasePath ?? host.environment.get('DATAGRAM_DB');
-  const runtime = await host.createRuntime({
-    ...(configuredDatabasePath === undefined ? {} : { databasePath: configuredDatabasePath }),
+  if (!['actions', 'queries', 'action', 'query', 'agent-query'].includes(command)) {
+    throw new DatagramError('cli.command-unknown', 'Unknown command', 400);
+  }
+
+  const target = await resolveServiceTarget(host, {
+    actorId: option(args, '--actor'),
+    databasePath: option(args, '--db'),
+    profileName: option(args, '--profile'),
   });
+  const runtime = await host.createRuntime({ databasePath: target.databasePath });
   try {
-    const actorId =
-      option(args, '--actor') ?? host.environment.get('DATAGRAM_ACTOR_ID') ?? runtime.owner.id;
+    const actorId = target.actorId ?? runtime.owner.id;
     const selector = channelType(args);
     switch (command) {
       case 'actions':

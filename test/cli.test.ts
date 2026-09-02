@@ -79,6 +79,26 @@ function localSetupHost(
   };
 }
 
+async function writeProfile(
+  configuration: string,
+  name: string,
+  databasePath: string,
+  personId: string,
+  displayName: string,
+): Promise<void> {
+  const profileDirectory = join(configuration, 'profiles');
+  await mkdir(profileDirectory, { recursive: true });
+  await writeFile(
+    join(profileDirectory, `${name}.json`),
+    `${JSON.stringify({
+      version: 1,
+      name,
+      service: { kind: 'local', databasePath },
+      identity: { personId, displayName },
+    })}\n`,
+  );
+}
+
 afterEach(async () => {
   await runtime?.close();
   runtime = undefined;
@@ -210,7 +230,7 @@ test('guided init creates and verifies a named default Local Service', async () 
   expect(rendered).toContain('[3/3] Verifying profile, Store, runtime, and identity');
   expect(rendered).toContain(`Configuration: ${profilePath}`);
   expect(rendered).toContain(`SQLite data: ${databasePath}`);
-  expect(rendered).toContain(`CLI: bunx prosto-datagram actions --db ${JSON.stringify(databasePath)}`);
+  expect(rendered).toContain('CLI: bunx prosto-datagram actions --profile "personal"');
   expect(rendered).toContain('Durable commands: skipped');
   expect(rendered).toContain('bunx --package prosto-datagram datagram-mcp');
 });
@@ -279,6 +299,160 @@ test('optional installer failure preserves core setup and gives exact resume com
   expect(rendered).toContain('Resume optional installation: bun install --global prosto-datagram');
   expect(rendered).toContain('Durable commands: pending (installer exit code 23)');
   expect(rendered).not.toContain('sensitive installer details');
+});
+
+test('ordinary commands target the default or explicitly selected Service profile', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'datagram-cli-profiles-'));
+  temporaryDirectories.push(directory);
+  const configuration = join(directory, 'configuration');
+  const personalDatabase = join(directory, 'personal.sqlite');
+  const workDatabase = join(directory, 'work.sqlite');
+  const personalRuntime = await createRuntime({
+    databasePath: personalDatabase,
+    ownerDisplayName: 'Personal Operator',
+  });
+  const workRuntime = await createRuntime({
+    databasePath: workDatabase,
+    ownerDisplayName: 'Work Operator',
+  });
+  await writeProfile(
+    configuration,
+    'personal',
+    personalDatabase,
+    personalRuntime.owner.id,
+    personalRuntime.owner.displayName,
+  );
+  await writeProfile(
+    configuration,
+    'work',
+    workDatabase,
+    workRuntime.owner.id,
+    workRuntime.owner.displayName,
+  );
+  await writeFile(join(configuration, 'default-profile'), 'personal\n');
+  await personalRuntime.close();
+  await workRuntime.close();
+
+  const output: string[] = [];
+  const host = localSetupHost(configuration, join(directory, 'data'), [], output);
+  await runCli(
+    [
+      'action',
+      'channel.create',
+      '--input',
+      JSON.stringify({ title: 'Work Table', typeId: 'table' }),
+      '--profile',
+      'work',
+    ],
+    host,
+  );
+  const created = JSON.parse(output.pop() ?? '') as { subject: { id: string } };
+
+  await runCli(['query', 'channel.list'], host);
+  const defaultResult = JSON.parse(output.pop() ?? '') as { data: { id: string }[] };
+  expect(defaultResult.data).toEqual([]);
+
+  await runCli(['query', 'channel.list', '--profile', 'work'], host);
+  const workResult = JSON.parse(output.pop() ?? '') as { data: { id: string }[] };
+  expect(workResult.data.map(({ id }) => id)).toContain(created.subject.id);
+
+  await runCli(['agent-query', 'channel.list', '--profile', 'work'], host);
+  expect(JSON.parse(output.pop() ?? '')).toMatchObject({
+    id: expect.any(String),
+    purpose: 'channel.list',
+  });
+});
+
+test('serve resolves its database from the selected Service profile', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'datagram-cli-profile-serve-'));
+  temporaryDirectories.push(directory);
+  const configuration = join(directory, 'configuration');
+  const databasePath = join(directory, 'work.sqlite');
+  runtime = await createRuntime({ databasePath: ':memory:' });
+  await writeProfile(configuration, 'work', databasePath, runtime.owner.id, runtime.owner.displayName);
+
+  const options: unknown[] = [];
+  let terminationHandler: (() => void | Promise<void>) | undefined;
+  const base = localSetupHost(configuration, join(directory, 'data'), [], []);
+  const host: CliHost = {
+    ...base,
+    startHttpServer: (value) => {
+      options.push(value);
+      return Promise.resolve({
+        identityMode: 'development',
+        runtime: runtime!,
+        server: { url: new URL('http://127.0.0.1:4310/'), stop: () => undefined },
+      });
+    },
+    onTermination: (handler) => {
+      terminationHandler = handler;
+    },
+  };
+
+  await runCli(['serve', '--profile', 'work', '--port', '4310'], host);
+  expect(options).toEqual([{ databasePath, port: 4310 }]);
+  await terminationHandler?.();
+  runtime = undefined;
+});
+
+test('profile selection fails actionably instead of guessing a Service target', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'datagram-cli-profile-errors-'));
+  temporaryDirectories.push(directory);
+  const host = localSetupHost(join(directory, 'configuration'), join(directory, 'data'), [], []);
+
+  expect(runCli(['actions'], host)).rejects.toMatchObject({
+    code: 'profile.selection-required',
+    message: expect.stringContaining('--profile NAME'),
+  });
+  expect(runCli(['actions', '--profile', 'missing'], host)).rejects.toMatchObject({
+    code: 'profile.not-found',
+    message: expect.stringContaining('datagram init'),
+  });
+  expect(
+    runCli(['actions', '--profile', 'personal', '--db', 'other.sqlite'], host),
+  ).rejects.toMatchObject({ code: 'profile.target-conflict' });
+});
+
+test('legacy environment and explicit database and actor inputs remain compatible', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'datagram-cli-legacy-target-'));
+  temporaryDirectories.push(directory);
+  const databasePath = join(directory, 'legacy.sqlite');
+  const seeded = await createRuntime({ databasePath, ownerDisplayName: 'Legacy Operator' });
+  const actorId = seeded.owner.id;
+  await seeded.close();
+  const output: string[] = [];
+  const runtimeOptions: unknown[] = [];
+  const base = localSetupHost(join(directory, 'configuration'), join(directory, 'data'), [], output);
+  const host: CliHost = {
+    ...base,
+    currentDirectory: directory,
+    environment: {
+      get: (name) =>
+        name === 'DATAGRAM_DB'
+          ? 'legacy.sqlite'
+          : name === 'DATAGRAM_ACTOR_ID'
+            ? actorId
+            : undefined,
+    },
+    createRuntime: async (options) => {
+      runtimeOptions.push(options);
+      return createRuntime(options);
+    },
+  };
+
+  await runCli(
+    ['action', 'channel.create', '--input', JSON.stringify({ title: 'Legacy', typeId: 'table' })],
+    host,
+  );
+  await runCli(['query', 'channel.list', '--db', 'legacy.sqlite', '--actor', actorId], host);
+  await runCli(['actions', '--db', ':memory:'], host);
+
+  expect(runtimeOptions).toEqual([
+    { databasePath },
+    { databasePath },
+    { databasePath: ':memory:' },
+  ]);
+  expect(JSON.parse(output.at(-2) ?? '')).toMatchObject({ data: [expect.any(Object)] });
 });
 
 test('guided init cancellation before Apply leaves no profile or SQLite data', async () => {

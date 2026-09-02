@@ -2,22 +2,9 @@ import { join } from 'node:path';
 
 import { DatagramError } from '../../application/errors';
 import type { CliHost } from './host';
+import { parseProfile, profileNamePattern, type LocalServiceProfile } from './profiles';
 
 const defaultProfileName = 'local';
-const profileNamePattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
-
-interface LocalServiceProfile {
-  readonly version: 1;
-  readonly name: string;
-  readonly service: {
-    readonly kind: 'local';
-    readonly databasePath: string;
-  };
-  readonly identity: {
-    readonly personId: string;
-    readonly displayName: string;
-  };
-}
 
 type WizardResult =
   | { readonly kind: 'cancelled' }
@@ -198,29 +185,6 @@ async function collectAnswers(host: CliHost): Promise<WizardResult> {
   }
 }
 
-function parseProfile(value: string): LocalServiceProfile {
-  const parsed: unknown = JSON.parse(value);
-  if (
-    typeof parsed !== 'object' ||
-    parsed === null ||
-    !('version' in parsed) ||
-    parsed.version !== 1 ||
-    !('service' in parsed) ||
-    typeof parsed.service !== 'object' ||
-    parsed.service === null ||
-    !('databasePath' in parsed.service) ||
-    typeof parsed.service.databasePath !== 'string' ||
-    !('identity' in parsed) ||
-    typeof parsed.identity !== 'object' ||
-    parsed.identity === null ||
-    !('personId' in parsed.identity) ||
-    typeof parsed.identity.personId !== 'string'
-  ) {
-    throw new Error('Profile verification failed');
-  }
-  return parsed as LocalServiceProfile;
-}
-
 export async function runGuidedInit(host: CliHost): Promise<void> {
   if (!host.terminal.inputIsInteractive || !host.terminal.outputIsInteractive) {
     throw new DatagramError(
@@ -269,7 +233,10 @@ export async function runGuidedInit(host: CliHost): Promise<void> {
     if (!(await host.filesystem.pathExists(databasePath))) {
       throw new Error('SQLite Store verification failed');
     }
-    const savedProfile = parseProfile(await host.filesystem.readTextFile(profilePath));
+    const savedProfile = parseProfile(
+      await host.filesystem.readTextFile(profilePath),
+      result.profileName,
+    );
     if (
       savedProfile.service.databasePath !== databasePath ||
       savedProfile.identity.personId !== runtime.owner.id
@@ -312,7 +279,7 @@ export async function runGuidedInit(host: CliHost): Promise<void> {
       `Configuration: ${profilePath}\nSQLite data: ${databasePath}\n` +
       `Identity: ${runtime.owner.displayName} (${runtime.owner.id})\n` +
       `Durable commands: ${durableInstallStatus}\n` +
-      `CLI: bunx prosto-datagram actions --db ${JSON.stringify(databasePath)}\n` +
+      `CLI: bunx prosto-datagram actions --profile ${JSON.stringify(result.profileName)}\n` +
       `MCP: DATAGRAM_DB=${JSON.stringify(databasePath)} DATAGRAM_ACTOR_ID=${JSON.stringify(runtime.owner.id)} bunx --package prosto-datagram datagram-mcp\n` +
       'Reconfigure: bunx prosto-datagram init\n',
   );
