@@ -35,7 +35,7 @@ export interface DoctorReport {
 const stages: readonly DoctorStage[] = ['profile', 'target', 'runtime', 'identity'];
 
 function repairCommand(profileName: string): string {
-  return `Run \`bunx prosto-datagram init\` to repair profile ${JSON.stringify(profileName)}.`;
+  return `Run \`bunx prosto-datagram init --profile ${JSON.stringify(profileName)}\` to repair this profile.`;
 }
 
 function causeCode(error: unknown): string {

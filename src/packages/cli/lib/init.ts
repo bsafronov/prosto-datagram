@@ -4,8 +4,16 @@ import { DatagramError } from '../../application/errors';
 import type { CliHost } from './host';
 import { checkService } from './doctor';
 import {
+  isUncertainStarter,
+  readSetupJournal,
+  saveSetupJournal,
+  type JournalStarterProgress,
+  type SetupJournal,
+} from './journal';
+import {
   parseProfile,
   profileNamePattern,
+  readServiceProfile,
   type LocalServiceProfile,
   type StarterProgress,
 } from './profiles';
@@ -70,9 +78,13 @@ function createAnswerReader(host: CliHost): ReadAnswer {
   };
 }
 
-async function collectAnswers(host: CliHost, read: ReadAnswer): Promise<WizardResult> {
+async function collectAnswers(
+  host: CliHost,
+  read: ReadAnswer,
+  initialProfileName = defaultProfileName,
+): Promise<WizardResult> {
   let step = 0;
-  let profileName = defaultProfileName;
+  let profileName = initialProfileName;
   let displayName = '';
   let durableInstall: DurableInstallPlan | undefined;
   while (true) {
@@ -244,12 +256,282 @@ async function saveProfile(
   profilePath: string,
   profile: LocalServiceProfile,
 ): Promise<void> {
-  await host.filesystem.writeTextFile(profilePath, `${JSON.stringify(profile, null, 2)}\n`, {
+  await host.filesystem.writeTextFileAtomic(profilePath, `${JSON.stringify(profile, null, 2)}\n`, {
     mode: 0o600,
   });
 }
 
-export async function runGuidedInit(host: CliHost): Promise<void> {
+function resumeCommand(profileName: string): string {
+  return `bunx prosto-datagram init --profile ${JSON.stringify(profileName)}`;
+}
+
+async function existingSetupName(
+  host: CliHost,
+  requestedProfileName: string | undefined,
+): Promise<string | undefined> {
+  if (requestedProfileName !== undefined) {
+    if (!profileNamePattern.test(requestedProfileName)) {
+      throw new DatagramError('profile.name-invalid', 'Profile name is invalid.', 400);
+    }
+    const profilePath = join(host.directories.configuration, 'profiles', `${requestedProfileName}.json`);
+    return (await host.filesystem.pathExists(profilePath)) ? requestedProfileName : undefined;
+  }
+  const defaultProfilePath = join(host.directories.configuration, 'default-profile');
+  if (!(await host.filesystem.pathExists(defaultProfilePath))) return undefined;
+  const name = (await host.filesystem.readTextFile(defaultProfilePath)).trim();
+  return profileNamePattern.test(name) ? name : undefined;
+}
+
+function journalFromProfile(profile: LocalServiceProfile): SetupJournal {
+  return {
+    version: 1,
+    profileName: profile.name,
+    core: profile.setup?.core ?? 'applied',
+    starter: profile.setup?.starter ?? { status: 'pending' },
+    durableInstall: 'skipped',
+  };
+}
+
+function normalStarter(progress: JournalStarterProgress): StarterProgress | undefined {
+  return isUncertainStarter(progress) ? undefined : progress;
+}
+
+function clearFailure(journal: SetupJournal): SetupJournal {
+  const { failure: _failure, ...rest } = journal;
+  return rest;
+}
+
+async function saveProgress(
+  host: CliHost,
+  profilePath: string,
+  profile: LocalServiceProfile,
+  journal: SetupJournal,
+): Promise<void> {
+  await saveSetupJournal(host, journal);
+  const starter = normalStarter(journal.starter);
+  if (journal.core === 'verified' && starter !== undefined) {
+    await saveProfile(host, profilePath, { ...profile, setup: { core: 'verified', starter } });
+  }
+}
+
+async function confirmReviewedOperation(
+  host: CliHost,
+  read: ReadAnswer,
+  description: string,
+): Promise<boolean> {
+  host.terminal.writeOutput(`${description}\nApply this reviewed operation? [Y/n]: `);
+  const answer = normalized(await read()).toLowerCase();
+  return answer === '' || answer === 'y' || answer === 'yes';
+}
+
+async function runExistingSetup(
+  host: CliHost,
+  read: ReadAnswer,
+  profileName: string,
+): Promise<void> {
+  const command = resumeCommand(profileName);
+  let profile: LocalServiceProfile;
+  try {
+    profile = await readServiceProfile(host, profileName);
+  } catch {
+    throw new DatagramError(
+      'setup.profile-repair-required',
+      `Existing setup profile is unreadable. No changes were made. Repair: ${command}`,
+      400,
+    );
+  }
+  const profilePath = join(host.directories.configuration, 'profiles', `${profileName}.json`);
+  let journalInvalid = false;
+  let journal: SetupJournal;
+  try {
+    journal = (await readSetupJournal(host, profileName)) ?? journalFromProfile(profile);
+  } catch {
+    journalInvalid = true;
+    journal = journalFromProfile(profile);
+  }
+  const report = await checkService(host, profileName);
+  const incomplete =
+    journalInvalid ||
+    journal.core !== 'verified' ||
+    journal.starter.status !== 'complete' ||
+    journal.durableInstall === 'pending';
+  host.terminal.writeOutput(
+    `Existing setup detected for profile ${JSON.stringify(profileName)}.\n` +
+      `Core: ${journal.core}; starter: ${journal.starter.status}; Service: ${report.ok ? 'ready' : 'needs repair'}; journal: ${journalInvalid ? 'needs repair' : 'valid'}\n` +
+      'Choose reviewed operation:\n' +
+      '  1. Inspect only\n' +
+      `  2. Resume incomplete stages${incomplete ? ' (Recommended)' : ''}\n` +
+      `  3. Repair setup metadata${!report.ok || journalInvalid ? ' (Recommended)' : ''}\n` +
+      '  4. Update default profile selection\n' +
+      '  5. Cancel\n' +
+      `Selection [${journalInvalid ? '3' : incomplete ? '2' : '1'}]: `,
+  );
+  const rawChoice = normalized(await read());
+  const choice = rawChoice === '' ? (journalInvalid ? '3' : incomplete ? '2' : '1') : rawChoice;
+  if (choice === '5' || isCancel(choice)) {
+    host.terminal.writeOutput('Setup cancelled. No changes were made.\n');
+    return;
+  }
+  if (choice === '1') {
+    for (const check of report.checks) host.terminal.writeOutput(`${check.stage}: ${check.status}\n`);
+    host.terminal.writeOutput(`No changes made. Resume or repair: ${command}\n`);
+    return;
+  }
+  if (choice === '4') {
+    if (!(await confirmReviewedOperation(host, read, `Update only default profile selection to ${JSON.stringify(profileName)}.\nNo Service data or other configuration will change.`))) {
+      host.terminal.writeOutput('Update cancelled. No changes were made.\n');
+      return;
+    }
+    await host.filesystem.writeTextFileAtomic(
+      join(host.directories.configuration, 'default-profile'),
+      `${profileName}\n`,
+      { mode: 0o600 },
+    );
+    host.terminal.writeOutput('Default profile selection updated.\n');
+    return;
+  }
+  if (choice === '3') {
+    if (!(await confirmReviewedOperation(host, read, `Repair setup metadata for ${JSON.stringify(profileName)} from verified Doctor facts.\nNo profile, Store, database, Channel, Record, secret, or unrelated configuration will be deleted.`))) {
+      host.terminal.writeOutput('Repair cancelled. No changes were made.\n');
+      return;
+    }
+    if (!report.ok) {
+      const failure = report.checks.find((check) => check.status === 'failed');
+      throw new DatagramError(
+        failure?.code ?? 'setup.repair-required',
+        `Repair stopped safely; Service failed verification. Repair: ${command}`,
+        400,
+      );
+    }
+    journal = { ...clearFailure(journal), core: 'verified' };
+    await saveProgress(host, profilePath, profile, journal);
+    host.terminal.writeOutput(`Setup metadata repaired. Inspect: bunx prosto-datagram doctor --profile ${JSON.stringify(profileName)}\n`);
+    return;
+  }
+  if (choice !== '2') {
+    throw new DatagramError('input.invalid', 'Choose 1, 2, 3, 4, or 5.', 400);
+  }
+  if (journalInvalid) {
+    throw new DatagramError(
+      'setup.journal-invalid',
+      `Resume stopped safely; setup journal needs reviewed repair. Repair: ${command}`,
+      400,
+    );
+  }
+  if (!(await confirmReviewedOperation(host, read, `Resume profile ${JSON.stringify(profileName)} from last verified stage.\nCore will not be repeated. Completed optional effects will not be repeated.`))) {
+    host.terminal.writeOutput('Resume cancelled. No changes were made.\n');
+    return;
+  }
+  if (!report.ok) {
+    throw new DatagramError('setup.repair-required', `Resume stopped safely; Service needs repair. Repair: ${command}`, 400);
+  }
+  if (journal.core !== 'verified') {
+    journal = { ...clearFailure(journal), core: 'verified' };
+    await saveProgress(host, profilePath, profile, journal);
+  }
+  if (isUncertainStarter(journal.starter)) {
+    throw new DatagramError(
+      'setup.effect-uncertain',
+      `Previous Action may have committed. It was not repeated. Inspect Service before repair. Repair: ${command}`,
+      409,
+    );
+  }
+  if (journal.starter.status !== 'complete') {
+    const answers = await collectStarterAnswers(host, read, journal.starter);
+    if (answers.kind === 'cancelled') {
+      host.terminal.writeOutput(`Core setup remains ready. Resume: ${command}\n`);
+      return;
+    }
+    const runtime = await host.openRuntime({ databasePath: profile.service.databasePath });
+    let starter: JournalStarterProgress = journal.starter;
+    try {
+      if (starter.status === 'pending') {
+        journal = { ...clearFailure(journal), starter: { status: 'channel-applying' } };
+        await saveSetupJournal(host, journal);
+        const receipt = await runtime.app.executeAction(profile.identity.personId, 'cli', 'channel.create', {
+          title: answers.title,
+          typeId: 'table',
+        });
+        starter = {
+          status: 'channel-created',
+          channelId: actionSubjectId(receipt, 'channel.create'),
+          channelOperationId: receipt.operationId,
+        };
+        journal = { ...journal, starter };
+        await saveProgress(host, profilePath, profile, journal);
+      }
+      if (starter.status === 'channel-created') {
+        journal = { ...journal, starter: { status: 'field-applying', channelId: starter.channelId, channelOperationId: starter.channelOperationId } };
+        await saveSetupJournal(host, journal);
+        const receipt = await runtime.app.executeAction(profile.identity.personId, 'cli', 'table.field.add', {
+          channelId: starter.channelId,
+          key: 'name', label: 'Name', required: true, type: 'text', unique: true,
+        });
+        starter = { ...starter, status: 'field-created', fieldOperationId: receipt.operationId };
+        journal = { ...journal, starter };
+        await saveProgress(host, profilePath, profile, journal);
+      }
+      if (starter.status === 'field-created') {
+        journal = { ...journal, starter: { status: 'record-applying', channelId: starter.channelId, channelOperationId: starter.channelOperationId, fieldOperationId: starter.fieldOperationId } };
+        await saveSetupJournal(host, journal);
+        const receipt = await runtime.app.executeAction(profile.identity.personId, 'cli', 'table.record.create', {
+          channelId: starter.channelId,
+          values: { name: answers.firstItem },
+        });
+        const completed: StarterProgress = {
+          ...starter,
+          status: 'complete',
+          recordOperationId: receipt.operationId,
+        };
+        starter = completed;
+        journal = { ...clearFailure(journal), starter: completed };
+        await saveProgress(host, profilePath, profile, journal);
+      }
+    } catch {
+      journal = {
+        ...journal,
+        starter,
+        failure: { stage: 'starter', code: 'setup.starter-failed' },
+      };
+      await saveSetupJournal(host, journal);
+      throw new DatagramError('setup.starter-failed', `Starter setup failed. Core remains ready. Resume: ${command}`, 500);
+    } finally {
+      await runtime.close();
+    }
+  }
+  if (journal.durableInstall === 'pending') {
+    host.terminal.writeOutput(
+      `Resume optional durable command install: ${durableInstallCommand}\nRun it now? [y/N]: `,
+    );
+    const answer = normalized(await read()).toLowerCase();
+    if (answer === 'y' || answer === 'yes') {
+      const installed = await host.runExternalCommand({
+        command: 'bun',
+        args: ['install', '--global', 'prosto-datagram'],
+      });
+      if (installed.exitCode === 0) {
+        journal = { ...clearFailure(journal), durableInstall: 'verified' };
+        await saveSetupJournal(host, journal);
+      } else {
+        journal = {
+          ...journal,
+          failure: { stage: 'durable-install', code: 'setup.durable-install-failed' },
+        };
+        await saveSetupJournal(host, journal);
+        host.terminal.writeOutput(`Optional install remains pending. Resume: ${command}\n`);
+      }
+    } else {
+      host.terminal.writeOutput(`Optional install remains pending. Resume: ${command}\n`);
+    }
+  }
+  host.terminal.writeOutput(
+    journal.durableInstall === 'pending'
+      ? `Core setup complete. Optional install remains pending. Resume: ${command}\n`
+      : `Setup complete. Profile ${JSON.stringify(profileName)} is ready.\n`,
+  );
+}
+
+export async function runGuidedInit(host: CliHost, requestedProfileName?: string): Promise<void> {
   if (!host.terminal.inputIsInteractive || !host.terminal.outputIsInteractive) {
     throw new DatagramError(
       'setup.interactive-required',
@@ -258,11 +540,16 @@ export async function runGuidedInit(host: CliHost): Promise<void> {
     );
   }
 
+  const read = createAnswerReader(host);
+  const existingName = await existingSetupName(host, requestedProfileName);
+  if (existingName !== undefined) {
+    await runExistingSetup(host, read, existingName);
+    return;
+  }
   host.terminal.writeOutput(
     'Set up Prosto.Datagram\nType Back to revisit a choice or Cancel to exit before Apply.\n',
   );
-  const read = createAnswerReader(host);
-  const result = await collectAnswers(host, read);
+  const result = await collectAnswers(host, read, requestedProfileName);
   if (result.kind === 'cancelled') {
     host.terminal.writeOutput('Setup cancelled. No changes were made.\n');
     return;
@@ -277,10 +564,29 @@ export async function runGuidedInit(host: CliHost): Promise<void> {
   host.terminal.writeOutput('[1/3] Creating Local Service\n');
   await host.filesystem.makeDirectory(profileDirectory, { recursive: true });
   await host.filesystem.makeDirectory(dataDirectory, { recursive: true });
-  const runtime = await host.createRuntime({
-    databasePath,
-    ownerDisplayName: result.displayName,
-  });
+  let journal: SetupJournal = {
+    version: 1,
+    profileName: result.profileName,
+    core: 'planned',
+    starter: { status: 'pending' },
+    durableInstall: result.durableInstall === undefined ? 'skipped' : 'pending',
+  };
+  await saveSetupJournal(host, journal);
+  let runtime;
+  try {
+    runtime = await host.createRuntime({
+      databasePath,
+      ownerDisplayName: result.displayName,
+    });
+  } catch {
+    journal = { ...journal, failure: { stage: 'core', code: 'setup.core-failed' } };
+    await saveSetupJournal(host, journal);
+    throw new DatagramError(
+      'setup.core-failed',
+      `Core setup failed. Resume: ${resumeCommand(result.profileName)}`,
+      500,
+    );
+  }
   let firstChannelId: string | undefined;
   try {
     host.terminal.writeOutput('[2/3] Saving default Service profile\n');
@@ -295,7 +601,9 @@ export async function runGuidedInit(host: CliHost): Promise<void> {
       ...(existingProfile?.setup === undefined ? {} : { setup: existingProfile.setup }),
     };
     await saveProfile(host, profilePath, profile);
-    await host.filesystem.writeTextFile(defaultProfilePath, `${result.profileName}\n`, { mode: 0o600 });
+    await host.filesystem.writeTextFileAtomic(defaultProfilePath, `${result.profileName}\n`, { mode: 0o600 });
+    journal = { ...journal, core: 'applied' };
+    await saveSetupJournal(host, journal);
 
     host.terminal.writeOutput('[3/3] Verifying profile, Store, runtime, and identity\n');
     const verification = await checkService(host, result.profileName, runtime);
@@ -313,19 +621,23 @@ export async function runGuidedInit(host: CliHost): Promise<void> {
     let starter = profile.setup?.starter ?? ({ status: 'pending' } as const);
     profile = { ...profile, setup: { core: 'verified', starter } };
     await saveProfile(host, profilePath, profile);
+    journal = { ...journal, core: 'verified', starter };
+    await saveSetupJournal(host, journal);
 
     if (starter.status !== 'complete') {
       const answers = await collectStarterAnswers(host, read, starter);
       if (answers.kind === 'cancelled') {
         host.terminal.writeOutput(
           'Core setup complete. Your first Table is still pending.\n' +
-            'Resume: bunx prosto-datagram init\n',
+            `Resume: ${resumeCommand(result.profileName)}\n`,
         );
         return;
       }
 
       try {
         if (starter.status === 'pending') {
+          journal = { ...journal, starter: { status: 'channel-applying' } };
+          await saveSetupJournal(host, journal);
           const receipt = await runtime.app.executeAction(runtime.owner.id, 'cli', 'channel.create', {
             title: answers.title,
             typeId: 'table',
@@ -337,9 +649,20 @@ export async function runGuidedInit(host: CliHost): Promise<void> {
           };
           profile = { ...profile, setup: { core: 'verified', starter } };
           await saveProfile(host, profilePath, profile);
+          journal = { ...journal, starter };
+          await saveSetupJournal(host, journal);
         }
 
         if (starter.status === 'channel-created') {
+          journal = {
+            ...journal,
+            starter: {
+              status: 'field-applying',
+              channelId: starter.channelId,
+              channelOperationId: starter.channelOperationId,
+            },
+          };
+          await saveSetupJournal(host, journal);
           const receipt = await runtime.app.executeAction(
             runtime.owner.id,
             'cli',
@@ -361,9 +684,21 @@ export async function runGuidedInit(host: CliHost): Promise<void> {
           };
           profile = { ...profile, setup: { core: 'verified', starter } };
           await saveProfile(host, profilePath, profile);
+          journal = { ...journal, starter };
+          await saveSetupJournal(host, journal);
         }
 
         if (starter.status === 'field-created') {
+          journal = {
+            ...journal,
+            starter: {
+              status: 'record-applying',
+              channelId: starter.channelId,
+              channelOperationId: starter.channelOperationId,
+              fieldOperationId: starter.fieldOperationId,
+            },
+          };
+          await saveSetupJournal(host, journal);
           const receipt = await runtime.app.executeAction(
             runtime.owner.id,
             'cli',
@@ -379,15 +714,23 @@ export async function runGuidedInit(host: CliHost): Promise<void> {
           };
           profile = { ...profile, setup: { core: 'verified', starter } };
           await saveProfile(host, profilePath, profile);
+          journal = { ...journal, starter };
+          await saveSetupJournal(host, journal);
         }
       } catch {
+        journal = {
+          ...journal,
+          starter,
+          failure: { stage: 'starter', code: 'setup.starter-failed' },
+        };
+        await saveSetupJournal(host, journal);
         host.terminal.writeOutput(
           'Starter Table setup failed. Core setup remains ready.\n' +
-            'Resume: bunx prosto-datagram init\n',
+            `Resume: ${resumeCommand(result.profileName)}\n`,
         );
         throw new DatagramError(
           'setup.starter-failed',
-          'Starter Table setup failed. Core setup remains ready. Run `bunx prosto-datagram init` to resume.',
+          `Starter Table setup failed. Core setup remains ready. Resume: ${resumeCommand(result.profileName)}`,
           500,
         );
       }
@@ -408,12 +751,24 @@ export async function runGuidedInit(host: CliHost): Promise<void> {
       });
       if (installed.exitCode === 0) {
         durableInstallStatus = `installed (${result.durableInstall.executablePaths.join(', ')})`;
+        journal = { ...clearFailure(journal), durableInstall: 'verified' };
       } else {
         durableInstallStatus = `pending (installer exit code ${installed.exitCode})`;
+        journal = {
+          ...journal,
+          durableInstall: 'pending',
+          failure: { stage: 'durable-install', code: 'setup.durable-install-failed' },
+        };
       }
     } catch {
       durableInstallStatus = 'pending (installer could not be started)';
+      journal = {
+        ...journal,
+        durableInstall: 'pending',
+        failure: { stage: 'durable-install', code: 'setup.durable-install-failed' },
+      };
     }
+    await saveSetupJournal(host, journal);
     if (durableInstallStatus.startsWith('pending')) {
       host.terminal.writeOutput(
         `Optional global installation failed. Core Service remains ready.\nResume optional installation: ${durableInstallCommand}\n`,

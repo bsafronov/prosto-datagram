@@ -1,4 +1,4 @@
-import { access, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { access, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { homedir, platform } from 'node:os';
 import { join } from 'node:path';
 
@@ -23,6 +23,7 @@ export interface CliFileSystem {
   pathExists(path: string): Promise<boolean>;
   readTextFile(path: string): Promise<string>;
   writeTextFile(path: string, value: string, options?: { readonly mode?: number }): Promise<void>;
+  writeTextFileAtomic(path: string, value: string, options?: { readonly mode?: number }): Promise<void>;
   makeDirectory(path: string, options?: { readonly recursive?: boolean }): Promise<void>;
 }
 
@@ -109,6 +110,11 @@ export function createProcessCliHost(): CliHost {
       },
       readTextFile: (path) => readFile(path, 'utf8'),
       writeTextFile: (path, value, options) => writeFile(path, value, options),
+      writeTextFileAtomic: async (path, value, options) => {
+        const temporaryPath = `${path}.tmp-${process.pid}-${crypto.randomUUID()}`;
+        await writeFile(temporaryPath, value, options);
+        await rename(temporaryPath, path);
+      },
       makeDirectory: (path, options) => mkdir(path, options).then(() => undefined),
     },
     directories: resolvePlatformDirectories(platform(), homedir(), process.env),

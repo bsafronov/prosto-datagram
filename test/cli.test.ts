@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from 'bun:test';
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -67,6 +67,11 @@ function localSetupHost(
       pathExists,
       readTextFile: (path) => readFile(path, 'utf8'),
       writeTextFile: (path, value, options) => writeFile(path, value, options),
+      writeTextFileAtomic: async (path, value, options) => {
+        const temporaryPath = `${path}.tmp`;
+        await writeFile(temporaryPath, value, options);
+        await rename(temporaryPath, path);
+      },
       makeDirectory: (path, options) => mkdir(path, options).then(() => undefined),
     },
     directories: { configuration, data },
@@ -154,6 +159,7 @@ test('CLI execution uses injected host services without touching process configu
       pathExists: () => Promise.resolve(false),
       readTextFile: () => Promise.reject(new Error('unexpected filesystem read')),
       writeTextFile: () => Promise.reject(new Error('unexpected filesystem write')),
+      writeTextFileAtomic: () => Promise.reject(new Error('unexpected filesystem write')),
       makeDirectory: () => Promise.reject(new Error('unexpected directory creation')),
     },
     directories: {
@@ -220,6 +226,7 @@ test('guided init creates and verifies a named default Local Service', async () 
 
   const databasePath = join(data, 'profiles', 'personal', 'datagram.sqlite');
   const profilePath = join(configuration, 'profiles', 'personal.json');
+  const journalPath = join(configuration, 'setup-journals', 'personal.json');
   const profile = JSON.parse(await readFile(profilePath, 'utf8')) as {
     version: number;
     name: string;
@@ -257,6 +264,23 @@ test('guided init creates and verifies a named default Local Service', async () 
     },
   });
   expect(await readFile(join(configuration, 'default-profile'), 'utf8')).toBe('personal\n');
+  const journal = JSON.parse(await readFile(journalPath, 'utf8')) as Record<string, unknown>;
+  expect(journal).toMatchObject({
+    version: 1,
+    profileName: 'personal',
+    core: 'verified',
+    starter: {
+      status: 'complete',
+      channelId: starter.channelId,
+      channelOperationId: starter.channelOperationId,
+      fieldOperationId: starter.fieldOperationId,
+      recordOperationId: starter.recordOperationId,
+    },
+    durableInstall: 'skipped',
+  });
+  expect(JSON.stringify(journal)).not.toContain('Ada Lovelace');
+  expect(JSON.stringify(journal)).not.toContain('Launch plan');
+  expect(JSON.stringify(journal)).not.toContain('Ship it');
   expect(await pathExists(databasePath)).toBe(true);
 
   runtime = await createRuntime({ databasePath });
@@ -359,6 +383,36 @@ test('optional installer failure preserves core setup and gives exact resume com
   expect(rendered).toContain('Resume optional installation: bun install --global prosto-datagram');
   expect(rendered).toContain('Durable commands: pending (installer exit code 23)');
   expect(rendered).not.toContain('sensitive installer details');
+  const journalPath = join(configuration, 'setup-journals', 'personal.json');
+  const journal = JSON.parse(await readFile(journalPath, 'utf8')) as {
+    core: string;
+    durableInstall: string;
+    failure: { stage: string; code: string };
+  };
+  expect(journal).toMatchObject({
+    core: 'verified',
+    durableInstall: 'pending',
+    failure: { stage: 'durable-install', code: 'setup.durable-install-failed' },
+  });
+  expect(JSON.stringify(journal)).not.toContain('sensitive installer details');
+
+  const resumedOutput: string[] = [];
+  const resumedRequests: Parameters<CliHost['runExternalCommand']>[0][] = [];
+  await runCli(
+    ['init', '--profile', 'personal'],
+    localSetupHost(configuration, data, ['', '', 'yes'], resumedOutput, (request) => {
+      resumedRequests.push(request);
+      return Promise.resolve({ exitCode: 0, stdout: '', stderr: '' });
+    }),
+  );
+  expect(resumedRequests).toEqual([
+    { command: 'bun', args: ['install', '--global', 'prosto-datagram'] },
+  ]);
+  expect(JSON.parse(await readFile(journalPath, 'utf8'))).toMatchObject({
+    core: 'verified',
+    durableInstall: 'verified',
+  });
+  expect(resumedOutput.join('')).toContain('Core will not be repeated.');
 });
 
 test('ordinary commands target the default or explicitly selected Service profile', async () => {
@@ -522,7 +576,7 @@ test('doctor gives a stable redacted profile failure and safe verbose context', 
   expect(rendered).toContain('Code: doctor.profile-unreadable');
   expect(rendered).toContain('Stage: profile');
   expect(rendered).toContain(
-    'Recovery: Run `bunx prosto-datagram init` to repair profile "broken".',
+    'Recovery: Run `bunx prosto-datagram init --profile "broken"` to repair this profile.',
   );
   expect(rendered).toContain('causeCode="profile.invalid"');
   expect(rendered).not.toContain('do-not-print');
@@ -689,7 +743,7 @@ test('guided init preserves verified core setup and resumes a failed starter rec
     localSetupHost(
       configuration,
       data,
-      ['', 'personal', 'Ada Lovelace', '', '', 'Ship it'],
+      ['', '', 'Ship it'],
       resumedOutput,
     ),
   );
@@ -716,6 +770,138 @@ test('guided init preserves verified core setup and resumes a failed starter rec
   ]);
   expect(JSON.stringify(completedProfile)).not.toContain('Ship it');
   expect(JSON.stringify(completedProfile)).not.toContain('Launch plan');
+});
+
+test('rerunning complete setup inspects without repeating core or optional effects', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'datagram-guided-rerun-complete-'));
+  temporaryDirectories.push(directory);
+  const configuration = join(directory, 'configuration');
+  const data = join(directory, 'data');
+  await runCli(
+    ['init'],
+    localSetupHost(
+      configuration,
+      data,
+      ['', 'personal', 'Operator', '', '', 'Plans', 'First'],
+      [],
+    ),
+  );
+  const profilePath = join(configuration, 'profiles', 'personal.json');
+  const journalPath = join(configuration, 'setup-journals', 'personal.json');
+  const beforeProfile = await readFile(profilePath, 'utf8');
+  const beforeJournal = await readFile(journalPath, 'utf8');
+  const output: string[] = [];
+  const base = localSetupHost(configuration, data, ['1'], output);
+  const host: CliHost = {
+    ...base,
+    createRuntime: () => Promise.reject(new Error('complete setup must not bootstrap again')),
+    runExternalCommand: () => Promise.reject(new Error('completed optional effects must not repeat')),
+  };
+
+  await runCli(['init', '--profile', 'personal'], host);
+
+  expect(output.join('')).toContain('Existing setup detected');
+  expect(output.join('')).toContain('Inspect only');
+  expect(output.join('')).toContain('No changes made.');
+  expect(await readFile(profilePath, 'utf8')).toBe(beforeProfile);
+  expect(await readFile(journalPath, 'utf8')).toBe(beforeJournal);
+});
+
+test('planned setup resumes safely when interruption happened before profile persistence', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'datagram-guided-planned-resume-'));
+  temporaryDirectories.push(directory);
+  const configuration = join(directory, 'configuration');
+  const data = join(directory, 'data');
+  const base = localSetupHost(
+    configuration,
+    data,
+    ['', 'personal', 'Operator', '', ''],
+    [],
+  );
+  await expect(
+    runCli(['init'], {
+      ...base,
+      createRuntime: () => Promise.reject(new Error('interrupted before core applied')),
+    }),
+  ).rejects.toMatchObject({
+    code: 'setup.core-failed',
+    message: expect.stringContaining('init --profile "personal"'),
+  });
+  expect(await pathExists(join(configuration, 'profiles', 'personal.json'))).toBe(false);
+  expect(
+    JSON.parse(await readFile(join(configuration, 'setup-journals', 'personal.json'), 'utf8')),
+  ).toMatchObject({ core: 'planned', failure: { code: 'setup.core-failed' } });
+
+  await runCli(
+    ['init', '--profile', 'personal'],
+    localSetupHost(
+      configuration,
+      data,
+      ['', '', 'Operator', '', '', 'Plans', 'First'],
+      [],
+    ),
+  );
+  expect(
+    JSON.parse(await readFile(join(configuration, 'setup-journals', 'personal.json'), 'utf8')),
+  ).toMatchObject({ core: 'verified', starter: { status: 'complete' } });
+});
+
+test('uncertain Action commit is never repeated automatically', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'datagram-guided-uncertain-'));
+  temporaryDirectories.push(directory);
+  const configuration = join(directory, 'configuration');
+  const data = join(directory, 'data');
+  await runCli(
+    ['init'],
+    localSetupHost(
+      configuration,
+      data,
+      ['', 'personal', 'Operator', '', '', 'Plans', 'First'],
+      [],
+    ),
+  );
+  const journalPath = join(configuration, 'setup-journals', 'personal.json');
+  const journal = JSON.parse(await readFile(journalPath, 'utf8')) as {
+    starter: {
+      channelId: string;
+      channelOperationId: string;
+      fieldOperationId: string;
+    };
+  } & Record<string, unknown>;
+  await writeFile(
+    journalPath,
+    `${JSON.stringify({
+      ...journal,
+      starter: {
+        status: 'record-applying',
+        channelId: journal.starter.channelId,
+        channelOperationId: journal.starter.channelOperationId,
+        fieldOperationId: journal.starter.fieldOperationId,
+      },
+    })}\n`,
+  );
+  const profile = JSON.parse(
+    await readFile(join(configuration, 'profiles', 'personal.json'), 'utf8'),
+  ) as { service: { databasePath: string }; setup: { starter: { channelId: string } } };
+  runtime = await createRuntime({ databasePath: profile.service.databasePath });
+  const before = await runtime.store.listOperations(profile.setup.starter.channelId);
+  await runtime.close();
+  runtime = undefined;
+
+  await expect(
+    runCli(
+      ['init', '--profile', 'personal'],
+      localSetupHost(configuration, data, ['', ''], []),
+    ),
+  ).rejects.toMatchObject({
+    code: 'setup.effect-uncertain',
+    message: expect.stringContaining('was not repeated'),
+  });
+
+  runtime = await createRuntime({ databasePath: profile.service.databasePath });
+  expect(await runtime.store.listOperations(profile.setup.starter.channelId)).toHaveLength(
+    before.length,
+  );
 });
 
 test('guided init cancellation before Apply leaves no profile or SQLite data', async () => {

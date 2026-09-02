@@ -6,7 +6,7 @@ import { runGuidedInit } from './init';
 import { resolveServiceTarget } from './profiles';
 
 export const cliUsage = `Usage:
-  datagram init
+  datagram init [--profile NAME]
   datagram doctor --profile NAME [--verbose]
   datagram actions|queries [--type-id ID --type-version VERSION] [--profile NAME | --db PATH]
   datagram action NAME [--type-id ID --type-version VERSION] [--input JSON] [--profile NAME | --actor ID --db PATH]
@@ -96,7 +96,7 @@ export async function runCli(
   }
 
   if (command === 'init') {
-    await runGuidedInit(host);
+    await runGuidedInit(host, option(args, '--profile'));
     return;
   }
 
