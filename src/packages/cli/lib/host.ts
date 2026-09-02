@@ -63,15 +63,21 @@ export interface CliHost {
   setExitCode(code: number): void;
 }
 
-function processDirectories(): CliPlatformDirectories {
-  const homeDirectory = homedir();
-  if (platform() === 'darwin') {
+export function resolvePlatformDirectories(
+  operatingSystem: NodeJS.Platform,
+  homeDirectory: string,
+  environment: Readonly<Record<string, string | undefined>>,
+): CliPlatformDirectories {
+  if (operatingSystem === 'darwin') {
     const applicationSupport = join(homeDirectory, 'Library', 'Application Support', 'Prosto.Datagram');
     return { configuration: applicationSupport, data: applicationSupport };
   }
+  if (operatingSystem !== 'linux') {
+    throw new Error(`Unsupported operating system: ${operatingSystem}`);
+  }
   return {
-    configuration: join(process.env.XDG_CONFIG_HOME ?? join(homeDirectory, '.config'), 'prosto-datagram'),
-    data: join(process.env.XDG_DATA_HOME ?? join(homeDirectory, '.local', 'share'), 'prosto-datagram'),
+    configuration: join(environment.XDG_CONFIG_HOME ?? join(homeDirectory, '.config'), 'prosto-datagram'),
+    data: join(environment.XDG_DATA_HOME ?? join(homeDirectory, '.local', 'share'), 'prosto-datagram'),
   };
 }
 
@@ -98,7 +104,7 @@ export function createProcessCliHost(): CliHost {
       writeTextFile: (path, value, options) => writeFile(path, value, options),
       makeDirectory: (path, options) => mkdir(path, options).then(() => undefined),
     },
-    directories: processDirectories(),
+    directories: resolvePlatformDirectories(platform(), homedir(), process.env),
     currentDirectory: process.cwd(),
     runExternalCommand: async ({ command, args = [], cwd, environment }) => {
       const child = Bun.spawn([command, ...args], {

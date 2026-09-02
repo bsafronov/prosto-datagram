@@ -1,9 +1,10 @@
 import { DatagramError, toPublicError } from '../../application/errors';
 import type { ChannelTypeContractSelector } from '../../application/contracts';
 import { createProcessCliHost, type CliHost } from './host';
+import { runGuidedInit } from './init';
 
 export const cliUsage = `Usage:
-  datagram init [--db PATH]
+  datagram init
   datagram actions|queries [--type-id ID --type-version VERSION] [--db PATH]
   datagram action NAME [--type-id ID --type-version VERSION] [--input JSON] [--actor ID] [--db PATH]
   datagram query NAME [--type-id ID --type-version VERSION] [--input JSON] [--actor ID] [--db PATH]
@@ -82,6 +83,11 @@ export async function runCli(
     return;
   }
 
+  if (command === 'init') {
+    await runGuidedInit(host);
+    return;
+  }
+
   const databasePath = option(args, '--db');
   const configuredDatabasePath = databasePath ?? host.environment.get('DATAGRAM_DB');
   const runtime = await host.createRuntime({
@@ -92,12 +98,6 @@ export async function runCli(
       option(args, '--actor') ?? host.environment.get('DATAGRAM_ACTOR_ID') ?? runtime.owner.id;
     const selector = channelType(args);
     switch (command) {
-      case 'init':
-        output(host, {
-          databasePath: configuredDatabasePath ?? 'datagram.sqlite',
-          owner: runtime.owner,
-        });
-        break;
       case 'actions':
         output(host, runtime.app.actions.catalog(selector));
         break;

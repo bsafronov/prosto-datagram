@@ -1,9 +1,14 @@
 import { afterEach, expect, test } from 'bun:test';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { cliUsage, runCli, type CliHost } from '../src/packages/cli';
+import {
+  cliUsage,
+  resolvePlatformDirectories,
+  runCli,
+  type CliHost,
+} from '../src/packages/cli';
 import { createRuntime, type DatagramRuntime } from '../src/packages/runtime';
 
 const temporaryDirectories: string[] = [];
@@ -21,6 +26,55 @@ async function cli(args: readonly string[]) {
     new Response(child.stdout).text(),
   ]);
   return { exitCode, stderr, stdout };
+}
+
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await access(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function scriptedInput(values: readonly string[]): AsyncIterable<string> {
+  return {
+    async *[Symbol.asyncIterator]() {
+      for (const value of values) yield `${value}\n`;
+    },
+  };
+}
+
+function localSetupHost(
+  configuration: string,
+  data: string,
+  answers: readonly string[],
+  output: string[],
+): CliHost {
+  return {
+    terminal: {
+      input: scriptedInput(answers),
+      inputIsInteractive: true,
+      outputIsInteractive: true,
+      writeOutput: (value) => output.push(value),
+      writeError: () => undefined,
+    },
+    environment: { get: () => undefined },
+    filesystem: {
+      pathExists,
+      readTextFile: (path) => readFile(path, 'utf8'),
+      writeTextFile: (path, value, options) => writeFile(path, value, options),
+      makeDirectory: (path, options) => mkdir(path, options).then(() => undefined),
+    },
+    directories: { configuration, data },
+    currentDirectory: '/unrelated/current-directory',
+    runExternalCommand: () => Promise.reject(new Error('unexpected external command')),
+    createRuntime,
+    startHttpServer: () => Promise.reject(new Error('unexpected HTTP server')),
+    onTermination: () => undefined,
+    exit: () => undefined,
+    setExitCode: () => undefined,
+  };
 }
 
 afterEach(async () => {
@@ -91,15 +145,12 @@ test('CLI execution uses injected host services without touching process configu
   };
 
   await runCli(['--help'], host);
-  await runCli(['init'], host);
+  await runCli(['actions'], host);
   await runCli(['serve', '--port', '4310', '--db', '/injected/server.sqlite'], host);
   await terminationHandler?.();
 
   expect(output[0]).toBe(cliUsage);
-  expect(JSON.parse(output[1] ?? '')).toEqual({
-    databasePath: '/injected/data/datagram.sqlite',
-    owner: injectedRuntime.owner,
-  });
+  expect(JSON.parse(output[1] ?? '')).toEqual(injectedRuntime.app.actions.catalog());
   expect(runtimeOptions).toEqual([{ databasePath: '/injected/data/datagram.sqlite' }]);
   expect(serverOptions).toEqual([{ databasePath: '/injected/server.sqlite', port: 4310 }]);
   expect(errors).toEqual([
@@ -107,6 +158,116 @@ test('CLI execution uses injected host services without touching process configu
   ]);
   expect(serverStopped).toBe(true);
   expect(exitCodes).toEqual([0]);
+});
+
+test('guided init creates and verifies a named default Local Service', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'datagram-guided-init-'));
+  temporaryDirectories.push(directory);
+  const configuration = join(directory, 'configuration');
+  const data = join(directory, 'data');
+  const output: string[] = [];
+  const host = localSetupHost(
+    configuration,
+    data,
+    ['', 'discarded', 'Back', 'personal', 'Ada Lovelace', ''],
+    output,
+  );
+
+  await runCli(['init'], host);
+
+  const databasePath = join(data, 'profiles', 'personal', 'datagram.sqlite');
+  const profilePath = join(configuration, 'profiles', 'personal.json');
+  const profile = JSON.parse(await readFile(profilePath, 'utf8')) as {
+    version: number;
+    name: string;
+    service: { kind: string; databasePath: string };
+    identity: { displayName: string; personId: string };
+  };
+  expect(profile).toEqual({
+    version: 1,
+    name: 'personal',
+    service: { kind: 'local', databasePath },
+    identity: {
+      displayName: 'Ada Lovelace',
+      personId: expect.stringMatching(/^person_/),
+    },
+  });
+  expect(await readFile(join(configuration, 'default-profile'), 'utf8')).toBe('personal\n');
+  expect(await pathExists(databasePath)).toBe(true);
+
+  runtime = await createRuntime({ databasePath });
+  expect(runtime.owner).toMatchObject({
+    displayName: 'Ada Lovelace',
+    id: profile.identity.personId,
+    isOperator: true,
+  });
+  const rendered = output.join('');
+  expect(rendered).toContain('Use on this machine (Recommended)');
+  expect(rendered).toContain('Type Back');
+  expect(rendered).toContain('[1/3] Creating Local Service');
+  expect(rendered).toContain('[3/3] Verifying profile, Store, runtime, and identity');
+  expect(rendered).toContain(`Configuration: ${profilePath}`);
+  expect(rendered).toContain(`SQLite data: ${databasePath}`);
+  expect(rendered).toContain(
+    `Next: bunx prosto-datagram actions --db ${JSON.stringify(databasePath)}`,
+  );
+});
+
+test('guided init cancellation before Apply leaves no profile or SQLite data', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'datagram-guided-cancel-'));
+  temporaryDirectories.push(directory);
+  const configuration = join(directory, 'configuration');
+  const data = join(directory, 'data');
+  const output: string[] = [];
+
+  await runCli(
+    ['init'],
+    localSetupHost(configuration, data, ['', 'local', 'Grace Hopper', 'Cancel'], output),
+  );
+
+  expect(await pathExists(configuration)).toBe(false);
+  expect(await pathExists(data)).toBe(false);
+  expect(output.join('')).toContain('Setup cancelled. No changes were made.');
+});
+
+test('guided init rejects non-interactive input with recovery guidance', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'datagram-guided-non-tty-'));
+  temporaryDirectories.push(directory);
+  const host = localSetupHost(join(directory, 'configuration'), join(directory, 'data'), [], []);
+  Object.defineProperty(host.terminal, 'inputIsInteractive', { value: false });
+
+  expect(runCli(['init'], host)).rejects.toMatchObject({
+    code: 'setup.interactive-required',
+    message: expect.stringContaining('bunx prosto-datagram init'),
+  });
+  expect(await pathExists(join(directory, 'configuration'))).toBe(false);
+  expect(await pathExists(join(directory, 'data'))).toBe(false);
+
+  const executable = await cli(['init']);
+  expect(executable.exitCode).toBe(1);
+  expect(JSON.parse(executable.stderr)).toEqual({
+    error: {
+      code: 'setup.interactive-required',
+      message:
+        '`datagram init` requires an interactive terminal. Open a terminal and run `bunx prosto-datagram init`.',
+    },
+  });
+});
+
+test('platform directories follow macOS and Linux user conventions', () => {
+  expect(resolvePlatformDirectories('darwin', '/Users/ada', {})).toEqual({
+    configuration: '/Users/ada/Library/Application Support/Prosto.Datagram',
+    data: '/Users/ada/Library/Application Support/Prosto.Datagram',
+  });
+  expect(
+    resolvePlatformDirectories('linux', '/home/ada', {
+      XDG_CONFIG_HOME: '/configuration',
+      XDG_DATA_HOME: '/data',
+    }),
+  ).toEqual({
+    configuration: '/configuration/prosto-datagram',
+    data: '/data/prosto-datagram',
+  });
 });
 
 test('CLI discovers and invokes shared contracts with trusted Query results', async () => {
