@@ -17,6 +17,7 @@ import {
   cliUsage,
   resolvePlatformDirectories,
   runCli,
+  type CredentialProvider,
   type CliHost,
 } from '../src/packages/cli';
 import { createRuntime, openRuntime, type DatagramRuntime } from '../src/packages/runtime';
@@ -419,6 +420,116 @@ test('guided team init stores references and verifies an external PostgreSQL Ser
   });
   expect(rerunOutput.join('')).toContain('Existing setup detected for profile "team".');
   expect(rerunOutput.join('')).toContain('No changes made.');
+});
+
+test('guided team init prefers native storage and persists only opaque provider references', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'datagram-guided-native-'));
+  temporaryDirectories.push(directory);
+  const configuration = join(directory, 'configuration');
+  const output: string[] = [];
+  const postgresSecret = ['postgres', 'native', 'marker'].join('-');
+  const connectionString = `postgres://operator:${postgresSecret}@localhost:5432/datagram?sslmode=disable`;
+  const storedSecrets: string[] = [];
+  const provider: CredentialProvider = {
+    kind: 'macos-keychain',
+    availability: () => Promise.resolve({ available: true }),
+    create: ({ account, secret }) => {
+      storedSecrets.push(secret);
+      return Promise.resolve({
+        kind: 'native',
+        provider: 'macos-keychain',
+        service: 'prosto-datagram',
+        account,
+      });
+    },
+    resolve: () => Promise.reject(new Error('unexpected resolve')),
+    update: () => Promise.reject(new Error('unexpected update')),
+  };
+  const base = localSetupHost(
+    configuration,
+    join(directory, 'data'),
+    ['2', 'team', 'Ada Operator', '', connectionString, '', '', 'yes'],
+    output,
+  );
+  const host: CliHost = {
+    ...base,
+    credentialProvider: provider,
+    probePostgres: () => Promise.resolve(),
+    checkPort: () => Promise.resolve(),
+    startServerService: (() =>
+      Promise.resolve({
+        runtime: {
+          deploymentOperator: {
+            id: 'person_native_operator',
+            displayName: 'Ada Operator',
+            isOperator: true,
+            createdAt: '2026-09-02T00:00:00.000Z',
+          },
+          close: () => Promise.resolve(),
+        },
+        server: { url: new URL('http://127.0.0.1:3100/'), stop: () => undefined },
+      })) as unknown as NonNullable<CliHost['startServerService']>,
+    request: () => Promise.resolve(new Response('{}', { status: 200 })),
+  };
+
+  await runCli(['init'], host);
+
+  const profileText = await readFile(join(configuration, 'profiles', 'team.json'), 'utf8');
+  const profile = JSON.parse(profileText) as Record<string, unknown>;
+  expect(profile).toMatchObject({
+    service: {
+      postgres: {
+        credential: {
+          kind: 'native',
+          provider: 'macos-keychain',
+          service: 'prosto-datagram',
+        },
+      },
+    },
+    identity: {
+      bearerCredential: {
+        kind: 'native',
+        provider: 'macos-keychain',
+        service: 'prosto-datagram',
+      },
+    },
+  });
+  expect(storedSecrets).toHaveLength(2);
+  expect(storedSecrets).toContain(connectionString);
+  expect(profileText).not.toContain(postgresSecret);
+  expect(profileText).not.toContain(storedSecrets[1] ?? 'missing bearer secret');
+  expect(output.join('')).not.toContain(postgresSecret);
+  expect(output.join('')).not.toContain(storedSecrets[1] ?? 'missing bearer secret');
+  expect(output.join('')).toContain('System credential store (macos-keychain) (Recommended)');
+  expect(await pathExists(join(configuration, 'secrets', 'team.json'))).toBe(false);
+});
+
+test('guided team init requires an explicit fallback when native storage is unavailable', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'datagram-guided-fallback-'));
+  temporaryDirectories.push(directory);
+  const configuration = join(directory, 'configuration');
+  const output: string[] = [];
+  const host: CliHost = {
+    ...localSetupHost(
+      configuration,
+      join(directory, 'data'),
+      ['2', 'team', 'Operator', 'cancel'],
+      output,
+    ),
+    credentialProvider: {
+      kind: 'linux-secret-service',
+      availability: () => Promise.resolve({ available: false, reason: 'No unlocked user collection.' }),
+      create: () => Promise.reject(new Error('unexpected create')),
+      resolve: () => Promise.reject(new Error('unexpected resolve')),
+      update: () => Promise.reject(new Error('unexpected update')),
+    },
+  };
+
+  await runCli(['init'], host);
+
+  expect(output.join('')).toContain('System credential store unavailable: No unlocked user collection.');
+  expect(output.join('')).toContain('Choose an explicit fallback');
+  expect(await pathExists(join(configuration, 'profiles', 'team.json'))).toBe(false);
 });
 
 test('guided team init reports PostgreSQL preflight failures without leaking the URL', async () => {

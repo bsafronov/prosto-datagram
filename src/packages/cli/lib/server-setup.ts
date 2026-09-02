@@ -3,10 +3,10 @@ import { isAbsolute, join } from 'node:path';
 import { DatagramError } from '../../application/errors';
 import type { ServerServiceOptions } from '../../server';
 import type { CliHost } from './host';
+import type { CredentialReference } from './credentials';
 import {
   parseProfile,
   profileNamePattern,
-  type CredentialReference,
   type ServerExposure,
   type ServerServiceProfile,
 } from './profiles';
@@ -18,9 +18,10 @@ interface Answers {
   readonly profileName: string;
   readonly displayName: string;
   readonly connectionString: string;
-  readonly postgresCredential: CredentialReference;
+  readonly credentialStorage: 'native' | 'file' | 'environment';
+  readonly postgresCredential?: CredentialReference;
   readonly bearerToken: string;
-  readonly bearerCredential: CredentialReference;
+  readonly bearerCredential?: CredentialReference;
   readonly secretPath?: string;
   readonly exposure: ServerExposure;
   readonly hostname: string;
@@ -102,25 +103,51 @@ async function collect(host: CliHost, read: ReadAnswer): Promise<Answers> {
     throw new DatagramError('setup.display-name-invalid', 'Enter 1-120 characters.', 400);
   }
   host.terminal.writeOutput(
-    '[4/8] Credentials\n  1. Permission-restricted secret file (Recommended)\n' +
-      '  2. Environment references (Advanced)\nSelection [1] (or Cancel): ',
+    '[4/8] Credentials\n',
   );
+  const nativeAvailability = host.credentialProvider === undefined
+    ? { available: false as const, reason: 'Native credential storage is unsupported on this platform.' }
+    : await host.credentialProvider.availability();
+  if (nativeAvailability.available) {
+    host.terminal.writeOutput(
+      `  1. System credential store (${host.credentialProvider?.kind}) (Recommended)\n` +
+        '  2. Permission-restricted secret file\n' +
+        '  3. Environment references (Advanced)\nSelection [1] (or Cancel): ',
+    );
+  } else {
+    host.terminal.writeOutput(
+      `  System credential store unavailable: ${nativeAvailability.reason}\n` +
+        'Choose an explicit fallback:\n' +
+        '  1. Permission-restricted secret file (Recommended fallback)\n' +
+        '  2. Environment references (Advanced)\nSelection [1] (or Cancel): ',
+    );
+  }
   const storage = trim(await read());
   if (isCancel(storage)) throw new DatagramError('setup.cancelled', 'Setup cancelled.', 400);
   let connectionString: string;
   let bearerToken: string;
-  let postgresCredential: CredentialReference;
-  let bearerCredential: CredentialReference;
+  let postgresCredential: CredentialReference | undefined;
+  let bearerCredential: CredentialReference | undefined;
   let secretPath: string | undefined;
-  if (!storage || storage === '1') {
+  let credentialStorage: Answers['credentialStorage'];
+  const nativeSelected = nativeAvailability.available && (!storage || storage === '1');
+  const fileSelected = nativeAvailability.available ? storage === '2' : !storage || storage === '1';
+  const environmentSelected = nativeAvailability.available ? storage === '3' : storage === '2';
+  if (nativeSelected || fileSelected) {
     host.terminal.writeOutput('Existing PostgreSQL URL (or Cancel): ');
     connectionString = trim(await read());
     if (isCancel(connectionString)) throw new DatagramError('setup.cancelled', 'Setup cancelled.', 400);
     bearerToken = crypto.randomUUID().replaceAll('-', '') + crypto.randomUUID().replaceAll('-', '');
-    secretPath = join(host.directories.configuration, 'secrets', `${profileName}.json`);
-    postgresCredential = { kind: 'file', path: secretPath, key: 'postgresUrl' };
-    bearerCredential = { kind: 'file', path: secretPath, key: 'bearerToken' };
-  } else if (storage === '2') {
+    if (nativeSelected) {
+      credentialStorage = 'native';
+    } else {
+      credentialStorage = 'file';
+      secretPath = join(host.directories.configuration, 'secrets', `${profileName}.json`);
+      postgresCredential = { kind: 'file', path: secretPath, key: 'postgresUrl' };
+      bearerCredential = { kind: 'file', path: secretPath, key: 'bearerToken' };
+    }
+  } else if (environmentSelected) {
+    credentialStorage = 'environment';
     const pg = await envSecret(host, read, 'PostgreSQL URL', 'DATAGRAM_POSTGRES_URL');
     const bearer = await envSecret(host, read, 'Operator bearer token', 'DATAGRAM_OPERATOR_TOKEN');
     connectionString = pg.value;
@@ -128,7 +155,11 @@ async function collect(host: CliHost, read: ReadAnswer): Promise<Answers> {
     postgresCredential = pg.reference;
     bearerCredential = bearer.reference;
   } else {
-    throw new DatagramError('setup.credential-choice-invalid', 'Choose 1 or 2.', 400);
+    throw new DatagramError(
+      'setup.credential-choice-invalid',
+      nativeAvailability.available ? 'Choose 1, 2, or 3.' : 'Choose 1 or 2.',
+      400,
+    );
   }
   postgresUrl(connectionString);
   host.terminal.writeOutput(
@@ -207,9 +238,10 @@ async function collect(host: CliHost, read: ReadAnswer): Promise<Answers> {
     profileName,
     displayName,
     connectionString,
-    postgresCredential,
+    credentialStorage,
+    ...(postgresCredential === undefined ? {} : { postgresCredential }),
     bearerToken,
-    bearerCredential,
+    ...(bearerCredential === undefined ? {} : { bearerCredential }),
     ...(secretPath ? { secretPath } : {}),
     exposure,
     hostname,
@@ -276,7 +308,7 @@ export async function runGuidedServerSetup(host: CliHost, read: ReadAnswer): Pro
       `  Profile: ${answers.profileName} (default)\n` +
       `  Deployment Operator: ${answers.displayName}\n` +
       `  Exposure: ${answers.exposure}; bind=${answers.hostname}:${answers.port}\n` +
-      `  Credentials: ${answers.postgresCredential.kind === 'file' ? 'permission-restricted secret file' : 'environment references (Advanced)'}\n` +
+      `  Credentials: ${answers.credentialStorage === 'native' ? `system credential store (${host.credentialProvider?.kind})` : answers.credentialStorage === 'file' ? 'permission-restricted secret file' : 'environment references (Advanced)'}\n` +
       'Apply this plan? [Y/n] (or Cancel): ',
   );
   const consent = trim(await read()).toLowerCase();
@@ -288,6 +320,25 @@ export async function runGuidedServerSetup(host: CliHost, read: ReadAnswer): Pro
     throw new DatagramError('setup.consent-invalid', 'Choose Y, n, or Cancel.', 400);
   }
   await host.filesystem.makeDirectory(join(host.directories.configuration, 'profiles'), { recursive: true });
+  let postgresCredential = answers.postgresCredential;
+  let bearerCredential = answers.bearerCredential;
+  if (answers.credentialStorage === 'native') {
+    const provider = capability(host.credentialProvider, 'credential.native-unavailable');
+    const accountPrefix = `${answers.profileName}:${crypto.randomUUID()}`;
+    postgresCredential = await provider.create({
+      account: `${accountPrefix}:postgres`,
+      label: `Prosto.Datagram ${answers.profileName} PostgreSQL`,
+      secret: answers.connectionString,
+    });
+    bearerCredential = await provider.create({
+      account: `${accountPrefix}:operator`,
+      label: `Prosto.Datagram ${answers.profileName} operator`,
+      secret: answers.bearerToken,
+    });
+  }
+  if (postgresCredential === undefined || bearerCredential === undefined) {
+    throw new DatagramError('credential.reference-missing', 'Credential references were not created.', 500);
+  }
   if (answers.secretPath) {
     const secret = `${JSON.stringify({ postgresUrl: answers.connectionString, bearerToken: answers.bearerToken })}\n`;
     if (host.filesystem.writePrivateTextFile) {
@@ -331,14 +382,14 @@ export async function runGuidedServerSetup(host: CliHost, read: ReadAnswer): Pro
         kind: 'server',
         infrastructure: { kind: 'external-postgres' },
         serviceKey,
-        postgres: { credential: answers.postgresCredential },
+        postgres: { credential: postgresCredential },
         bind: { exposure: answers.exposure, hostname: answers.hostname, port: answers.port },
         ...(answers.publicAccess ? { publicAccess: answers.publicAccess } : {}),
       },
       identity: {
         personId: started.runtime.deploymentOperator.id,
         displayName: started.runtime.deploymentOperator.displayName,
-        bearerCredential: answers.bearerCredential,
+        bearerCredential,
       },
     };
     await host.filesystem.writeTextFile(profilePath, `${JSON.stringify(profile, null, 2)}\n`, { mode: 0o600 });

@@ -1,13 +1,10 @@
 import { isAbsolute, join, resolve } from 'node:path';
 
 import { DatagramError } from '../../application/errors';
+import type { CredentialReference } from './credentials';
 import type { CliHost } from './host';
 
 export const profileNamePattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
-
-export type CredentialReference =
-  | { readonly kind: 'file'; readonly path: string; readonly key: string }
-  | { readonly kind: 'environment'; readonly name: string };
 
 export interface LocalServiceProfile {
   readonly version: 1;
@@ -108,6 +105,19 @@ export async function resolveCredential(
   host: CliHost,
   reference: CredentialReference,
 ): Promise<string> {
+  if (reference.kind === 'native') {
+    if (
+      host.credentialProvider === undefined ||
+      host.credentialProvider.kind !== reference.provider
+    ) {
+      throw new DatagramError(
+        'credential.native-unavailable',
+        'The native credential provider is unavailable on this host.',
+        400,
+      );
+    }
+    return host.credentialProvider.resolve(reference);
+  }
   if (reference.kind === 'environment') {
     const value = host.environment.get(reference.name);
     if (value) return value;
@@ -140,6 +150,17 @@ export async function resolveCredential(
 
 function isCredentialReference(value: unknown): value is CredentialReference {
   if (typeof value !== 'object' || value === null || !('kind' in value)) return false;
+  if (value.kind === 'native') {
+    return (
+      'provider' in value &&
+      ['macos-keychain', 'linux-secret-service'].includes(String(value.provider)) &&
+      'service' in value &&
+      value.service === 'prosto-datagram' &&
+      'account' in value &&
+      typeof value.account === 'string' &&
+      value.account.length > 0
+    );
+  }
   if (value.kind === 'environment') {
     return (
       'name' in value &&

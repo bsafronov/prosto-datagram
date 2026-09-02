@@ -17,6 +17,10 @@ import {
   type ServerOptions,
   type ServerServiceOptions,
 } from '../../server';
+import {
+  createNativeCredentialProvider,
+} from './credentials';
+import type { CredentialProvider } from './credentials';
 
 export interface CliTerminal {
   readonly input: AsyncIterable<string | Uint8Array>;
@@ -45,6 +49,7 @@ export interface ExternalCommandRequest {
   readonly args?: readonly string[];
   readonly cwd?: string;
   readonly environment?: Readonly<Record<string, string | undefined>>;
+  readonly stdin?: string;
 }
 
 export interface ExternalCommandResult {
@@ -70,6 +75,7 @@ export interface CliHost {
   readonly filesystem: CliFileSystem;
   readonly directories: CliPlatformDirectories;
   readonly currentDirectory: string;
+  readonly credentialProvider?: CredentialProvider;
   runExternalCommand(request: ExternalCommandRequest): Promise<ExternalCommandResult>;
   createRuntime(options?: RuntimeOptions): Promise<DatagramRuntime>;
   openRuntime(options?: Pick<RuntimeOptions, 'databasePath'>): Promise<OpenDatagramRuntime>;
@@ -102,6 +108,34 @@ export function resolvePlatformDirectories(
 }
 
 export function createProcessCliHost(): CliHost {
+  const runExternalCommand: CliHost['runExternalCommand'] = async ({
+    command,
+    args = [],
+    cwd,
+    environment,
+    stdin,
+  }) => {
+    const child = Bun.spawn([command, ...args], {
+      ...(cwd === undefined ? {} : { cwd }),
+      env: environment === undefined ? process.env : { ...process.env, ...environment },
+      stderr: 'pipe',
+      stdin: stdin === undefined ? 'ignore' : 'pipe',
+      stdout: 'pipe',
+    });
+    if (stdin !== undefined) {
+      const childInput = child.stdin;
+      if (childInput === undefined) throw new Error('External command stdin is unavailable');
+      childInput.write(stdin);
+      childInput.end();
+    }
+    const [exitCode, stderr, stdout] = await Promise.all([
+      child.exited,
+      new Response(child.stderr).text(),
+      new Response(child.stdout).text(),
+    ]);
+    return { exitCode, stderr, stdout };
+  };
+  const credentialProvider = createNativeCredentialProvider(platform(), runExternalCommand);
   return {
     terminal: {
       input: process.stdin,
@@ -154,21 +188,8 @@ export function createProcessCliHost(): CliHost {
     },
     directories: resolvePlatformDirectories(platform(), homedir(), process.env),
     currentDirectory: process.cwd(),
-    runExternalCommand: async ({ command, args = [], cwd, environment }) => {
-      const child = Bun.spawn([command, ...args], {
-        ...(cwd === undefined ? {} : { cwd }),
-        env: environment === undefined ? process.env : { ...process.env, ...environment },
-        stderr: 'pipe',
-        stdin: 'ignore',
-        stdout: 'pipe',
-      });
-      const [exitCode, stderr, stdout] = await Promise.all([
-        child.exited,
-        new Response(child.stderr).text(),
-        new Response(child.stdout).text(),
-      ]);
-      return { exitCode, stderr, stdout };
-    },
+    runExternalCommand,
+    ...(credentialProvider === undefined ? {} : { credentialProvider }),
     createRuntime,
     openRuntime,
     startHttpServer,

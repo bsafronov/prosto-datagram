@@ -10,3 +10,10 @@ export {
   type ExternalCommandRequest,
   type ExternalCommandResult,
 } from './lib/host';
+export type {
+  CredentialProvider,
+  CredentialProviderAvailability,
+  CredentialReference,
+  NativeCredentialReference,
+  NativeCredentialProviderKind,
+} from './credentials';
