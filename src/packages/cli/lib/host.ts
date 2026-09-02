@@ -1,6 +1,8 @@
-import { access, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { access, chmod, lstat, mkdir, open, readFile, rename, stat, writeFile } from 'node:fs/promises';
+import { createServer } from 'node:net';
 import { homedir, platform } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { SQL } from 'bun';
 
 import {
   createRuntime,
@@ -9,7 +11,12 @@ import {
   type OpenDatagramRuntime,
   type RuntimeOptions,
 } from '../../runtime';
-import { startHttpServer, type ServerOptions } from '../../server';
+import {
+  startHttpServer,
+  startServerService,
+  type ServerOptions,
+  type ServerServiceOptions,
+} from '../../server';
 
 export interface CliTerminal {
   readonly input: AsyncIterable<string | Uint8Array>;
@@ -25,6 +32,7 @@ export interface CliFileSystem {
   writeTextFile(path: string, value: string, options?: { readonly mode?: number }): Promise<void>;
   writeTextFileAtomic(path: string, value: string, options?: { readonly mode?: number }): Promise<void>;
   makeDirectory(path: string, options?: { readonly recursive?: boolean }): Promise<void>;
+  writePrivateTextFile?(path: string, value: string): Promise<void>;
 }
 
 export interface CliPlatformDirectories {
@@ -66,6 +74,10 @@ export interface CliHost {
   createRuntime(options?: RuntimeOptions): Promise<DatagramRuntime>;
   openRuntime(options?: Pick<RuntimeOptions, 'databasePath'>): Promise<OpenDatagramRuntime>;
   startHttpServer(options?: ServerOptions): Promise<CliHttpServer>;
+  probePostgres?(connectionString: string): Promise<void>;
+  checkPort?(hostname: string, port: number): Promise<void>;
+  startServerService?(options: ServerServiceOptions): ReturnType<typeof startServerService>;
+  request?(request: Request): Promise<Response>;
   onTermination(handler: () => void | Promise<void>): void;
   exit(code: number): void;
   setExitCode(code: number): void;
@@ -116,6 +128,29 @@ export function createProcessCliHost(): CliHost {
         await rename(temporaryPath, path);
       },
       makeDirectory: (path, options) => mkdir(path, options).then(() => undefined),
+      writePrivateTextFile: async (path, value) => {
+        await mkdir(dirname(path), { mode: 0o700, recursive: true });
+        await chmod(dirname(path), 0o700);
+        try {
+          if ((await lstat(path)).isSymbolicLink()) throw new Error('Secret file cannot be a symlink');
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+        }
+        const temporaryPath = `${path}.${crypto.randomUUID()}.tmp`;
+        const file = await open(temporaryPath, 'wx', 0o600);
+        try {
+          await file.writeFile(value, 'utf8');
+        } finally {
+          await file.close();
+        }
+        await chmod(temporaryPath, 0o600);
+        await rename(temporaryPath, path);
+        await chmod(path, 0o600);
+        const metadata = await stat(path);
+        if ((metadata.mode & 0o777) !== 0o600 || metadata.uid !== process.getuid?.()) {
+          throw new Error('Secret file owner or permissions are unsafe');
+        }
+      },
     },
     directories: resolvePlatformDirectories(platform(), homedir(), process.env),
     currentDirectory: process.cwd(),
@@ -137,6 +172,22 @@ export function createProcessCliHost(): CliHost {
     createRuntime,
     openRuntime,
     startHttpServer,
+    probePostgres: async (connectionString) => {
+      const client = new SQL(connectionString);
+      try {
+        await client`SELECT 1`;
+      } finally {
+        await client.close();
+      }
+    },
+    checkPort: (hostname, port) =>
+      new Promise<void>((resolve, reject) => {
+        const server = createServer();
+        server.once('error', reject);
+        server.listen(port, hostname, () => server.close((error) => (error ? reject(error) : resolve())));
+      }),
+    startServerService,
+    request: (request) => fetch(request),
     onTermination: (handler) => {
       process.once('SIGINT', handler);
       process.once('SIGTERM', handler);

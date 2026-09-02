@@ -5,8 +5,11 @@ import type { OpenDatagramRuntime } from '../../runtime';
 import type { CliHost } from './host';
 import {
   readServiceProfile,
+  isServerProfile,
+  resolveCredential,
   resolveServiceTarget,
   type ResolvedServiceTarget,
+  type ServerServiceProfile,
 } from './profiles';
 
 export type DoctorStage = 'profile' | 'target' | 'runtime' | 'identity';
@@ -28,6 +31,7 @@ export interface FailedDoctorCheck {
 export interface DoctorReport {
   readonly ok: boolean;
   readonly profileName: string;
+  readonly serviceKind: 'local' | 'server';
   readonly checks: readonly (SuccessfulCheck | FailedDoctorCheck)[];
   readonly target?: ResolvedServiceTarget;
 }
@@ -50,12 +54,121 @@ function failed(
   context: Readonly<Record<string, string>>,
   technicalContext: Readonly<Record<string, string>>,
   completed: SuccessfulCheck[],
+  serviceKind: 'local' | 'server' = 'local',
 ): DoctorReport {
   return {
     ok: false,
     profileName,
+    serviceKind,
     checks: [...completed, { status: 'failed', stage, code, recovery, context, technicalContext }],
   };
+}
+
+async function checkServerService(
+  host: CliHost,
+  profile: ServerServiceProfile,
+  completed: SuccessfulCheck[],
+): Promise<DoctorReport> {
+  let connectionString: string;
+  let bearerToken: string;
+  try {
+    connectionString = await resolveCredential(host, profile.service.postgres.credential);
+    bearerToken = await resolveCredential(host, profile.identity.bearerCredential);
+    completed.push({ status: 'ok', stage: 'target' });
+  } catch (error) {
+    return failed(
+      profile.name,
+      'target',
+      'doctor.target-unresolved',
+      repairCommand(profile.name),
+      { profile: profile.name, service: 'server' },
+      { causeCode: causeCode(error), credentialReferences: 'configured' },
+      completed,
+      'server',
+    );
+  }
+  try {
+    if (host.probePostgres === undefined) throw new Error('probe unavailable');
+    await host.probePostgres(connectionString);
+    completed.push({ status: 'ok', stage: 'runtime' });
+  } catch {
+    return failed(
+      profile.name,
+      'runtime',
+      'doctor.runtime-unready',
+      'Check PostgreSQL availability, TLS mode, credentials, and network route.',
+      { profile: profile.name, service: 'server' },
+      { adapter: 'postgres', credentialReference: 'configured' },
+      completed,
+      'server',
+    );
+  }
+  let started: Awaited<ReturnType<NonNullable<CliHost['startServerService']>>> | undefined;
+  try {
+    if (host.startServerService === undefined || host.request === undefined) {
+      throw new Error('server verification unavailable');
+    }
+    started = await host.startServerService({
+      connectionString,
+      deploymentOperatorDisplayName: profile.identity.displayName,
+      deploymentOperatorId: profile.identity.personId,
+      deploymentOperatorToken: bearerToken,
+      hostname: profile.service.bind.hostname,
+      port: profile.service.bind.port,
+      serviceKey: profile.service.serviceKey,
+      ...(profile.service.publicAccess?.kind === 'direct-tls'
+        ? {
+            tls: {
+              certificate: await host.filesystem.readTextFile(
+                profile.service.publicAccess.certificatePath,
+              ),
+              key: await host.filesystem.readTextFile(profile.service.publicAccess.keyPath),
+            },
+          }
+        : {}),
+    });
+    const url =
+      profile.service.publicAccess?.kind === 'reverse-proxy'
+        ? new URL(profile.service.publicAccess.endpoint)
+        : started.server.url;
+    const health = await host.request(
+      new Request(new URL('/health', url), {
+        redirect: 'manual',
+        signal: AbortSignal.timeout(5_000),
+      }),
+    );
+    const actions = await host.request(
+      new Request(new URL('/v1/actions', url), {
+        headers: { authorization: `Bearer ${bearerToken}` },
+        redirect: 'manual',
+        signal: AbortSignal.timeout(5_000),
+      }),
+    );
+    if (!health.ok || !actions.ok) throw new Error('verification failed');
+    completed.push({ status: 'ok', stage: 'identity' });
+    return {
+      ok: true,
+      profileName: profile.name,
+      serviceKind: 'server',
+      checks: completed,
+    };
+  } catch {
+    return failed(
+      profile.name,
+      'identity',
+      'doctor.identity-invalid',
+      'Check the bind address, TLS/reverse proxy, and Deployment Operator credential.',
+      { profile: profile.name, service: 'server' },
+      { identityReference: 'configured', networkExposure: profile.service.bind.exposure },
+      completed,
+      'server',
+    );
+  } finally {
+    if (started) {
+      await started.server.stop();
+      await started.runtime.close();
+    }
+  }
 }
 
 export async function checkService(
@@ -66,8 +179,9 @@ export async function checkService(
   const completed: SuccessfulCheck[] = [];
   const profilePath = join(host.directories.configuration, 'profiles', `${profileName}.json`);
   try {
-    await readServiceProfile(host, profileName);
+    const profile = await readServiceProfile(host, profileName);
     completed.push({ status: 'ok', stage: 'profile' });
+    if (isServerProfile(profile)) return checkServerService(host, profile, completed);
   } catch (error) {
     return failed(
       profileName,
@@ -124,7 +238,7 @@ export async function checkService(
   try {
     await runtime.app.verifyServiceIdentity(target.actorId ?? '');
     completed.push({ status: 'ok', stage: 'identity' });
-    return { ok: true, profileName, checks: completed, target };
+    return { ok: true, profileName, serviceKind: 'local', checks: completed, target };
   } catch (error) {
     return failed(
       profileName,
@@ -165,7 +279,7 @@ export async function runDoctor(
   }
   if (report.ok) {
     host.terminal.writeOutput(
-      `Service ready. profile=${JSON.stringify(profileName)} kind=local\nChannel data: not inspected\n`,
+      `Service ready. profile=${JSON.stringify(profileName)} kind=${report.serviceKind}\nChannel data: not inspected\n`,
     );
     return;
   }

@@ -29,6 +29,7 @@ export interface ServerServiceOptions {
   readonly hostname?: string;
   readonly port?: number;
   readonly serviceKey?: string;
+  readonly tls?: { readonly certificate: string; readonly key: string };
 }
 
 export interface ServerServiceRuntime {
@@ -94,6 +95,9 @@ export async function startServerService(options: ServerServiceOptions = {}) {
     fetch: createHttpHandler({ app: runtime.app, verifyIdentity }),
     hostname: options.hostname ?? process.env.HOST ?? '127.0.0.1',
     port: options.port ?? Number(process.env.PORT ?? 3100),
+    ...(options.tls === undefined
+      ? {}
+      : { tls: { cert: options.tls.certificate, key: options.tls.key } }),
   });
   return { runtime, server };
 }

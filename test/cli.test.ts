@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from 'bun:test';
-import { access, mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -317,6 +317,131 @@ test('guided init creates and verifies a named default Local Service', async () 
   expect(rendered).toContain('Durable commands: skipped');
   expect(rendered).toContain('bunx --package prosto-datagram datagram-mcp');
   expect(rendered).toContain(`First Channel: ${starter.channelId}`);
+});
+
+test('guided team init stores references and verifies an external PostgreSQL Server Service', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'datagram-guided-server-'));
+  temporaryDirectories.push(directory);
+  const configuration = join(directory, 'configuration');
+  const output: string[] = [];
+  const secretMarker = 'postgres-password-marker';
+  const connectionString =
+    `postgres://operator:${secretMarker}@localhost:5432/datagram?sslmode=disable`;
+  const base = localSetupHost(
+    configuration,
+    join(directory, 'data'),
+    ['2', 'team', 'Ada Operator', '', connectionString, '', '', 'yes'],
+    output,
+  );
+  let stopped = false;
+  let closed = false;
+  const host: CliHost = {
+    ...base,
+    probePostgres: () => Promise.resolve(),
+    checkPort: () => Promise.resolve(),
+    startServerService: (() =>
+      Promise.resolve({
+        runtime: {
+          deploymentOperator: {
+            id: 'person_team_operator',
+            displayName: 'Ada Operator',
+            isOperator: true,
+            createdAt: '2026-09-02T00:00:00.000Z',
+          },
+          close: () => {
+            closed = true;
+            return Promise.resolve();
+          },
+        },
+        server: {
+          url: new URL('http://127.0.0.1:3100/'),
+          stop: () => {
+            stopped = true;
+          },
+        },
+      })) as unknown as NonNullable<CliHost['startServerService']>,
+    request: (request) => {
+      const authenticated = request.url.endsWith('/v1/actions');
+      if (authenticated) expect(request.headers.get('authorization')).toMatch(/^Bearer /);
+      return Promise.resolve(new Response('{}', { status: 200 }));
+    },
+  };
+
+  await runCli(['init'], host);
+
+  const profilePath = join(configuration, 'profiles', 'team.json');
+  const secretPath = join(configuration, 'secrets', 'team.json');
+  const profileText = await readFile(profilePath, 'utf8');
+  expect(JSON.parse(profileText)).toMatchObject({
+    service: {
+      kind: 'server',
+      infrastructure: { kind: 'external-postgres' },
+      postgres: { credential: { kind: 'file', path: secretPath, key: 'postgresUrl' } },
+      bind: { exposure: 'host', hostname: '127.0.0.1', port: 3100 },
+    },
+    identity: {
+      personId: 'person_team_operator',
+      bearerCredential: { kind: 'file', path: secretPath, key: 'bearerToken' },
+    },
+    setup: { core: 'verified' },
+  });
+  expect(profileText).not.toContain(secretMarker);
+  expect(output.join('')).not.toContain(secretMarker);
+  expect(output.join('')).toContain('no infrastructure lifecycle ownership');
+  expect(output.join('')).toContain('Optional next step: invite teammates');
+  expect((await stat(secretPath)).mode & 0o777).toBe(0o600);
+  expect(await readFile(secretPath, 'utf8')).toContain(secretMarker);
+  expect(stopped).toBe(true);
+  expect(closed).toBe(true);
+});
+
+test('guided team init reports PostgreSQL preflight failures without leaking the URL', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'datagram-guided-server-failure-'));
+  temporaryDirectories.push(directory);
+  const marker = 'must-not-leak';
+  const host: CliHost = {
+    ...localSetupHost(
+      join(directory, 'configuration'),
+      join(directory, 'data'),
+      ['2', 'team', 'Operator', '', `postgres://u:${marker}@localhost/db?sslmode=disable`, '', ''],
+      [],
+    ),
+    probePostgres: () => Promise.reject(new Error(`password=${marker}`)),
+    checkPort: () => Promise.resolve(),
+  };
+
+  try {
+    await runCli(['init'], host);
+    throw new Error('expected preflight failure');
+  } catch (error) {
+    expect(error).toMatchObject({ code: 'setup.postgres-unreachable' });
+    expect(String((error as Error).message)).not.toContain(marker);
+  }
+});
+
+test('guided team init blocks public plaintext exposure before Apply', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'datagram-guided-public-'));
+  temporaryDirectories.push(directory);
+  const configuration = join(directory, 'configuration');
+  const host = localSetupHost(
+    configuration,
+    join(directory, 'data'),
+    [
+      '2',
+      'team',
+      'Operator',
+      '',
+      'postgres://u:p@localhost/datagram?sslmode=disable',
+      '3',
+      '0.0.0.0',
+      '',
+    ],
+    [],
+  );
+
+  expect(runCli(['init'], host)).rejects.toMatchObject({ code: 'setup.public-tls-required' });
+  expect(await pathExists(join(configuration, 'profiles', 'team.json'))).toBe(false);
+  expect(await pathExists(join(configuration, 'secrets', 'team.json'))).toBe(false);
 });
 
 test('guided init previews and runs durable installation only after consent', async () => {

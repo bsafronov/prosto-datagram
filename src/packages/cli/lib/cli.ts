@@ -3,7 +3,12 @@ import type { ChannelTypeContractSelector } from '../../application/contracts';
 import { createProcessCliHost, type CliHost } from './host';
 import { runDoctor } from './doctor';
 import { runGuidedInit } from './init';
-import { resolveServiceTarget } from './profiles';
+import {
+  isServerProfile,
+  readServiceProfile,
+  resolveCredential,
+  resolveServiceTarget,
+} from './profiles';
 
 export const cliUsage = `Usage:
   datagram init [--profile NAME]
@@ -74,10 +79,53 @@ export async function runCli(
 
   if (command === 'serve') {
     const rawPort = option(args, '--port');
+    const profileName = option(args, '--profile');
+    if (profileName !== undefined) {
+      const profile = await readServiceProfile(host, profileName);
+      if (isServerProfile(profile)) {
+        if (host.startServerService === undefined) {
+          throw new DatagramError('server.unavailable', 'Server Service startup is unavailable.', 500);
+        }
+        const connectionString = await resolveCredential(host, profile.service.postgres.credential);
+        const deploymentOperatorToken = await resolveCredential(
+          host,
+          profile.identity.bearerCredential,
+        );
+        const { runtime, server } = await host.startServerService({
+          connectionString,
+          deploymentOperatorDisplayName: profile.identity.displayName,
+          deploymentOperatorId: profile.identity.personId,
+          deploymentOperatorToken,
+          hostname: profile.service.bind.hostname,
+          port: rawPort === undefined ? profile.service.bind.port : Number(rawPort),
+          serviceKey: profile.service.serviceKey,
+          ...(profile.service.publicAccess?.kind === 'direct-tls'
+            ? {
+                tls: {
+                  certificate: await host.filesystem.readTextFile(
+                    profile.service.publicAccess.certificatePath,
+                  ),
+                  key: await host.filesystem.readTextFile(profile.service.publicAccess.keyPath),
+                },
+              }
+            : {}),
+        });
+        host.terminal.writeError(
+          `Datagram HTTP listening on ${server.url.toString()} (production identity mode)\n`,
+        );
+        const close = async () => {
+          await server.stop();
+          await runtime.close();
+          host.exit(0);
+        };
+        host.onTermination(close);
+        return;
+      }
+    }
     const target = await resolveServiceTarget(host, {
       actorId: option(args, '--actor'),
       databasePath: option(args, '--db'),
-      profileName: option(args, '--profile'),
+      profileName,
     });
     const { identityMode, runtime, server } = await host.startHttpServer({
       databasePath: target.databasePath,

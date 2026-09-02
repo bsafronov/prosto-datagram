@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { DatagramError } from '../../application/errors';
 import type { CliHost } from './host';
 import { checkService } from './doctor';
+import { runGuidedServerSetup } from './server-setup';
 import {
   isUncertainStarter,
   readSetupJournal,
@@ -22,6 +23,7 @@ const defaultProfileName = 'local';
 
 type WizardResult =
   | { readonly kind: 'cancelled' }
+  | { readonly kind: 'team-complete' }
   | {
       readonly kind: 'apply';
       readonly profileName: string;
@@ -100,9 +102,8 @@ async function collectAnswers(
       if (answer === '' || answer === '1') {
         step = 1;
       } else if (answer === '2') {
-        host.terminal.writeOutput(
-          'Team setup is not available in this release. Choose “Use on this machine.”\n',
-        );
+        await runGuidedServerSetup(host, read);
+        return { kind: 'team-complete' };
       } else {
         host.terminal.writeOutput('Choose 1 or 2.\n');
       }
@@ -554,6 +555,7 @@ export async function runGuidedInit(host: CliHost, requestedProfileName?: string
     host.terminal.writeOutput('Setup cancelled. No changes were made.\n');
     return;
   }
+  if (result.kind === 'team-complete') return;
 
   const profileDirectory = join(host.directories.configuration, 'profiles');
   const dataDirectory = join(host.directories.data, 'profiles', result.profileName);
@@ -593,12 +595,15 @@ export async function runGuidedInit(host: CliHost, requestedProfileName?: string
     const existingProfile = (await host.filesystem.pathExists(profilePath))
       ? parseProfile(await host.filesystem.readTextFile(profilePath), result.profileName)
       : undefined;
+    const savedSetup = existingProfile?.setup;
+    const existingSetup =
+      savedSetup !== undefined && 'starter' in savedSetup ? savedSetup : undefined;
     let profile: LocalServiceProfile = {
       version: 1,
       name: result.profileName,
       service: { kind: 'local', databasePath },
       identity: { personId: runtime.owner.id, displayName: runtime.owner.displayName },
-      ...(existingProfile?.setup === undefined ? {} : { setup: existingProfile.setup }),
+      ...(existingSetup === undefined ? {} : { setup: existingSetup }),
     };
     await saveProfile(host, profilePath, profile);
     await host.filesystem.writeTextFileAtomic(defaultProfilePath, `${result.profileName}\n`, { mode: 0o600 });
