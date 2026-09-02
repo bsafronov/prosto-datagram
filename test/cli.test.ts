@@ -50,6 +50,8 @@ function localSetupHost(
   data: string,
   answers: readonly string[],
   output: string[],
+  runExternalCommand: CliHost['runExternalCommand'] = () =>
+    Promise.reject(new Error('unexpected external command')),
 ): CliHost {
   return {
     terminal: {
@@ -68,7 +70,7 @@ function localSetupHost(
     },
     directories: { configuration, data },
     currentDirectory: '/unrelated/current-directory',
-    runExternalCommand: () => Promise.reject(new Error('unexpected external command')),
+    runExternalCommand,
     createRuntime,
     startHttpServer: () => Promise.reject(new Error('unexpected HTTP server')),
     onTermination: () => undefined,
@@ -169,7 +171,7 @@ test('guided init creates and verifies a named default Local Service', async () 
   const host = localSetupHost(
     configuration,
     data,
-    ['', 'discarded', 'Back', 'personal', 'Ada Lovelace', ''],
+    ['', 'discarded', 'Back', 'personal', 'Ada Lovelace', '', ''],
     output,
   );
 
@@ -208,9 +210,75 @@ test('guided init creates and verifies a named default Local Service', async () 
   expect(rendered).toContain('[3/3] Verifying profile, Store, runtime, and identity');
   expect(rendered).toContain(`Configuration: ${profilePath}`);
   expect(rendered).toContain(`SQLite data: ${databasePath}`);
-  expect(rendered).toContain(
-    `Next: bunx prosto-datagram actions --db ${JSON.stringify(databasePath)}`,
+  expect(rendered).toContain(`CLI: bunx prosto-datagram actions --db ${JSON.stringify(databasePath)}`);
+  expect(rendered).toContain('Durable commands: skipped');
+  expect(rendered).toContain('bunx --package prosto-datagram datagram-mcp');
+});
+
+test('guided init previews and runs durable installation only after consent', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'datagram-guided-global-install-'));
+  temporaryDirectories.push(directory);
+  const output: string[] = [];
+  const requests: Parameters<CliHost['runExternalCommand']>[0][] = [];
+  const globalBin = join(directory, 'bun-bin');
+  const host = localSetupHost(
+    join(directory, 'configuration'),
+    join(directory, 'data'),
+    ['', 'personal', 'Ada Lovelace', 'yes', 'yes'],
+    output,
+    (request) => {
+      requests.push(request);
+      if (request.args?.[0] === 'pm') {
+        return Promise.resolve({ exitCode: 0, stdout: `${globalBin}\n`, stderr: '' });
+      }
+      return Promise.resolve({ exitCode: 0, stdout: '', stderr: '' });
+    },
   );
+
+  await runCli(['init'], host);
+
+  expect(requests).toEqual([
+    { command: 'bun', args: ['pm', 'bin', '-g'] },
+    { command: 'bun', args: ['install', '--global', 'prosto-datagram'] },
+  ]);
+  const rendered = output.join('');
+  expect(rendered).toContain('Durable install command: bun install --global prosto-datagram');
+  expect(rendered).toContain(join(globalBin, 'datagram'));
+  expect(rendered).toContain(join(globalBin, 'datagram-mcp'));
+  expect(rendered).toContain('Durable commands: installed');
+});
+
+test('optional installer failure preserves core setup and gives exact resume command', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'datagram-guided-install-failure-'));
+  temporaryDirectories.push(directory);
+  const configuration = join(directory, 'configuration');
+  const data = join(directory, 'data');
+  const output: string[] = [];
+  let calls = 0;
+  const host = localSetupHost(
+    configuration,
+    data,
+    ['', 'personal', 'Grace Hopper', 'yes', 'yes'],
+    output,
+    () => {
+      calls += 1;
+      return Promise.resolve(
+        calls === 1
+          ? { exitCode: 0, stdout: `${join(directory, 'bun-bin')}\n`, stderr: '' }
+          : { exitCode: 23, stdout: '', stderr: 'sensitive installer details' },
+      );
+    },
+  );
+
+  await runCli(['init'], host);
+
+  expect(await pathExists(join(data, 'profiles', 'personal', 'datagram.sqlite'))).toBe(true);
+  expect(await pathExists(join(configuration, 'profiles', 'personal.json'))).toBe(true);
+  const rendered = output.join('');
+  expect(rendered).toContain('Core Service remains ready.');
+  expect(rendered).toContain('Resume optional installation: bun install --global prosto-datagram');
+  expect(rendered).toContain('Durable commands: pending (installer exit code 23)');
+  expect(rendered).not.toContain('sensitive installer details');
 });
 
 test('guided init cancellation before Apply leaves no profile or SQLite data', async () => {

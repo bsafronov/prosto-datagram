@@ -21,7 +21,20 @@ interface LocalServiceProfile {
 
 type WizardResult =
   | { readonly kind: 'cancelled' }
-  | { readonly kind: 'apply'; readonly profileName: string; readonly displayName: string };
+  | {
+      readonly kind: 'apply';
+      readonly profileName: string;
+      readonly displayName: string;
+      readonly durableInstall: DurableInstallPlan | undefined;
+    };
+
+interface DurableInstallPlan {
+  readonly command: 'bun';
+  readonly args: readonly ['install', '--global', 'prosto-datagram'];
+  readonly executablePaths: readonly [string, string];
+}
+
+const durableInstallCommand = 'bun install --global prosto-datagram';
 
 async function* lines(input: AsyncIterable<string | Uint8Array>): AsyncGenerator<string> {
   const decoder = new TextDecoder();
@@ -65,10 +78,11 @@ async function collectAnswers(host: CliHost): Promise<WizardResult> {
   let step = 0;
   let profileName = defaultProfileName;
   let displayName = '';
+  let durableInstall: DurableInstallPlan | undefined;
   while (true) {
     if (step === 0) {
       host.terminal.writeOutput(
-        '[1/4] Choose how to use Datagram\n' +
+        '[1/5] Choose how to use Datagram\n' +
           '  1. Use on this machine (Recommended)\n' +
           '  2. Run for a team\n' +
           'Selection [1] (or Cancel): ',
@@ -89,7 +103,7 @@ async function collectAnswers(host: CliHost): Promise<WizardResult> {
 
     if (step === 1) {
       host.terminal.writeOutput(
-        `[2/4] Name this Service profile\nProfile name [${profileName}] (or Back/Cancel): `,
+        `[2/5] Name this Service profile\nProfile name [${profileName}] (or Back/Cancel): `,
       );
       const answer = normalized(await read());
       if (isCancel(answer)) return { kind: 'cancelled' };
@@ -111,7 +125,7 @@ async function collectAnswers(host: CliHost): Promise<WizardResult> {
 
     if (step === 2) {
       host.terminal.writeOutput(
-        '[3/4] Identify the Deployment Operator\nDisplay name (or Back/Cancel): ',
+        '[3/5] Identify the Deployment Operator\nDisplay name (or Back/Cancel): ',
       );
       const answer = normalized(await read());
       if (isCancel(answer)) return { kind: 'cancelled' };
@@ -126,21 +140,58 @@ async function collectAnswers(host: CliHost): Promise<WizardResult> {
       continue;
     }
 
+    if (step === 3) {
+      host.terminal.writeOutput(
+        '[4/5] Choose command access\n' +
+          'Install durable global `datagram` and `datagram-mcp` commands? [y/N] (or Back/Cancel): ',
+      );
+      const answer = normalized(await read()).toLowerCase();
+      if (isCancel(answer)) return { kind: 'cancelled' };
+      if (isBack(answer)) {
+        step = 2;
+      } else if (answer === '' || answer === 'n' || answer === 'no') {
+        durableInstall = undefined;
+        step = 4;
+      } else if (answer === 'y' || answer === 'yes') {
+        const bin = await host.runExternalCommand({ command: 'bun', args: ['pm', 'bin', '-g'] });
+        const binDirectory = bin.stdout.trim();
+        if (bin.exitCode !== 0 || binDirectory.length === 0) {
+          host.terminal.writeOutput(
+            'Bun global executable location is unavailable. Choose No and use package-runner commands.\n',
+          );
+        } else {
+          durableInstall = {
+            command: 'bun',
+            args: ['install', '--global', 'prosto-datagram'],
+            executablePaths: [join(binDirectory, 'datagram'), join(binDirectory, 'datagram-mcp')],
+          };
+          step = 4;
+        }
+      } else {
+        host.terminal.writeOutput('Choose y, N, Back, or Cancel.\n');
+      }
+      continue;
+    }
+
     const databasePath = join(host.directories.data, 'profiles', profileName, 'datagram.sqlite');
     const profilePath = join(host.directories.configuration, 'profiles', `${profileName}.json`);
     host.terminal.writeOutput(
-      '[4/4] Review plan\n' +
+      '[5/5] Review plan\n' +
         `  Service: Local Service\n  Profile: ${profileName} (default)\n` +
         `  Configuration: ${profilePath}\n  SQLite data: ${databasePath}\n` +
         `  Deployment Operator: ${displayName}\n  Secrets: none\n` +
+        (durableInstall === undefined
+          ? '  Durable commands: skipped; use bunx package-runner commands\n'
+          : `  Durable install command: ${durableInstallCommand}\n` +
+            `  Executables: ${durableInstall.executablePaths.join(', ')}\n`) +
         'Apply this plan? [Y/n] (or Back/Cancel): ',
     );
     const answer = normalized(await read()).toLowerCase();
     if (isCancel(answer) || answer === 'n' || answer === 'no') return { kind: 'cancelled' };
     if (isBack(answer)) {
-      step = 2;
+      step = 3;
     } else if (answer === '' || answer === 'y' || answer === 'yes') {
-      return { kind: 'apply', profileName, displayName };
+      return { kind: 'apply', profileName, displayName, durableInstall };
     } else {
       host.terminal.writeOutput('Choose Y, n, Back, or Cancel.\n');
     }
@@ -228,15 +279,41 @@ export async function runGuidedInit(host: CliHost): Promise<void> {
     await runtime.app.verifyServiceIdentity(runtime.owner.id);
     if (runtime.app.actions.catalog().length === 0) throw new Error('Runtime verification failed');
 
-    host.terminal.writeOutput(
-      'Setup complete.\n' +
-        `Profile: ${result.profileName} (default)\nService: Local Service (ready)\n` +
-        `Configuration: ${profilePath}\nSQLite data: ${databasePath}\n` +
-        `Identity: ${runtime.owner.displayName} (${runtime.owner.id})\n` +
-        `Next: bunx prosto-datagram actions --db ${JSON.stringify(databasePath)}\n` +
-        'Reconfigure: bunx prosto-datagram init\n',
-    );
   } finally {
     await runtime.close();
   }
+
+  let durableInstallStatus = 'skipped';
+  if (result.durableInstall !== undefined) {
+    host.terminal.writeOutput('[optional] Installing durable global commands\n');
+    try {
+      const installed = await host.runExternalCommand({
+        command: result.durableInstall.command,
+        args: result.durableInstall.args,
+      });
+      if (installed.exitCode === 0) {
+        durableInstallStatus = `installed (${result.durableInstall.executablePaths.join(', ')})`;
+      } else {
+        durableInstallStatus = `pending (installer exit code ${installed.exitCode})`;
+      }
+    } catch {
+      durableInstallStatus = 'pending (installer could not be started)';
+    }
+    if (durableInstallStatus.startsWith('pending')) {
+      host.terminal.writeOutput(
+        `Optional global installation failed. Core Service remains ready.\nResume optional installation: ${durableInstallCommand}\n`,
+      );
+    }
+  }
+
+  host.terminal.writeOutput(
+    'Setup complete.\n' +
+      `Profile: ${result.profileName} (default)\nService: Local Service (ready)\n` +
+      `Configuration: ${profilePath}\nSQLite data: ${databasePath}\n` +
+      `Identity: ${runtime.owner.displayName} (${runtime.owner.id})\n` +
+      `Durable commands: ${durableInstallStatus}\n` +
+      `CLI: bunx prosto-datagram actions --db ${JSON.stringify(databasePath)}\n` +
+      `MCP: DATAGRAM_DB=${JSON.stringify(databasePath)} DATAGRAM_ACTOR_ID=${JSON.stringify(runtime.owner.id)} bunx --package prosto-datagram datagram-mcp\n` +
+      'Reconfigure: bunx prosto-datagram init\n',
+  );
 }

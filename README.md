@@ -8,6 +8,19 @@ This repository contains the first executable scaffold. It implements Channel co
 
 Requires Bun 1.3.13 or newer.
 
+Start guided setup from the published package without a source checkout:
+
+```sh
+bunx prosto-datagram init
+```
+
+Setup can optionally preview and, after explicit consent, run
+`bun install --global prosto-datagram` for durable `datagram` and `datagram-mcp` commands. Declining
+keeps package-runner commands available. A failed optional installation does not invalidate the
+configured Service and can be resumed with the displayed command.
+
+Contributor setup:
+
 ```sh
 bun install
 bun run check
