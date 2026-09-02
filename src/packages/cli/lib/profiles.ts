@@ -16,7 +16,32 @@ export interface LocalServiceProfile {
     readonly personId: string;
     readonly displayName: string;
   };
+  readonly setup?: {
+    readonly core: 'verified';
+    readonly starter: StarterProgress;
+  };
 }
+
+export type StarterProgress =
+  | { readonly status: 'pending' }
+  | {
+      readonly status: 'channel-created';
+      readonly channelId: string;
+      readonly channelOperationId: string;
+    }
+  | {
+      readonly status: 'field-created';
+      readonly channelId: string;
+      readonly channelOperationId: string;
+      readonly fieldOperationId: string;
+    }
+  | {
+      readonly status: 'complete';
+      readonly channelId: string;
+      readonly channelOperationId: string;
+      readonly fieldOperationId: string;
+      readonly recordOperationId: string;
+    };
 
 export interface TargetOptions {
   readonly profileName?: string | undefined;

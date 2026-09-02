@@ -52,6 +52,7 @@ function localSetupHost(
   output: string[],
   runExternalCommand: CliHost['runExternalCommand'] = () =>
     Promise.reject(new Error('unexpected external command')),
+  failAction?: string,
 ): CliHost {
   return {
     terminal: {
@@ -71,7 +72,25 @@ function localSetupHost(
     directories: { configuration, data },
     currentDirectory: '/unrelated/current-directory',
     runExternalCommand,
-    createRuntime,
+    createRuntime: async (options) => {
+      const created = await createRuntime(options);
+      if (failAction === undefined) return created;
+      return {
+        ...created,
+        app: new Proxy(created.app, {
+          get(target, property) {
+            if (property === 'executeAction') {
+              return async (...args: Parameters<typeof target.executeAction>) => {
+                if (args[2] === failAction) throw new Error('injected starter failure');
+                return target.executeAction(...args);
+              };
+            }
+            const value = Reflect.get(target, property, target) as unknown;
+            return typeof value === 'function' ? value.bind(target) : value;
+          },
+        }),
+      };
+    },
     startHttpServer: () => Promise.reject(new Error('unexpected HTTP server')),
     onTermination: () => undefined,
     exit: () => undefined,
@@ -191,7 +210,7 @@ test('guided init creates and verifies a named default Local Service', async () 
   const host = localSetupHost(
     configuration,
     data,
-    ['', 'discarded', 'Back', 'personal', 'Ada Lovelace', '', ''],
+    ['', 'discarded', 'Back', 'personal', 'Ada Lovelace', '', '', 'Launch plan', 'Ship it'],
     output,
   );
 
@@ -204,14 +223,35 @@ test('guided init creates and verifies a named default Local Service', async () 
     name: string;
     service: { kind: string; databasePath: string };
     identity: { displayName: string; personId: string };
+    setup: {
+      core: string;
+      starter: {
+        status: string;
+        channelId: string;
+        channelOperationId: string;
+        fieldOperationId: string;
+        recordOperationId: string;
+      };
+    };
   };
-  expect(profile).toEqual({
+  const starter = structuredClone(profile.setup.starter);
+  expect(profile).toMatchObject({
     version: 1,
     name: 'personal',
     service: { kind: 'local', databasePath },
     identity: {
       displayName: 'Ada Lovelace',
       personId: expect.stringMatching(/^person_/),
+    },
+    setup: {
+      core: 'verified',
+      starter: {
+        status: 'complete',
+        channelId: expect.stringMatching(/^channel_/),
+        channelOperationId: expect.stringMatching(/^operation_/),
+        fieldOperationId: expect.stringMatching(/^operation_/),
+        recordOperationId: expect.stringMatching(/^operation_/),
+      },
     },
   });
   expect(await readFile(join(configuration, 'default-profile'), 'utf8')).toBe('personal\n');
@@ -223,6 +263,23 @@ test('guided init creates and verifies a named default Local Service', async () 
     id: profile.identity.personId,
     isOperator: true,
   });
+  expect(await runtime.store.listTableFields(starter.channelId)).toEqual([
+    expect.objectContaining({
+      key: 'name',
+      label: 'Name',
+      required: true,
+      type: 'text',
+      unique: true,
+    }),
+  ]);
+  expect(await runtime.store.listTableRecords(starter.channelId)).toEqual([
+    expect.objectContaining({ values: { name: 'Ship it' } }),
+  ]);
+  expect(await runtime.store.listOperations(starter.channelId)).toEqual([
+    expect.objectContaining({ action: 'channel.create', origin: 'cli' }),
+    expect.objectContaining({ action: 'table.field.add', origin: 'cli' }),
+    expect.objectContaining({ action: 'table.record.create', origin: 'cli' }),
+  ]);
   const rendered = output.join('');
   expect(rendered).toContain('Use on this machine (Recommended)');
   expect(rendered).toContain('Type Back');
@@ -233,6 +290,7 @@ test('guided init creates and verifies a named default Local Service', async () 
   expect(rendered).toContain('CLI: bunx prosto-datagram actions --profile "personal"');
   expect(rendered).toContain('Durable commands: skipped');
   expect(rendered).toContain('bunx --package prosto-datagram datagram-mcp');
+  expect(rendered).toContain(`First Channel: ${starter.channelId}`);
 });
 
 test('guided init previews and runs durable installation only after consent', async () => {
@@ -244,7 +302,7 @@ test('guided init previews and runs durable installation only after consent', as
   const host = localSetupHost(
     join(directory, 'configuration'),
     join(directory, 'data'),
-    ['', 'personal', 'Ada Lovelace', 'yes', 'yes'],
+    ['', 'personal', 'Ada Lovelace', 'yes', 'yes', 'Launch plan', 'Ship it'],
     output,
     (request) => {
       requests.push(request);
@@ -278,7 +336,7 @@ test('optional installer failure preserves core setup and gives exact resume com
   const host = localSetupHost(
     configuration,
     data,
-    ['', 'personal', 'Grace Hopper', 'yes', 'yes'],
+    ['', 'personal', 'Grace Hopper', 'yes', 'yes', 'Launch plan', 'Ship it'],
     output,
     () => {
       calls += 1;
@@ -453,6 +511,75 @@ test('legacy environment and explicit database and actor inputs remain compatibl
     { databasePath: ':memory:' },
   ]);
   expect(JSON.parse(output.at(-2) ?? '')).toMatchObject({ data: [expect.any(Object)] });
+});
+
+test('guided init preserves verified core setup and resumes a failed starter recipe', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'datagram-guided-resume-'));
+  temporaryDirectories.push(directory);
+  const configuration = join(directory, 'configuration');
+  const data = join(directory, 'data');
+  const failedOutput: string[] = [];
+
+  await expect(
+    runCli(
+      ['init'],
+      localSetupHost(
+        configuration,
+        data,
+        ['', 'personal', 'Ada Lovelace', '', '', 'Launch plan', ''],
+        failedOutput,
+        undefined,
+        'table.record.create',
+      ),
+    ),
+  ).rejects.toMatchObject({ code: 'setup.starter-failed' });
+
+  const profilePath = join(configuration, 'profiles', 'personal.json');
+  const failedProfile = JSON.parse(await readFile(profilePath, 'utf8')) as {
+    setup: { core: string; starter: { status: string; channelId: string } };
+  };
+  const failedChannelId = failedProfile.setup.starter.channelId;
+  expect(failedProfile.setup).toMatchObject({
+    core: 'verified',
+    starter: { status: 'field-created', channelId: expect.stringMatching(/^channel_/) },
+  });
+  expect(failedOutput.join('')).toContain('Core setup remains ready.');
+  expect(failedOutput.join('')).toContain('Resume: bunx prosto-datagram init');
+  expect(await pathExists(join(data, 'profiles', 'personal', 'datagram.sqlite'))).toBe(true);
+
+  const resumedOutput: string[] = [];
+  await runCli(
+    ['init'],
+    localSetupHost(
+      configuration,
+      data,
+      ['', 'personal', 'Ada Lovelace', '', '', 'Ship it'],
+      resumedOutput,
+    ),
+  );
+
+  const completedProfile = JSON.parse(await readFile(profilePath, 'utf8')) as {
+    setup: { starter: { status: string; channelId: string } };
+  };
+  expect(completedProfile.setup.starter).toMatchObject({
+    status: 'complete',
+    channelId: failedChannelId,
+  });
+  expect(resumedOutput.join('')).toContain('Resume your first Table');
+
+  runtime = await createRuntime({
+    databasePath: join(data, 'profiles', 'personal', 'datagram.sqlite'),
+  });
+  expect(await runtime.store.listOperations(failedChannelId)).toEqual([
+    expect.objectContaining({ action: 'channel.create', origin: 'cli' }),
+    expect.objectContaining({ action: 'table.field.add', origin: 'cli' }),
+    expect.objectContaining({ action: 'table.record.create', origin: 'cli' }),
+  ]);
+  expect(await runtime.store.listTableRecords(failedChannelId)).toEqual([
+    expect.objectContaining({ values: { name: 'Ship it' } }),
+  ]);
+  expect(JSON.stringify(completedProfile)).not.toContain('Ship it');
+  expect(JSON.stringify(completedProfile)).not.toContain('Launch plan');
 });
 
 test('guided init cancellation before Apply leaves no profile or SQLite data', async () => {
