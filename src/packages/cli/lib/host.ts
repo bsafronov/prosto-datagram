@@ -1,4 +1,4 @@
-import { access, chmod, lstat, mkdir, open, readFile, rename, stat, writeFile } from 'node:fs/promises';
+import { access, chmod, lstat, mkdir, open, readFile, readdir, rename, stat, writeFile } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { createServer } from 'node:net';
 import { homedir, platform } from 'node:os';
@@ -33,6 +33,7 @@ export interface CliTerminal {
 }
 
 export interface CliFileSystem {
+  listDirectory?(path: string): Promise<string[]>;
   pathExists(path: string): Promise<boolean>;
   readTextFile(path: string): Promise<string>;
   writeTextFile(path: string, value: string, options?: { readonly mode?: number }): Promise<void>;
@@ -153,6 +154,7 @@ export function createProcessCliHost(): CliHost {
     },
     environment: { get: (name) => process.env[name] },
     filesystem: {
+      listDirectory: (path) => readdir(path),
       pathExists: async (path) => {
         try {
           await access(path);

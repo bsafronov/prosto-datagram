@@ -45,6 +45,20 @@ bunx prosto-datagram init --profile team
 Repair and reruns preserve profiles, secrets, databases, managed volumes, Channels, and Records.
 They never perform destructive cleanup.
 
+### Everyday Table work
+
+Run `datagram` (or `bun run cli` from this checkout) in a terminal to select a
+Service profile and Table, choose **Add a Record**, fill in its fields, and review
+before saving. Use `datagram work --profile NAME` to go directly to one Service.
+Choose **Create a Table** in the Table menu, including when the Service is empty,
+to name a Table, define its Fields, review and create it, then add the first Record.
+Table and Field creation use separate Operations; cancelling the first Record leaves
+the new Table available for later use.
+The first interactive flow supports Text, Number, Boolean, and Date-time fields;
+Tables with Dictionary or Record Reference fields still use explicit Action commands.
+Blank input uses the Field default when available, or omits the value. Shared
+Action validation checks required and unique constraints before saving.
+
 ### Managed PostgreSQL
 
 The Docker option creates one persistent PostgreSQL container and volume owned by the selected

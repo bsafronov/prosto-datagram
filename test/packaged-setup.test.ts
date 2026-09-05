@@ -236,6 +236,21 @@ test('packed CLI completes Local setup through first real Table Record', async (
   });
   expect(doctor).toMatchObject({ exitCode: 0, stderr: '' });
   expect(doctor.stdout).toContain(`Service ready. profile="${profileName}" kind=local`);
+  const work = await interactivePackageCommand([], [
+    { waitFor: 'Choose a Service profile', keys: '\r' },
+    { waitFor: 'Choose a Table', keys: '\r' },
+    { waitFor: 'Add a Record', keys: '\r' },
+    { waitFor: 'Name (text', keys: 'Second item\r' },
+    { waitFor: 'Save Record', keys: '\r' },
+  ], home);
+  expect(work.exitCode).toBe(0);
+  expect(work.stdout).toContain('Record saved.');
+  const reopened = await createRuntime({ databasePath: profile.service.databasePath });
+  try {
+    expect((await reopened.store.listTableRecords(profile.setup.starter.channelId)).map(record => record.values.name)).toContain('Second item');
+  } finally {
+    await reopened.close();
+  }
 }, 120_000);
 
 test('packed setup masks credentials and cancels before creating a profile', async () => {

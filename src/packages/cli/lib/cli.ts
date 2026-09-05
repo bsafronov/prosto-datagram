@@ -4,6 +4,8 @@ import { createRemoteServiceApplication } from '../../remote-service-client';
 import { createProcessCliHost, type CliHost } from './host';
 import { runDoctor } from './doctor';
 import { runGuidedInit } from './init';
+import { chooseWorkProfile, runTableWork } from './work';
+import { createAnswerReader } from './prompts';
 import {
   isServerProfile,
   readServiceProfile,
@@ -13,6 +15,8 @@ import {
 } from './profiles';
 
 export const cliUsage = `Usage:
+  datagram [--profile NAME] (interactive Table work)
+  datagram work [--profile NAME]
   datagram init [--profile NAME]
   datagram doctor --profile NAME [--verbose]
   datagram postgres start|stop|status --profile NAME
@@ -74,10 +78,31 @@ export async function runCli(
   args: readonly string[],
   host: CliHost = createProcessCliHost(),
 ): Promise<void> {
-  const command = args[0];
+  let command = args[0];
+  if (command === undefined && host.terminal.inputIsInteractive && host.terminal.outputIsInteractive) command = 'work';
+  if (command === '--profile') command = 'work';
   if (command === undefined || command === '--help' || command === '-h') {
     host.terminal.writeOutput(cliUsage);
     return;
+  }
+
+  if (command === 'work') {
+    if (!host.terminal.inputIsInteractive || !host.terminal.outputIsInteractive) {
+      throw new DatagramError('cli.interactive-required', 'Open an interactive terminal to use `datagram work`.', 400);
+    }
+    if (option(args, '--db') || option(args, '--actor') || option(args, '--type-id') || option(args, '--type-version')) {
+      throw new DatagramError('input.invalid', 'Interactive work uses a Service profile. Use --profile NAME.', 400);
+    }
+    if (!option(args, '--profile')) {
+      const sessionHost = { ...host, terminal: { ...host.terminal, prompt: createAnswerReader(host) } };
+      const name = await chooseWorkProfile(sessionHost);
+      if (name) await runCli(['work', '--profile', name], sessionHost);
+      return;
+    }
+    const profile = await readServiceProfile(host, option(args, '--profile')!);
+    if (!isServerProfile(profile) && !await host.filesystem.pathExists(profile.service.databasePath)) {
+      throw new DatagramError('profile.database-missing', 'Profile database is missing. Run `datagram doctor` to diagnose it.', 400);
+    }
   }
 
   if (command === 'postgres') {
@@ -197,7 +222,7 @@ export async function runCli(
     return;
   }
 
-  if (!['actions', 'queries', 'action', 'query', 'agent-query'].includes(command)) {
+  if (!['work', 'actions', 'queries', 'action', 'query', 'agent-query'].includes(command)) {
     throw new DatagramError('cli.command-unknown', 'Unknown command', 400);
   }
 
@@ -235,6 +260,9 @@ export async function runCli(
       ? selectedProfile.identity.personId
       : target!.actorId ?? localRuntime!.owner.id;
     switch (command) {
+      case 'work':
+        await runTableWork(host, activeApp, actorId);
+        break;
       case 'actions':
         output(host, activeApp.actions.catalog(selector));
         break;

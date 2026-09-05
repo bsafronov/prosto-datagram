@@ -80,6 +80,7 @@ function localSetupHost(
     environment: { get: (name) => legacy?.environment?.[name] },
     filesystem: {
       pathExists,
+      listDirectory: (path) => readdir(path),
       readTextFile: (path) => readFile(path, 'utf8'),
       writeTextFile: (path, value, options) => writeFile(path, value, options),
       writeTextFileAtomic: async (path, value, options) => {
@@ -1670,6 +1671,72 @@ test('CLI discovers and invokes shared contracts with trusted Query results', as
   const result = JSON.parse(queried.stdout) as { data: { id: string }[]; view: unknown };
   expect(result.data[0]?.id).toBe(receipt.subject.id);
   expect(result.view).toBeDefined();
+});
+
+test('interactive work selects a profile and Table and saves one typed Record after review', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'datagram-work-'));
+  temporaryDirectories.push(directory);
+  const databasePath = join(directory, 'data.sqlite');
+  runtime = await createRuntime({ databasePath });
+  const channel = await runtime.app.executeAction(runtime.owner.id, 'cli', 'channel.create', { title: 'Inventory', typeId: 'table' });
+  const channelId = channel.subject!.id;
+  await runtime.app.executeAction(runtime.owner.id, 'cli', 'table.field.add', { channelId, key: 'amount', label: 'Amount', type: 'number', required: true });
+  await writeProfile(directory, 'test', databasePath, runtime.owner.id, 'Test');
+  await runtime.close();
+  runtime = undefined;
+  const output: string[] = [];
+  const host = localSetupHost(directory, directory, ['test', channelId, 'add', 'invalid', '42', 'save'], output);
+  await runCli([], host);
+  runtime = await createRuntime({ databasePath });
+  expect((await runtime.store.listTableRecords(channelId)).map(record => record.values)).toEqual([{ amount: 42 }]);
+  expect((await runtime.store.listOperations(channelId)).filter(op => op.action === 'table.record.create')).toHaveLength(1);
+  expect(output.join('')).toContain('Enter a finite number.');
+  expect(output.join('')).toContain('Record saved.');
+  await runtime.close();
+  runtime = undefined;
+  await runCli(['work', '--profile', 'test'], localSetupHost(directory, directory, [channelId, 'add', '43', 'cancel'], []));
+  runtime = await createRuntime({ databasePath });
+  expect(await runtime.store.listTableRecords(channelId)).toHaveLength(1);
+});
+
+test('interactive work creates a Table in an empty Service and adds its first Record', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'datagram-create-table-'));
+  temporaryDirectories.push(directory);
+  const databasePath = join(directory, 'data.sqlite');
+  runtime = await createRuntime({ databasePath });
+  const actorId = runtime.owner.id;
+  await writeProfile(directory, 'test', databasePath, actorId, 'Test');
+  await runtime.close();
+  runtime = undefined;
+  const output: string[] = [];
+  await runCli(['work', '--profile', 'test'], localSetupHost(directory, directory, [
+    'create', 'Inventory', 'Name', 'text', 'yes', 'yes', 'Amount', 'number', 'no', 'no',
+    'create', 'add', 'Paper', '12', 'save',
+  ], output));
+  runtime = await createRuntime({ databasePath });
+  const channels = await runtime.store.listChannels(actorId);
+  expect(channels).toHaveLength(1);
+  expect(channels[0]?.title).toBe('Inventory');
+  const id = channels[0]!.id;
+  expect((await runtime.store.listTableFields(id)).map(field => ({ label: field.label, type: field.type, required: field.required }))).toEqual([
+    { label: 'Name', type: 'text', required: true }, { label: 'Amount', type: 'number', required: false },
+  ]);
+  expect((await runtime.store.listTableRecords(id)).map(record => record.values)).toEqual([{ field_1: 'Paper', field_2: 12 }]);
+  expect((await runtime.store.listOperations(id)).map(operation => operation.action)).toEqual([
+    'channel.create', 'table.field.add', 'table.field.add', 'table.record.create',
+  ]);
+  await runtime.close();
+  runtime = undefined;
+  await runCli(['work', '--profile', 'test'], localSetupHost(directory, directory, [
+    'create', 'Cancelled Table', 'Name', 'text', 'no', 'no', 'cancel',
+  ], []));
+  runtime = await createRuntime({ databasePath });
+  expect(await runtime.store.listChannels(actorId)).toHaveLength(1);
+});
+
+test('interactive work rejects non-interactive use before accessing configuration', async () => {
+  const host = localSetupHost('/unused', '/unused', [], []);
+  await expect(runCli(['work'], { ...host, terminal: { ...host.terminal, inputIsInteractive: false } })).rejects.toMatchObject({ code: 'cli.interactive-required' });
 });
 
 test('CLI maps invalid input to safe structured errors', async () => {
