@@ -443,7 +443,7 @@ test('guided team wizard supports Back across team choices before Apply', async 
 
   const rendered = output.join('');
   expect(rendered.match(/Team Service profile name/g)?.length).toBe(3);
-  expect(rendered).toContain('Selection [1] (or Back/Cancel)');
+  expect(rendered).toContain('Back. Back');
   expect(rendered).toContain('Setup cancelled. No changes were made.');
   expect(await pathExists(configuration)).toBe(false);
 });

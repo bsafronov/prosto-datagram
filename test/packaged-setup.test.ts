@@ -45,7 +45,7 @@ function packageCommand(...args: string[]): string[] {
 
 async function interactivePackageCommand(
   args: readonly string[],
-  answers: readonly string[],
+  steps: readonly { readonly waitFor: string; readonly keys: string }[],
   home: string,
   environment: Record<string, string | undefined> = {},
 ): Promise<ProcessResult> {
@@ -60,7 +60,7 @@ async function interactivePackageCommand(
       stderr: 'pipe',
     },
   );
-  child.stdin.write(`${answers.join('\n')}\n`);
+  child.stdin.write(JSON.stringify(steps));
   child.stdin.end();
   const timeout = setTimeout(() => child.kill(), 120_000);
   const [exitCode, stdout, stderr] = await Promise.all([
@@ -122,13 +122,16 @@ async function assertAuthenticatedServe(
   token: string,
   environment: Record<string, string | undefined> = {},
 ): Promise<void> {
-  const child = Bun.spawn(packageCommand('serve', '--profile', profileName, '--port', String(port)), {
-    cwd: home,
-    env: { ...isolatedEnvironment(home), ...environment },
-    stdin: 'ignore',
-    stdout: 'pipe',
-    stderr: 'pipe',
-  });
+  const child = Bun.spawn(
+    packageCommand('serve', '--profile', profileName, '--port', String(port)),
+    {
+      cwd: home,
+      env: { ...isolatedEnvironment(home), ...environment },
+      stdin: 'ignore',
+      stdout: 'pipe',
+      stderr: 'pipe',
+    },
+  );
   let stderr = '';
   const stderrDone = (async () => {
     for await (const chunk of child.stderr) stderr += new TextDecoder().decode(chunk);
@@ -187,7 +190,18 @@ test('packed CLI completes Local setup through first real Table Record', async (
   const profileName = `local-${crypto.randomUUID().slice(0, 8)}`;
   const result = await interactivePackageCommand(
     ['init'],
-    ['', profileName, 'Package Operator', '', '', 'Launch plan', 'Ship it', ''],
+    [
+      { waitFor: 'Use on this machine', keys: '\r' },
+      { waitFor: 'Name this Service profile', keys: `${profileName}\r` },
+      { waitFor: 'Identify the Deployment Operator', keys: 'Package Operator\r' },
+      { waitFor: 'Use bunx without global installation', keys: '\u001b[B\u001b[B\r' },
+      { waitFor: 'Identify the Deployment Operator', keys: 'Package Operator\r' },
+      { waitFor: 'Use bunx without global installation', keys: '\r' },
+      { waitFor: 'Apply this plan?', keys: '\r' },
+      { waitFor: 'Channel title', keys: 'Launch plan\r' },
+      { waitFor: 'First item', keys: 'Ship it\r' },
+      { waitFor: 'Connect Codex now?', keys: '\r' },
+    ],
     home,
   );
 
@@ -224,6 +238,40 @@ test('packed CLI completes Local setup through first real Table Record', async (
   expect(doctor.stdout).toContain(`Service ready. profile="${profileName}" kind=local`);
 }, 120_000);
 
+test('packed setup masks credentials and cancels before creating a profile', async () => {
+  const home = await temporaryHome('datagram-packaged-cancel-');
+  const fileChoice = (await nativeCredentialAvailable(home)) ? 2 : 1;
+  const secret = 'private-password-marker';
+  const result = await interactivePackageCommand(
+    ['init'],
+    [
+      { waitFor: 'Use on this machine', keys: '\u001b[B\r' },
+      { waitFor: 'Team Service profile name', keys: 'cancelled\r' },
+      { waitFor: 'Deployment Operator display name', keys: 'Test Operator\r' },
+      { waitFor: 'Existing PostgreSQL URL (externally owned)', keys: '\r' },
+      {
+        waitFor: 'Permission-restricted secret file',
+        keys: '\u001b[B'.repeat(fileChoice - 1) + '\r',
+      },
+      {
+        waitFor: 'Existing PostgreSQL URL (or Back/Cancel)',
+        keys: `postgres://operator:${secret}@localhost:5432/datagram?sslmode=disable\r`,
+      },
+      { waitFor: 'Private network', keys: '\u0003' },
+    ],
+    home,
+  );
+  expect(result.exitCode).toBe(0);
+  expect(result.stdout).toContain('Setup cancelled. No changes were made.');
+  expect(result.stdout).not.toContain(secret);
+  expect(
+    await Bun.file(join(directories(home).configuration, 'profiles', 'cancelled.json')).exists(),
+  ).toBe(false);
+  expect(
+    await Bun.file(join(directories(home).configuration, 'secrets', 'cancelled.json')).exists(),
+  ).toBe(false);
+}, 30_000);
+
 test.skipIf(postgresUrl === undefined)(
   'packed CLI configures external PostgreSQL and serves authenticated HTTP',
   async () => {
@@ -239,17 +287,20 @@ test.skipIf(postgresUrl === undefined)(
     const result = await interactivePackageCommand(
       ['init'],
       [
-        '2',
-        profileName,
-        'External Operator',
-        '1',
-        environmentChoice,
-        '',
-        '',
-        '',
-        String(serverPort),
-        'yes',
-        '',
+        { waitFor: 'Use on this machine', keys: '\u001b[B\r' },
+        { waitFor: 'Team Service profile name', keys: `${profileName}\r` },
+        { waitFor: 'Deployment Operator display name', keys: 'External Operator\r' },
+        { waitFor: 'Existing PostgreSQL URL (externally owned)', keys: '\r' },
+        {
+          waitFor: 'Environment references (Advanced)',
+          keys: '\u001b[B'.repeat(Number(environmentChoice) - 1) + '\r',
+        },
+        { waitFor: 'PostgreSQL URL environment variable', keys: '\r' },
+        { waitFor: 'Operator bearer token environment variable', keys: '\r' },
+        { waitFor: 'Private network', keys: '\r' },
+        { waitFor: 'HTTP port', keys: `${serverPort}\r` },
+        { waitFor: 'Apply this plan?', keys: '\r' },
+        { waitFor: 'Connect Codex now?', keys: '\r' },
       ],
       home,
       environment,
@@ -283,7 +334,21 @@ test.skipIf(postgresUrl === undefined || !dockerAvailable)(
     const fileChoice = (await nativeCredentialAvailable(home)) ? '2' : '1';
     const result = await interactivePackageCommand(
       ['init'],
-      ['2', profileName, 'Managed Operator', '2', String(definition.port), fileChoice, '', String(serverPort), 'yes', ''],
+      [
+        { waitFor: 'Use on this machine', keys: '\u001b[B\r' },
+        { waitFor: 'Team Service profile name', keys: `${profileName}\r` },
+        { waitFor: 'Deployment Operator display name', keys: 'Managed Operator\r' },
+        { waitFor: 'Existing PostgreSQL URL (externally owned)', keys: '\u001b[B\r' },
+        { waitFor: 'PostgreSQL host port', keys: `${definition.port}\r` },
+        {
+          waitFor: 'Permission-restricted secret file',
+          keys: '\u001b[B'.repeat(Number(fileChoice) - 1) + '\r',
+        },
+        { waitFor: 'Private network', keys: '\r' },
+        { waitFor: 'HTTP port', keys: `${serverPort}\r` },
+        { waitFor: 'Apply this plan?', keys: '\r' },
+        { waitFor: 'Connect Codex now?', keys: '\r' },
+      ],
       home,
     );
 

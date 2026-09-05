@@ -3,6 +3,7 @@ import { join, resolve } from 'node:path';
 import { DatagramError } from '../../application/errors';
 import type { OpenDatagramRuntime } from '../../runtime';
 import type { CliHost } from './host';
+import { createAnswerReader, type ReadAnswer } from './prompts';
 import { checkService } from './doctor';
 import { runGuidedServerSetup } from './server-setup';
 import {
@@ -54,20 +55,6 @@ interface LegacyLocalService {
 }
 
 const durableInstallCommand = 'bun install --global prosto-datagram';
-type ReadAnswer = () => Promise<string>;
-
-async function* lines(input: AsyncIterable<string | Uint8Array>): AsyncGenerator<string> {
-  const decoder = new TextDecoder();
-  let buffered = '';
-  for await (const chunk of input) {
-    buffered += typeof chunk === 'string' ? chunk : decoder.decode(chunk, { stream: true });
-    const split = buffered.split(/\r?\n/);
-    buffered = split.pop() ?? '';
-    for (const line of split) yield line;
-  }
-  buffered += decoder.decode();
-  if (buffered.length > 0) yield buffered;
-}
 
 function normalized(value: string): string {
   return value.trim();
@@ -79,21 +66,6 @@ function isCancel(value: string): boolean {
 
 function isBack(value: string): boolean {
   return normalized(value).toLowerCase() === 'back';
-}
-
-function createAnswerReader(host: CliHost): ReadAnswer {
-  const answers = lines(host.terminal.input)[Symbol.asyncIterator]();
-  return async () => {
-    const result = await answers.next();
-    if (result.done) {
-      throw new DatagramError(
-        'setup.input-ended',
-        'Setup input ended. Run `datagram init` in an interactive terminal to try again.',
-        400,
-      );
-    }
-    return result.value;
-  };
 }
 
 async function detectLegacyLocalService(host: CliHost): Promise<LegacyLocalService | undefined> {
@@ -125,21 +97,25 @@ async function runLegacyAdoption(
   legacy: LegacyLocalService,
   requestedProfileName?: string,
 ): Promise<boolean> {
-  host.terminal.writeOutput(
-    'Existing Local Service detected.\n' +
-      `  Source: ${legacy.databaseSource === 'environment' ? 'legacy environment configuration' : 'current-directory SQLite'}\n` +
-      `  SQLite data: ${legacy.databasePath}\n` +
-      (legacy.environmentDatabasePath === undefined
-        ? ''
-        : `  DATAGRAM_DB: ${legacy.environmentDatabasePath}\n`) +
-      (legacy.actorId === undefined ? '' : `  DATAGRAM_ACTOR_ID: ${legacy.actorId}\n`) +
-      'Choose operation:\n' +
-      '  1. Preview adoption into a named profile (Recommended)\n' +
-      '  2. Set up a separate new Service\n' +
-      '  3. Cancel\n' +
-      'Selection [1]: ',
+  const rawChoice = normalized(
+    await read({
+      message:
+        'Existing Local Service detected.\n' +
+        `  Source: ${legacy.databaseSource === 'environment' ? 'legacy environment configuration' : 'current-directory SQLite'}\n` +
+        `  SQLite data: ${legacy.databasePath}\n` +
+        (legacy.environmentDatabasePath === undefined
+          ? ''
+          : `  DATAGRAM_DB: ${legacy.environmentDatabasePath}\n`) +
+        (legacy.actorId === undefined ? '' : `  DATAGRAM_ACTOR_ID: ${legacy.actorId}\n`) +
+        'Choose operation:',
+      initialValue: '1',
+      choices: [
+        { value: '1', label: 'Preview adoption into a named profile (Recommended)' },
+        { value: '2', label: 'Set up a separate new Service' },
+        { value: '3', label: 'Cancel' },
+      ],
+    }),
   );
-  const rawChoice = normalized(await read());
   const choice = rawChoice === '' ? '1' : rawChoice;
   if (choice === '3' || isCancel(choice)) {
     host.terminal.writeOutput('Adoption cancelled. No changes were made.\n');
@@ -151,10 +127,12 @@ async function runLegacyAdoption(
   }
 
   const initialProfileName = requestedProfileName ?? defaultProfileName;
-  host.terminal.writeOutput(
-    `Name the adopted Service profile\nProfile name [${initialProfileName}] (or Cancel): `,
+
+  const profileAnswer = normalized(
+    await read({
+      message: `Name the adopted Service profile\nProfile name [${initialProfileName}] (or Cancel): `,
+    }),
   );
-  const profileAnswer = normalized(await read());
   if (isCancel(profileAnswer)) {
     host.terminal.writeOutput('Adoption cancelled. No changes were made.\n');
     return true;
@@ -182,25 +160,30 @@ async function runLegacyAdoption(
       );
     }
     const defaultProfilePath = join(host.directories.configuration, 'default-profile');
-    host.terminal.writeOutput(
-      'Review adoption plan\n' +
-        `  Service: Local Service\n  Profile: ${profileName}\n` +
-        `  Configuration: ${profilePath}\n` +
-        `  Default profile selection: ${defaultProfilePath} -> ${profileName}\n` +
-        `  SQLite data reference: ${legacy.databasePath}\n` +
-        `  Identity person ID: ${identity.id}\n` +
-        `  Identity display name: ${identity.displayName}\n` +
-        (legacy.environmentDatabasePath === undefined
-          ? ''
-          : `  Legacy DATAGRAM_DB value: ${legacy.environmentDatabasePath}\n`) +
-        (legacy.actorId === undefined
-          ? ''
-          : `  Legacy DATAGRAM_ACTOR_ID value: ${legacy.actorId}\n`) +
-        '  Existing SQLite data: referenced in place; not moved, rewritten, or deleted\n' +
-        '  Secrets: none\n' +
-        'Adopt this existing Service? [Y/n] (or Cancel): ',
-    );
-    const answer = normalized(await read()).toLowerCase();
+
+    const answer = normalized(
+      await read({
+        message:
+          'Review adoption plan\n' +
+          `  Service: Local Service\n  Profile: ${profileName}\n` +
+          `  Configuration: ${profilePath}\n` +
+          `  Default profile selection: ${defaultProfilePath} -> ${profileName}\n` +
+          `  SQLite data reference: ${legacy.databasePath}\n` +
+          `  Identity person ID: ${identity.id}\n` +
+          `  Identity display name: ${identity.displayName}\n` +
+          (legacy.environmentDatabasePath === undefined
+            ? ''
+            : `  Legacy DATAGRAM_DB value: ${legacy.environmentDatabasePath}\n`) +
+          (legacy.actorId === undefined
+            ? ''
+            : `  Legacy DATAGRAM_ACTOR_ID value: ${legacy.actorId}\n`) +
+          '  Existing SQLite data: referenced in place; not moved, rewritten, or deleted\n' +
+          '  Secrets: none\n' +
+          'Adopt this existing Service?',
+        confirm: true,
+        initialValue: 'yes',
+      }),
+    ).toLowerCase();
     if (isCancel(answer) || answer === 'n' || answer === 'no') {
       host.terminal.writeOutput('Adoption cancelled. No changes were made.\n');
       return true;
@@ -263,13 +246,16 @@ async function collectAnswers(
   let durableInstall: DurableInstallPlan | undefined;
   while (true) {
     if (step === 0) {
-      host.terminal.writeOutput(
-        '[1/5] Choose how to use Datagram\n' +
-          '  1. Use on this machine (Recommended)\n' +
-          '  2. Run for a team\n' +
-          'Selection [1] (or Cancel): ',
+      const answer = normalized(
+        await read({
+          message: '[1/5] Choose how to use Datagram',
+          initialValue: '1',
+          choices: [
+            { value: '1', label: 'Use on this machine (Recommended)' },
+            { value: '2', label: 'Run for a team' },
+          ],
+        }),
       );
-      const answer = normalized(await read());
       if (isCancel(answer)) return { kind: 'cancelled' };
       if (answer === '' || answer === '1') {
         step = 1;
@@ -284,10 +270,11 @@ async function collectAnswers(
     }
 
     if (step === 1) {
-      host.terminal.writeOutput(
-        `[2/5] Name this Service profile\nProfile name [${profileName}] (or Back/Cancel): `,
+      const answer = normalized(
+        await read({
+          message: `[2/5] Name this Service profile\nProfile name [${profileName}] (or Back/Cancel): `,
+        }),
       );
-      const answer = normalized(await read());
       if (isCancel(answer)) return { kind: 'cancelled' };
       if (isBack(answer)) {
         step = 0;
@@ -306,10 +293,11 @@ async function collectAnswers(
     }
 
     if (step === 2) {
-      host.terminal.writeOutput(
-        '[3/5] Identify the Deployment Operator\nDisplay name (or Back/Cancel): ',
+      const answer = normalized(
+        await read({
+          message: '[3/5] Identify the Deployment Operator\nDisplay name (or Back/Cancel): ',
+        }),
       );
-      const answer = normalized(await read());
       if (isCancel(answer)) return { kind: 'cancelled' };
       if (isBack(answer)) {
         step = 1;
@@ -323,11 +311,19 @@ async function collectAnswers(
     }
 
     if (step === 3) {
-      host.terminal.writeOutput(
-        '[4/5] Choose command access\n' +
-          'Install durable global `datagram` and `datagram-mcp` commands? [y/N] (or Back/Cancel): ',
-      );
-      const answer = normalized(await read()).toLowerCase();
+      const answer = normalized(
+        await read({
+          message:
+            '[4/5] Choose command access\n' +
+            'Install durable global `datagram` and `datagram-mcp` commands?',
+          initialValue: 'no',
+          choices: [
+            { value: 'no', label: 'Use bunx without global installation' },
+            { value: 'yes', label: 'Install global commands' },
+            { value: 'Back', label: 'Back' },
+          ],
+        }),
+      ).toLowerCase();
       if (isCancel(answer)) return { kind: 'cancelled' };
       if (isBack(answer)) {
         step = 2;
@@ -357,18 +353,27 @@ async function collectAnswers(
 
     const databasePath = join(host.directories.data, 'profiles', profileName, 'datagram.sqlite');
     const profilePath = join(host.directories.configuration, 'profiles', `${profileName}.json`);
-    host.terminal.writeOutput(
-      '[5/5] Review plan\n' +
-        `  Service: Local Service\n  Profile: ${profileName} (default)\n` +
-        `  Configuration: ${profilePath}\n  SQLite data: ${databasePath}\n` +
-        `  Deployment Operator: ${displayName}\n  Secrets: none\n` +
-        (durableInstall === undefined
-          ? '  Durable commands: skipped; use bunx package-runner commands\n'
-          : `  Durable install command: ${durableInstallCommand}\n` +
-            `  Executables: ${durableInstall.executablePaths.join(', ')}\n`) +
-        'Apply this plan? [Y/n] (or Back/Cancel): ',
-    );
-    const answer = normalized(await read()).toLowerCase();
+
+    const answer = normalized(
+      await read({
+        message:
+          '[5/5] Review plan\n' +
+          `  Service: Local Service\n  Profile: ${profileName} (default)\n` +
+          `  Configuration: ${profilePath}\n  SQLite data: ${databasePath}\n` +
+          `  Deployment Operator: ${displayName}\n  Secrets: none\n` +
+          (durableInstall === undefined
+            ? '  Durable commands: skipped; use bunx package-runner commands\n'
+            : `  Durable install command: ${durableInstallCommand}\n` +
+              `  Executables: ${durableInstall.executablePaths.join(', ')}\n`) +
+          'Apply this plan?',
+        initialValue: 'yes',
+        choices: [
+          { value: 'yes', label: 'Apply' },
+          { value: 'Back', label: 'Back' },
+          { value: 'Cancel', label: 'Cancel' },
+        ],
+      }),
+    ).toLowerCase();
     if (isCancel(answer) || answer === 'n' || answer === 'no') return { kind: 'cancelled' };
     if (isBack(answer)) {
       step = 3;
@@ -389,8 +394,9 @@ async function collectStarterAnswers(
   | { readonly kind: 'apply'; readonly firstItem: string; readonly title?: string }
 > {
   if (progress.status !== 'pending') {
-    host.terminal.writeOutput('Resume your first Table\nFirst item (or Cancel): ');
-    const firstItem = normalized(await read());
+    const firstItem = normalized(
+      await read({ message: 'Resume your first Table\nFirst item (or Cancel): ' }),
+    );
     return isCancel(firstItem) ? { kind: 'cancelled' } : { kind: 'apply', firstItem };
   }
 
@@ -398,16 +404,16 @@ async function collectStarterAnswers(
   let step = 0;
   while (true) {
     if (step === 0) {
-      host.terminal.writeOutput('Create your first Table\nChannel title (or Cancel): ');
-      const answer = normalized(await read());
+      const answer = normalized(
+        await read({ message: 'Create your first Table\nChannel title (or Cancel): ' }),
+      );
       if (isCancel(answer)) return { kind: 'cancelled' };
       title = answer;
       step = 1;
       continue;
     }
 
-    host.terminal.writeOutput('First item (or Back/Cancel): ');
-    const firstItem = normalized(await read());
+    const firstItem = normalized(await read({ message: 'First item (or Back/Cancel): ' }));
     if (isCancel(firstItem)) return { kind: 'cancelled' };
     if (isBack(firstItem)) {
       step = 0;
@@ -447,7 +453,11 @@ async function existingSetupName(
     if (!profileNamePattern.test(requestedProfileName)) {
       throw new DatagramError('profile.name-invalid', 'Profile name is invalid.', 400);
     }
-    const profilePath = join(host.directories.configuration, 'profiles', `${requestedProfileName}.json`);
+    const profilePath = join(
+      host.directories.configuration,
+      'profiles',
+      `${requestedProfileName}.json`,
+    );
     return (await host.filesystem.pathExists(profilePath)) ? requestedProfileName : undefined;
   }
   const defaultProfilePath = join(host.directories.configuration, 'default-profile');
@@ -507,9 +517,7 @@ async function reconcileUncertainStarterAction(
   });
   if (!Array.isArray(history.data)) return undefined;
   const priorOperationId =
-    progress.status === 'field-applying'
-      ? progress.channelOperationId
-      : progress.fieldOperationId;
+    progress.status === 'field-applying' ? progress.channelOperationId : progress.fieldOperationId;
   const priorIndex = history.data.findIndex(
     (operation) =>
       typeof operation === 'object' &&
@@ -520,19 +528,21 @@ async function reconcileUncertainStarterAction(
   if (priorIndex < 0) return undefined;
   const expectedIntent =
     progress.status === 'field-applying' ? 'table.field.add' : 'table.record.create';
-  const candidates = history.data.slice(priorIndex + 1).filter(
-    (operation): operation is { readonly id: string } =>
-      typeof operation === 'object' &&
-      operation !== null &&
-      'actorId' in operation &&
-      operation.actorId === actorId &&
-      'origin' in operation &&
-      operation.origin === 'cli' &&
-      'intent' in operation &&
-      operation.intent === expectedIntent &&
-      'id' in operation &&
-      typeof operation.id === 'string',
-  );
+  const candidates = history.data
+    .slice(priorIndex + 1)
+    .filter(
+      (operation): operation is { readonly id: string } =>
+        typeof operation === 'object' &&
+        operation !== null &&
+        'actorId' in operation &&
+        operation.actorId === actorId &&
+        'origin' in operation &&
+        operation.origin === 'cli' &&
+        'intent' in operation &&
+        operation.intent === expectedIntent &&
+        'id' in operation &&
+        typeof operation.id === 'string',
+    );
   if (candidates.length !== 1) return undefined;
   return progress.status === 'field-applying'
     ? {
@@ -598,15 +608,19 @@ async function runCodexStep(
     return { journal: next, summary: `unavailable (${discovery.reason})` };
   }
   const plan = discovery.plan;
-  host.terminal.writeOutput(
-    '[optional] Connect Codex\n' +
-      `  Skill: install Datagram-owned files at ${plan.skillDestination}\n` +
-      `  MCP: codex mcp add ${plan.mcpServerName} -- ${plan.command} --profile ${JSON.stringify(plan.profileName)}\n` +
-      `  Credential reference: ${plan.credentialReference}\n` +
-      '  Authority: selected person; Store-derived values remain outside agent output\n' +
-      'Connect Codex now? [y/N]: ',
-  );
-  const answer = normalized(await read()).toLowerCase();
+
+  const answer = normalized(
+    await read({
+      message:
+        '[optional] Connect Codex\n' +
+        `  Skill: install Datagram-owned files at ${plan.skillDestination}\n` +
+        `  MCP: codex mcp add ${plan.mcpServerName} -- ${plan.command} --profile ${JSON.stringify(plan.profileName)}\n` +
+        `  Credential reference: ${plan.credentialReference}\n` +
+        '  Authority: selected person; Store-derived values remain outside agent output\n' +
+        'Connect Codex now?',
+      confirm: true,
+    }),
+  ).toLowerCase();
   if (answer !== 'y' && answer !== 'yes') {
     const next: SetupJournal = {
       ...clearFailure(journal),
@@ -652,8 +666,13 @@ async function confirmReviewedOperation(
   read: ReadAnswer,
   description: string,
 ): Promise<boolean> {
-  host.terminal.writeOutput(`${description}\nApply this reviewed operation? [Y/n]: `);
-  const answer = normalized(await read()).toLowerCase();
+  const answer = normalized(
+    await read({
+      message: `${description}\nApply this reviewed operation?`,
+      confirm: true,
+      initialValue: 'yes',
+    }),
+  ).toLowerCase();
   return answer === '' || answer === 'y' || answer === 'yes';
 }
 
@@ -675,34 +694,50 @@ async function runExistingServerSetup(
     } satisfies SetupJournal);
   const report = await checkService(host, profile.name);
   const coreReportOk =
-    report.ok || report.checks.some((check) => check.status === 'failed' && check.stage === 'codex');
+    report.ok ||
+    report.checks.some((check) => check.status === 'failed' && check.stage === 'codex');
   const incomplete =
     profile.setup?.core !== 'verified' ||
     journal.codex?.status === 'pending' ||
     journal.codex?.status === 'skill-installed';
-  host.terminal.writeOutput(
-    `Existing setup detected for profile ${JSON.stringify(profile.name)}.\n` +
-      `Core: ${profile.setup?.core ?? 'incomplete'}; Service: ${coreReportOk ? 'ready' : 'needs repair'}; Codex: ${journal.codex?.status ?? 'not configured'}\n` +
-      'Choose reviewed operation:\n' +
-      '  1. Inspect only\n' +
-      `  2. Resume or repair verification${incomplete || !coreReportOk ? ' (Recommended)' : ''}\n` +
-      '  3. Update default profile selection\n' +
-      '  4. Cancel\n' +
-      `Selection [${incomplete || !coreReportOk ? '2' : '1'}]: `,
+
+  const rawChoice = normalized(
+    await read({
+      message:
+        `Existing setup detected for profile ${JSON.stringify(profile.name)}.\n` +
+        `Core: ${profile.setup?.core ?? 'incomplete'}; Service: ${coreReportOk ? 'ready' : 'needs repair'}; Codex: ${journal.codex?.status ?? 'not configured'}\n` +
+        'Choose reviewed operation:',
+      initialValue: incomplete || !coreReportOk ? '2' : '1',
+      choices: [
+        { value: '1', label: 'Inspect only' },
+        {
+          value: '2',
+          label: `Resume or repair verification${incomplete || !coreReportOk ? ' (Recommended)' : ''}`,
+        },
+        { value: '3', label: 'Update default profile selection' },
+        { value: '4', label: 'Cancel' },
+      ],
+    }),
   );
-  const rawChoice = normalized(await read());
   const choice = rawChoice === '' ? (incomplete || !coreReportOk ? '2' : '1') : rawChoice;
   if (choice === '4' || isCancel(choice)) {
     host.terminal.writeOutput('Setup cancelled. No changes were made.\n');
     return;
   }
   if (choice === '1') {
-    for (const check of report.checks) host.terminal.writeOutput(`${check.stage}: ${check.status}\n`);
+    for (const check of report.checks)
+      host.terminal.writeOutput(`${check.stage}: ${check.status}\n`);
     host.terminal.writeOutput(`No changes made. Resume or repair: ${command}\n`);
     return;
   }
   if (choice === '3') {
-    if (!(await confirmReviewedOperation(host, read, `Update only default profile selection to ${JSON.stringify(profile.name)}.\nNo Service data or other configuration will change.`))) {
+    if (
+      !(await confirmReviewedOperation(
+        host,
+        read,
+        `Update only default profile selection to ${JSON.stringify(profile.name)}.\nNo Service data or other configuration will change.`,
+      ))
+    ) {
       host.terminal.writeOutput('Update cancelled. No changes were made.\n');
       return;
     }
@@ -717,7 +752,13 @@ async function runExistingServerSetup(
   if (choice !== '2') {
     throw new DatagramError('input.invalid', 'Choose 1, 2, 3, or 4.', 400);
   }
-  if (!(await confirmReviewedOperation(host, read, `Resume or repair verification for ${JSON.stringify(profile.name)}.\nExisting PostgreSQL data, credentials, and unrelated configuration will not be changed.`))) {
+  if (
+    !(await confirmReviewedOperation(
+      host,
+      read,
+      `Resume or repair verification for ${JSON.stringify(profile.name)}.\nExisting PostgreSQL data, credentials, and unrelated configuration will not be changed.`,
+    ))
+  ) {
     host.terminal.writeOutput('Repair cancelled. No changes were made.\n');
     return;
   }
@@ -771,11 +812,14 @@ async function runExistingSetup(
   if (reconciledStarter !== journal.starter) {
     journal = { ...clearFailure(journal), starter: reconciledStarter };
     await saveProgress(host, profilePath, profile, journal);
-    host.terminal.writeOutput('Reconciled committed starter Action from verified profile progress.\n');
+    host.terminal.writeOutput(
+      'Reconciled committed starter Action from verified profile progress.\n',
+    );
   }
   const report = await checkService(host, profileName);
   const coreReportOk =
-    report.ok || report.checks.some((check) => check.status === 'failed' && check.stage === 'codex');
+    report.ok ||
+    report.checks.some((check) => check.status === 'failed' && check.stage === 'codex');
   const incomplete =
     journalInvalid ||
     journal.core !== 'verified' ||
@@ -783,30 +827,45 @@ async function runExistingSetup(
     journal.durableInstall === 'pending' ||
     journal.codex?.status === 'pending' ||
     journal.codex?.status === 'skill-installed';
-  host.terminal.writeOutput(
-    `Existing setup detected for profile ${JSON.stringify(profileName)}.\n` +
-      `Core: ${journal.core}; starter: ${journal.starter.status}; Service: ${coreReportOk ? 'ready' : 'needs repair'}; Codex: ${journal.codex?.status ?? 'not configured'}; journal: ${journalInvalid ? 'needs repair' : 'valid'}\n` +
-      'Choose reviewed operation:\n' +
-      '  1. Inspect only\n' +
-      `  2. Resume incomplete stages${incomplete ? ' (Recommended)' : ''}\n` +
-      `  3. Repair setup metadata${!coreReportOk || journalInvalid ? ' (Recommended)' : ''}\n` +
-      '  4. Update default profile selection\n' +
-      '  5. Cancel\n' +
-      `Selection [${journalInvalid ? '3' : incomplete ? '2' : '1'}]: `,
+
+  const rawChoice = normalized(
+    await read({
+      message:
+        `Existing setup detected for profile ${JSON.stringify(profileName)}.\n` +
+        `Core: ${journal.core}; starter: ${journal.starter.status}; Service: ${coreReportOk ? 'ready' : 'needs repair'}; Codex: ${journal.codex?.status ?? 'not configured'}; journal: ${journalInvalid ? 'needs repair' : 'valid'}\n` +
+        'Choose reviewed operation:',
+      initialValue: journalInvalid ? '3' : incomplete ? '2' : '1',
+      choices: [
+        { value: '1', label: 'Inspect only' },
+        { value: '2', label: `Resume incomplete stages${incomplete ? ' (Recommended)' : ''}` },
+        {
+          value: '3',
+          label: `Repair setup metadata${!coreReportOk || journalInvalid ? ' (Recommended)' : ''}`,
+        },
+        { value: '4', label: 'Update default profile selection' },
+        { value: '5', label: 'Cancel' },
+      ],
+    }),
   );
-  const rawChoice = normalized(await read());
   const choice = rawChoice === '' ? (journalInvalid ? '3' : incomplete ? '2' : '1') : rawChoice;
   if (choice === '5' || isCancel(choice)) {
     host.terminal.writeOutput('Setup cancelled. No changes were made.\n');
     return;
   }
   if (choice === '1') {
-    for (const check of report.checks) host.terminal.writeOutput(`${check.stage}: ${check.status}\n`);
+    for (const check of report.checks)
+      host.terminal.writeOutput(`${check.stage}: ${check.status}\n`);
     host.terminal.writeOutput(`No changes made. Resume or repair: ${command}\n`);
     return;
   }
   if (choice === '4') {
-    if (!(await confirmReviewedOperation(host, read, `Update only default profile selection to ${JSON.stringify(profileName)}.\nNo Service data or other configuration will change.`))) {
+    if (
+      !(await confirmReviewedOperation(
+        host,
+        read,
+        `Update only default profile selection to ${JSON.stringify(profileName)}.\nNo Service data or other configuration will change.`,
+      ))
+    ) {
       host.terminal.writeOutput('Update cancelled. No changes were made.\n');
       return;
     }
@@ -819,7 +878,13 @@ async function runExistingSetup(
     return;
   }
   if (choice === '3') {
-    if (!(await confirmReviewedOperation(host, read, `Repair setup metadata for ${JSON.stringify(profileName)} from verified Doctor facts.\nNo profile, Store, database, Channel, Record, secret, or unrelated configuration will be deleted.`))) {
+    if (
+      !(await confirmReviewedOperation(
+        host,
+        read,
+        `Repair setup metadata for ${JSON.stringify(profileName)} from verified Doctor facts.\nNo profile, Store, database, Channel, Record, secret, or unrelated configuration will be deleted.`,
+      ))
+    ) {
       host.terminal.writeOutput('Repair cancelled. No changes were made.\n');
       return;
     }
@@ -833,7 +898,9 @@ async function runExistingSetup(
     }
     journal = { ...clearFailure(journal), core: 'verified' };
     await saveProgress(host, profilePath, profile, journal);
-    host.terminal.writeOutput(`Setup metadata repaired. Inspect: bunx prosto-datagram doctor --profile ${JSON.stringify(profileName)}\n`);
+    host.terminal.writeOutput(
+      `Setup metadata repaired. Inspect: bunx prosto-datagram doctor --profile ${JSON.stringify(profileName)}\n`,
+    );
     return;
   }
   if (choice !== '2') {
@@ -846,12 +913,22 @@ async function runExistingSetup(
       400,
     );
   }
-  if (!(await confirmReviewedOperation(host, read, `Resume profile ${JSON.stringify(profileName)} from last verified stage.\nCore will not be repeated. Completed optional effects will not be repeated.`))) {
+  if (
+    !(await confirmReviewedOperation(
+      host,
+      read,
+      `Resume profile ${JSON.stringify(profileName)} from last verified stage.\nCore will not be repeated. Completed optional effects will not be repeated.`,
+    ))
+  ) {
     host.terminal.writeOutput('Resume cancelled. No changes were made.\n');
     return;
   }
   if (!coreReportOk) {
-    throw new DatagramError('setup.repair-required', `Resume stopped safely; Service needs repair. Repair: ${command}`, 400);
+    throw new DatagramError(
+      'setup.repair-required',
+      `Resume stopped safely; Service needs repair. Repair: ${command}`,
+      400,
+    );
   }
   if (journal.core !== 'verified') {
     journal = { ...clearFailure(journal), core: 'verified' };
@@ -882,7 +959,11 @@ async function runExistingSetup(
   if (journal.starter.status !== 'complete') {
     const resumableStarter = normalStarter(journal.starter);
     if (resumableStarter === undefined) {
-      throw new DatagramError('setup.effect-uncertain', 'Starter Action state remains uncertain.', 409);
+      throw new DatagramError(
+        'setup.effect-uncertain',
+        'Starter Action state remains uncertain.',
+        409,
+      );
     }
     const answers = await collectStarterAnswers(host, read, resumableStarter);
     if (answers.kind === 'cancelled') {
@@ -895,10 +976,15 @@ async function runExistingSetup(
       if (starter.status === 'pending') {
         journal = { ...clearFailure(journal), starter: { status: 'channel-applying' } };
         await saveSetupJournal(host, journal);
-        const receipt = await runtime.app.executeAction(profile.identity.personId, 'cli', 'channel.create', {
-          title: answers.title,
-          typeId: 'table',
-        });
+        const receipt = await runtime.app.executeAction(
+          profile.identity.personId,
+          'cli',
+          'channel.create',
+          {
+            title: answers.title,
+            typeId: 'table',
+          },
+        );
         starter = {
           status: 'channel-created',
           channelId: actionSubjectId(receipt, 'channel.create'),
@@ -908,23 +994,52 @@ async function runExistingSetup(
         await saveProgress(host, profilePath, profile, journal);
       }
       if (starter.status === 'channel-created') {
-        journal = { ...journal, starter: { status: 'field-applying', channelId: starter.channelId, channelOperationId: starter.channelOperationId } };
+        journal = {
+          ...journal,
+          starter: {
+            status: 'field-applying',
+            channelId: starter.channelId,
+            channelOperationId: starter.channelOperationId,
+          },
+        };
         await saveSetupJournal(host, journal);
-        const receipt = await runtime.app.executeAction(profile.identity.personId, 'cli', 'table.field.add', {
-          channelId: starter.channelId,
-          key: 'name', label: 'Name', required: true, type: 'text', unique: true,
-        });
+        const receipt = await runtime.app.executeAction(
+          profile.identity.personId,
+          'cli',
+          'table.field.add',
+          {
+            channelId: starter.channelId,
+            key: 'name',
+            label: 'Name',
+            required: true,
+            type: 'text',
+            unique: true,
+          },
+        );
         starter = { ...starter, status: 'field-created', fieldOperationId: receipt.operationId };
         journal = { ...journal, starter };
         await saveProgress(host, profilePath, profile, journal);
       }
       if (starter.status === 'field-created') {
-        journal = { ...journal, starter: { status: 'record-applying', channelId: starter.channelId, channelOperationId: starter.channelOperationId, fieldOperationId: starter.fieldOperationId } };
+        journal = {
+          ...journal,
+          starter: {
+            status: 'record-applying',
+            channelId: starter.channelId,
+            channelOperationId: starter.channelOperationId,
+            fieldOperationId: starter.fieldOperationId,
+          },
+        };
         await saveSetupJournal(host, journal);
-        const receipt = await runtime.app.executeAction(profile.identity.personId, 'cli', 'table.record.create', {
-          channelId: starter.channelId,
-          values: { name: answers.firstItem },
-        });
+        const receipt = await runtime.app.executeAction(
+          profile.identity.personId,
+          'cli',
+          'table.record.create',
+          {
+            channelId: starter.channelId,
+            values: { name: answers.firstItem },
+          },
+        );
         const completed: StarterProgress = {
           ...starter,
           status: 'complete',
@@ -941,16 +1056,22 @@ async function runExistingSetup(
         failure: { stage: 'starter', code: 'setup.starter-failed' },
       };
       await saveSetupJournal(host, journal);
-      throw new DatagramError('setup.starter-failed', `Starter setup failed. Core remains ready. Resume: ${command}`, 500);
+      throw new DatagramError(
+        'setup.starter-failed',
+        `Starter setup failed. Core remains ready. Resume: ${command}`,
+        500,
+      );
     } finally {
       await runtime.close();
     }
   }
   if (journal.durableInstall === 'pending') {
-    host.terminal.writeOutput(
-      `Resume optional durable command install: ${durableInstallCommand}\nRun it now? [y/N]: `,
-    );
-    const answer = normalized(await read()).toLowerCase();
+    const answer = normalized(
+      await read({
+        message: `Resume optional durable command install: ${durableInstallCommand}\nRun it now?`,
+        confirm: true,
+      }),
+    ).toLowerCase();
     if (answer === 'y' || answer === 'yes') {
       const installed = await host.runExternalCommand({
         command: 'bun',
@@ -971,7 +1092,11 @@ async function runExistingSetup(
       host.terminal.writeOutput(`Optional install remains pending. Resume: ${command}\n`);
     }
   }
-  if (journal.codex !== undefined && journal.codex.status !== 'skipped' && journal.codex.status !== 'verified') {
+  if (
+    journal.codex !== undefined &&
+    journal.codex.status !== 'skipped' &&
+    journal.codex.status !== 'verified'
+  ) {
     ({ journal } = await runCodexStep(host, read, journal));
   }
   host.terminal.writeOutput(
@@ -1003,7 +1128,8 @@ export async function runGuidedInit(host: CliHost, requestedProfileName?: string
     return;
   }
   host.terminal.writeOutput(
-    'Set up Prosto.Datagram\nType Back to revisit a choice or Cancel to exit before Apply.\n',
+    'Set up Prosto.Datagram\nUse ↑/↓ and Enter to choose. Select Back in menus to revisit a step.\n' +
+      'Type Back in text fields that offer it. Press Esc or Ctrl+C to cancel.\n',
   );
   const result = await collectAnswers(host, read, requestedProfileName);
   if (result.kind === 'cancelled') {
@@ -1062,7 +1188,9 @@ export async function runGuidedInit(host: CliHost, requestedProfileName?: string
       ...(existingSetup === undefined ? {} : { setup: existingSetup }),
     };
     await saveProfile(host, profilePath, profile);
-    await host.filesystem.writeTextFileAtomic(defaultProfilePath, `${result.profileName}\n`, { mode: 0o600 });
+    await host.filesystem.writeTextFileAtomic(defaultProfilePath, `${result.profileName}\n`, {
+      mode: 0o600,
+    });
     journal = { ...journal, core: 'applied' };
     await saveSetupJournal(host, journal);
 
@@ -1099,10 +1227,15 @@ export async function runGuidedInit(host: CliHost, requestedProfileName?: string
         if (starter.status === 'pending') {
           journal = { ...journal, starter: { status: 'channel-applying' } };
           await saveSetupJournal(host, journal);
-          const receipt = await runtime.app.executeAction(runtime.owner.id, 'cli', 'channel.create', {
-            title: answers.title,
-            typeId: 'table',
-          });
+          const receipt = await runtime.app.executeAction(
+            runtime.owner.id,
+            'cli',
+            'channel.create',
+            {
+              title: answers.title,
+              typeId: 'table',
+            },
+          );
           starter = {
             status: 'channel-created',
             channelId: actionSubjectId(receipt, 'channel.create'),

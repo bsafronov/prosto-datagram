@@ -7,10 +7,7 @@ import type { CredentialReference } from './credentials';
 import { checkService } from './doctor';
 import { applyCodexIntegration, discoverCodexIntegration } from './integrations';
 import { saveSetupJournal, type SetupJournal } from './journal';
-import {
-  managedPostgresDefinition,
-  type ManagedPostgresCreate,
-} from './docker-postgres';
+import { managedPostgresDefinition, type ManagedPostgresCreate } from './docker-postgres';
 import {
   parseProfile,
   profileNamePattern,
@@ -18,7 +15,7 @@ import {
   type ServerServiceProfile,
 } from './profiles';
 
-type ReadAnswer = () => Promise<string>;
+import type { ReadAnswer } from './prompts';
 type PublicAccess = ServerServiceProfile['service']['publicAccess'];
 
 interface Answers {
@@ -55,7 +52,11 @@ function postgresUrl(value: string): URL {
   } catch {
     throw new DatagramError('setup.postgres-url-invalid', 'Enter a valid PostgreSQL URL.', 400);
   }
-  if (!['postgres:', 'postgresql:'].includes(url.protocol) || !url.hostname || url.pathname === '/') {
+  if (
+    !['postgres:', 'postgresql:'].includes(url.protocol) ||
+    !url.hostname ||
+    url.pathname === '/'
+  ) {
     throw new DatagramError(
       'setup.postgres-url-invalid',
       'PostgreSQL URL must include a host and database.',
@@ -102,12 +103,17 @@ async function envSecret(
   label: string,
   defaultName: string,
 ): Promise<{ reference: CredentialReference; value: string }> {
-  host.terminal.writeOutput(`${label} environment variable [${defaultName}] (or Cancel): `);
-  const answer = trim(await read());
+  const answer = trim(
+    await read({ message: `${label} environment variable [${defaultName}] (or Cancel): ` }),
+  );
   if (isCancel(answer)) throw new DatagramError('setup.cancelled', 'Setup cancelled.', 400);
   const name = answer || defaultName;
   if (!envPattern.test(name)) {
-    throw new DatagramError('setup.environment-invalid', 'Environment variable name is invalid.', 400);
+    throw new DatagramError(
+      'setup.environment-invalid',
+      'Environment variable name is invalid.',
+      400,
+    );
   }
   const value = host.environment.get(name);
   if (!value) {
@@ -121,26 +127,36 @@ async function envSecret(
 }
 
 async function collect(host: CliHost, read: ReadAnswer): Promise<Answers | undefined> {
-  host.terminal.writeOutput('[2/9] Team Service profile name [team] (or Back/Cancel): ');
-  const rawProfileName = trim(await read());
+  const rawProfileName = trim(
+    await read({ message: '[2/9] Team Service profile name [team] (or Back/Cancel): ' }),
+  );
   if (isCancel(rawProfileName)) throw new DatagramError('setup.cancelled', 'Setup cancelled.', 400);
   if (isBack(rawProfileName)) return undefined;
   const profileName = rawProfileName || 'team';
   if (!profileNamePattern.test(profileName)) {
     throw new DatagramError('profile.name-invalid', 'Service profile name is invalid.', 400);
   }
-  host.terminal.writeOutput('[3/9] Deployment Operator display name (or Back/Cancel): ');
-  const displayName = trim(await read());
+
+  const displayName = trim(
+    await read({ message: '[3/9] Deployment Operator display name (or Back/Cancel): ' }),
+  );
   if (isCancel(displayName)) throw new DatagramError('setup.cancelled', 'Setup cancelled.', 400);
   if (isBack(displayName)) return collect(host, read);
   if (!displayName || displayName.length > 120) {
     throw new DatagramError('setup.display-name-invalid', 'Enter 1-120 characters.', 400);
   }
-  host.terminal.writeOutput(
-    '[4/9] PostgreSQL\n  1. Existing PostgreSQL URL (externally owned)\n' +
-      '  2. Docker-managed persistent PostgreSQL\nSelection [1] (or Back/Cancel): ',
+
+  const databaseSource = trim(
+    await read({
+      message: '[4/9] PostgreSQL',
+      initialValue: '1',
+      choices: [
+        { value: '1', label: 'Existing PostgreSQL URL (externally owned)' },
+        { value: '2', label: 'Docker-managed persistent PostgreSQL' },
+        { value: 'Back', label: 'Back' },
+      ],
+    }),
   );
-  const databaseSource = trim(await read());
   if (isCancel(databaseSource)) throw new DatagramError('setup.cancelled', 'Setup cancelled.', 400);
   if (isBack(databaseSource)) return collect(host, read);
   if (!['', '1', '2'].includes(databaseSource)) {
@@ -156,15 +172,18 @@ async function collect(host: CliHost, read: ReadAnswer): Promise<Answers | undef
   let managedPostgres: ManagedPostgresCreate | undefined;
   let managedCredentialsReused = false;
   if (managed) {
-    host.terminal.writeOutput('PostgreSQL host port [5432] (or Back/Cancel): ');
-    const rawPostgresPort = trim(await read());
-    if (isCancel(rawPostgresPort)) throw new DatagramError('setup.cancelled', 'Setup cancelled.', 400);
+    const rawPostgresPort = trim(
+      await read({ message: 'PostgreSQL host port [5432] (or Back/Cancel): ' }),
+    );
+    if (isCancel(rawPostgresPort))
+      throw new DatagramError('setup.cancelled', 'Setup cancelled.', 400);
     if (isBack(rawPostgresPort)) return collect(host, read);
     const postgresPort = rawPostgresPort ? Number(rawPostgresPort) : 5432;
     if (!Number.isInteger(postgresPort) || postgresPort < 1 || postgresPort > 65_535) {
       throw new DatagramError('setup.port-invalid', 'Port must be from 1 to 65535.', 400);
     }
-    const password = crypto.randomUUID().replaceAll('-', '') + crypto.randomUUID().replaceAll('-', '');
+    const password =
+      crypto.randomUUID().replaceAll('-', '') + crypto.randomUUID().replaceAll('-', '');
     bearerToken = crypto.randomUUID().replaceAll('-', '') + crypto.randomUUID().replaceAll('-', '');
     connectionString = `postgres://datagram:${password}@127.0.0.1:${postgresPort}/datagram?sslmode=disable`;
     managedPostgres = { ...managedPostgresDefinition(profileName, postgresPort), password };
@@ -176,24 +195,41 @@ async function collect(host: CliHost, read: ReadAnswer): Promise<Answers | undef
           reason: 'Native credential storage is unsupported on this platform.',
         }
       : await host.credentialProvider.availability();
-  host.terminal.writeOutput('Credentials\n');
-  if (nativeAvailability.available) {
-    host.terminal.writeOutput(
-      `  1. System credential store (${host.credentialProvider?.kind}) (Recommended)\n` +
-        '  2. Permission-restricted secret file\n' +
-        (managed ? '' : '  3. Environment references (Advanced)\n') +
-        'Selection [1] (or Back/Cancel): ',
-    );
-  } else {
+  if (!nativeAvailability.available) {
     host.terminal.writeOutput(
       `  System credential store unavailable: ${nativeAvailability.reason}\n` +
-        'Choose an explicit fallback:\n' +
-        '  1. Permission-restricted secret file (Recommended fallback)\n' +
-        (managed ? '' : '  2. Environment references (Advanced)\n') +
-        'Selection [1] (or Back/Cancel): ',
+        'Choose an explicit fallback:\n',
     );
   }
-  const storage = trim(await read());
+  const storage = trim(
+    await read({
+      message: 'Credentials',
+      initialValue: '1',
+      choices: [
+        ...(nativeAvailability.available
+          ? [
+              {
+                value: '1',
+                label: `System credential store (${host.credentialProvider?.kind}) (Recommended)`,
+              },
+            ]
+          : []),
+        {
+          value: nativeAvailability.available ? '2' : '1',
+          label: 'Permission-restricted secret file',
+        },
+        ...(managed
+          ? []
+          : [
+              {
+                value: nativeAvailability.available ? '3' : '2',
+                label: 'Environment references (Advanced)',
+              },
+            ]),
+        { value: 'Back', label: 'Back' },
+      ],
+    }),
+  );
   if (isCancel(storage)) throw new DatagramError('setup.cancelled', 'Setup cancelled.', 400);
   if (isBack(storage)) return collect(host, read);
   const nativeSelected = nativeAvailability.available && (!storage || storage === '1');
@@ -203,8 +239,9 @@ async function collect(host: CliHost, read: ReadAnswer): Promise<Answers | undef
   if (nativeSelected || fileSelected) {
     credentialStorage = nativeSelected ? 'native' : 'file';
     if (!managed) {
-      host.terminal.writeOutput('Existing PostgreSQL URL (or Back/Cancel): ');
-      connectionString = trim(await read());
+      connectionString = trim(
+        await read({ message: 'Existing PostgreSQL URL (or Back/Cancel): ', secret: true }),
+      );
       if (isCancel(connectionString)) {
         throw new DatagramError('setup.cancelled', 'Setup cancelled.', 400);
       }
@@ -281,10 +318,19 @@ async function collect(host: CliHost, read: ReadAnswer): Promise<Answers | undef
     throw new DatagramError('credential.value-missing', 'Credential values were not created.', 500);
   }
   postgresUrl(connectionString);
-  host.terminal.writeOutput(
-    '[6/9] Exposure\n  1. This host\n  2. Private network\n  3. Public\nSelection [1] (or Back/Cancel): ',
+
+  const exposureAnswer = trim(
+    await read({
+      message: '[6/9] Exposure',
+      initialValue: '1',
+      choices: [
+        { value: '1', label: 'This host' },
+        { value: '2', label: 'Private network' },
+        { value: '3', label: 'Public' },
+        { value: 'Back', label: 'Back' },
+      ],
+    }),
   );
-  const exposureAnswer = trim(await read());
   if (isCancel(exposureAnswer)) throw new DatagramError('setup.cancelled', 'Setup cancelled.', 400);
   if (isBack(exposureAnswer)) return collect(host, read);
   const exposure: ServerExposure =
@@ -299,26 +345,35 @@ async function collect(host: CliHost, read: ReadAnswer): Promise<Answers | undef
             })();
   let hostname = '127.0.0.1';
   if (exposure !== 'host') {
-    host.terminal.writeOutput('Explicit non-loopback bind hostname/address (or Back/Cancel): ');
-    hostname = trim(await read());
+    hostname = trim(
+      await read({ message: 'Explicit non-loopback bind hostname/address (or Back/Cancel): ' }),
+    );
     if (isCancel(hostname)) throw new DatagramError('setup.cancelled', 'Setup cancelled.', 400);
     if (isBack(hostname)) return collect(host, read);
     if (!hostname || ['127.0.0.1', '::1', 'localhost'].includes(hostname.toLowerCase())) {
-      throw new DatagramError('setup.bind-invalid', 'Enter an explicit non-loopback bind address.', 400);
+      throw new DatagramError(
+        'setup.bind-invalid',
+        'Enter an explicit non-loopback bind address.',
+        400,
+      );
     }
   }
   let publicAccess: PublicAccess;
   if (exposure === 'public') {
-    host.terminal.writeOutput(
-      '[7/9] Public TLS\n  1. Existing HTTPS reverse proxy\n' +
-        '  2. Direct TLS certificate/key\nSelection (or Back/Cancel): ',
+    const tls = trim(
+      await read({
+        message: '[7/9] Public TLS',
+        choices: [
+          { value: '1', label: 'Existing HTTPS reverse proxy' },
+          { value: '2', label: 'Direct TLS certificate/key' },
+          { value: 'Back', label: 'Back' },
+        ],
+      }),
     );
-    const tls = trim(await read());
     if (isCancel(tls)) throw new DatagramError('setup.cancelled', 'Setup cancelled.', 400);
     if (isBack(tls)) return collect(host, read);
     if (tls === '1') {
-      host.terminal.writeOutput('Public HTTPS endpoint (or Back/Cancel): ');
-      const endpoint = trim(await read());
+      const endpoint = trim(await read({ message: 'Public HTTPS endpoint (or Back/Cancel): ' }));
       if (isCancel(endpoint)) throw new DatagramError('setup.cancelled', 'Setup cancelled.', 400);
       if (isBack(endpoint)) return collect(host, read);
       let url: URL;
@@ -336,19 +391,30 @@ async function collect(host: CliHost, read: ReadAnswer): Promise<Answers | undef
       }
       publicAccess = { kind: 'reverse-proxy', endpoint: url.toString() };
     } else if (tls === '2') {
-      host.terminal.writeOutput('Absolute TLS certificate path (or Back/Cancel): ');
-      const certificatePath = trim(await read());
-      if (isCancel(certificatePath)) throw new DatagramError('setup.cancelled', 'Setup cancelled.', 400);
+      const certificatePath = trim(
+        await read({ message: 'Absolute TLS certificate path (or Back/Cancel): ' }),
+      );
+      if (isCancel(certificatePath))
+        throw new DatagramError('setup.cancelled', 'Setup cancelled.', 400);
       if (isBack(certificatePath)) return collect(host, read);
-      host.terminal.writeOutput('Absolute TLS private-key path (or Back/Cancel): ');
-      const keyPath = trim(await read());
+
+      const keyPath = trim(
+        await read({ message: 'Absolute TLS private-key path (or Back/Cancel): ' }),
+      );
       if (isCancel(keyPath)) throw new DatagramError('setup.cancelled', 'Setup cancelled.', 400);
       if (isBack(keyPath)) return collect(host, read);
       if (!isAbsolute(certificatePath) || !isAbsolute(keyPath)) {
         throw new DatagramError('setup.public-tls-required', 'TLS paths must be absolute.', 400);
       }
-      if (!(await host.filesystem.pathExists(certificatePath)) || !(await host.filesystem.pathExists(keyPath))) {
-        throw new DatagramError('setup.public-tls-required', 'TLS certificate or key was not found.', 400);
+      if (
+        !(await host.filesystem.pathExists(certificatePath)) ||
+        !(await host.filesystem.pathExists(keyPath))
+      ) {
+        throw new DatagramError(
+          'setup.public-tls-required',
+          'TLS certificate or key was not found.',
+          400,
+        );
       }
       publicAccess = { kind: 'direct-tls', certificatePath, keyPath };
     } else {
@@ -359,8 +425,8 @@ async function collect(host: CliHost, read: ReadAnswer): Promise<Answers | undef
       );
     }
   }
-  host.terminal.writeOutput('[8/9] HTTP port [3100] (or Back/Cancel): ');
-  const rawPort = trim(await read());
+
+  const rawPort = trim(await read({ message: '[8/9] HTTP port [3100] (or Back/Cancel): ' }));
   if (isCancel(rawPort)) throw new DatagramError('setup.cancelled', 'Setup cancelled.', 400);
   if (isBack(rawPort)) return collect(host, read);
   const port = rawPort ? Number(rawPort) : 3100;
@@ -415,6 +481,7 @@ export async function runGuidedServerSetup(
     }
     throw error;
   }
+
   host.terminal.writeOutput('Preflight: PostgreSQL infrastructure and HTTP port.\n');
   if (answers.managedPostgres) {
     let managedPostgres = answers.managedPostgres;
@@ -457,10 +524,11 @@ export async function runGuidedServerSetup(
         );
         break;
       } catch {
-        host.terminal.writeOutput(
-          `PostgreSQL port ${managedPostgres.port} is unavailable. Choose another port before Apply (or Cancel): `,
+        const replacement = trim(
+          await read({
+            message: `PostgreSQL port ${managedPostgres.port} is unavailable. Choose another port before Apply (or Cancel): `,
+          }),
         );
-        const replacement = trim(await read());
         if (isCancel(replacement)) {
           host.terminal.writeOutput('Setup cancelled. No changes were made.\n');
           return 'complete';
@@ -481,9 +549,10 @@ export async function runGuidedServerSetup(
     }
   } else {
     try {
-      await capability(host.probePostgres, 'setup.postgres-probe-unavailable')(
-        answers.connectionString,
-      );
+      await capability(
+        host.probePostgres,
+        'setup.postgres-probe-unavailable',
+      )(answers.connectionString);
     } catch {
       throw new DatagramError(
         'setup.postgres-unreachable',
@@ -494,7 +563,10 @@ export async function runGuidedServerSetup(
   }
   const parsedUrl = postgresUrl(answers.connectionString);
   try {
-    await capability(host.checkPort, 'setup.port-check-unavailable')(answers.hostname, answers.port);
+    await capability(host.checkPort, 'setup.port-check-unavailable')(
+      answers.hostname,
+      answers.port,
+    );
   } catch {
     throw new DatagramError(
       'setup.port-unavailable',
@@ -502,25 +574,34 @@ export async function runGuidedServerSetup(
       400,
     );
   }
-  const profilePath = join(host.directories.configuration, 'profiles', `${answers.profileName}.json`);
-  host.terminal.writeOutput(
-    '[9/9] Review plan\n' +
-      (answers.managedPostgres
-        ? '  Service: Server Service; Docker-managed PostgreSQL owned by this profile\n' +
-          `  Image download: ${answers.managedPostgres.image}\n` +
-          `  Generated infrastructure: container=${answers.managedPostgres.containerName}; volume=${answers.managedPostgres.volumeName}\n` +
-          `  PostgreSQL port: 127.0.0.1:${answers.managedPostgres.port}\n` +
-          `  Data location: persistent Docker volume ${answers.managedPostgres.volumeName}\n` +
-          '  Lifecycle: stop, repair, reconfiguration, and setup reruns never remove database data\n'
-        : '  Service: Server Service; external PostgreSQL (no infrastructure lifecycle ownership)\n') +
-      `  PostgreSQL: postgresql://[redacted]:${parsedUrl.port || '5432'}/[redacted] sslmode=${parsedUrl.searchParams.get('sslmode') ?? 'default'}\n` +
-      `  Profile: ${answers.profileName} (default)\n` +
-      `  Deployment Operator: ${answers.displayName}\n` +
-      `  Exposure: ${answers.exposure}; bind=${answers.hostname}:${answers.port}\n` +
-      `  Credentials: ${answers.credentialStorage === 'native' ? `system credential store (${host.credentialProvider?.kind})` : answers.credentialStorage === 'file' ? 'permission-restricted secret file' : 'environment references (Advanced)'}\n` +
-      'Apply this plan? [Y/n] (or Cancel): ',
+  const profilePath = join(
+    host.directories.configuration,
+    'profiles',
+    `${answers.profileName}.json`,
   );
-  const consent = trim(await read()).toLowerCase();
+
+  const consent = trim(
+    await read({
+      message:
+        '[9/9] Review plan\n' +
+        (answers.managedPostgres
+          ? '  Service: Server Service; Docker-managed PostgreSQL owned by this profile\n' +
+            `  Image download: ${answers.managedPostgres.image}\n` +
+            `  Generated infrastructure: container=${answers.managedPostgres.containerName}; volume=${answers.managedPostgres.volumeName}\n` +
+            `  PostgreSQL port: 127.0.0.1:${answers.managedPostgres.port}\n` +
+            `  Data location: persistent Docker volume ${answers.managedPostgres.volumeName}\n` +
+            '  Lifecycle: stop, repair, reconfiguration, and setup reruns never remove database data\n'
+          : '  Service: Server Service; external PostgreSQL (no infrastructure lifecycle ownership)\n') +
+        `  PostgreSQL: postgresql://[redacted]:${parsedUrl.port || '5432'}/[redacted] sslmode=${parsedUrl.searchParams.get('sslmode') ?? 'default'}\n` +
+        `  Profile: ${answers.profileName} (default)\n` +
+        `  Deployment Operator: ${answers.displayName}\n` +
+        `  Exposure: ${answers.exposure}; bind=${answers.hostname}:${answers.port}\n` +
+        `  Credentials: ${answers.credentialStorage === 'native' ? `system credential store (${host.credentialProvider?.kind})` : answers.credentialStorage === 'file' ? 'permission-restricted secret file' : 'environment references (Advanced)'}\n` +
+        'Apply this plan?',
+      confirm: true,
+      initialValue: 'yes',
+    }),
+  ).toLowerCase();
   if (isCancel(consent) || consent === 'n' || consent === 'no') {
     host.terminal.writeOutput('Setup cancelled. No changes were made.\n');
     return 'complete';
@@ -528,7 +609,9 @@ export async function runGuidedServerSetup(
   if (!['', 'y', 'yes'].includes(consent)) {
     throw new DatagramError('setup.consent-invalid', 'Choose Y, n, or Cancel.', 400);
   }
-  await host.filesystem.makeDirectory(join(host.directories.configuration, 'profiles'), { recursive: true });
+  await host.filesystem.makeDirectory(join(host.directories.configuration, 'profiles'), {
+    recursive: true,
+  });
   let postgresCredential = answers.postgresCredential;
   let bearerCredential = answers.bearerCredential;
   if (answers.credentialStorage === 'native') {
@@ -548,14 +631,20 @@ export async function runGuidedServerSetup(
     });
   }
   if (postgresCredential === undefined || bearerCredential === undefined) {
-    throw new DatagramError('credential.reference-missing', 'Credential references were not created.', 500);
+    throw new DatagramError(
+      'credential.reference-missing',
+      'Credential references were not created.',
+      500,
+    );
   }
   if (answers.secretPath) {
     const secret = `${JSON.stringify({ postgresUrl: answers.connectionString, bearerToken: answers.bearerToken })}\n`;
     if (host.filesystem.writePrivateTextFile) {
       await host.filesystem.writePrivateTextFile(answers.secretPath, secret);
     } else {
-      await host.filesystem.makeDirectory(join(host.directories.configuration, 'secrets'), { recursive: true });
+      await host.filesystem.makeDirectory(join(host.directories.configuration, 'secrets'), {
+        recursive: true,
+      });
       await host.filesystem.writeTextFile(answers.secretPath, secret, { mode: 0o600 });
     }
   }
@@ -563,7 +652,9 @@ export async function runGuidedServerSetup(
     ? parseProfile(await host.filesystem.readTextFile(profilePath), answers.profileName)
     : undefined;
   const serviceKey =
-    existing?.service.kind === 'server' ? existing.service.serviceKey : `service_${crypto.randomUUID()}`;
+    existing?.service.kind === 'server'
+      ? existing.service.serviceKey
+      : `service_${crypto.randomUUID()}`;
   let started: Awaited<ReturnType<NonNullable<CliHost['startServerService']>>> | undefined;
   try {
     if (answers.managedPostgres) {
@@ -617,7 +708,9 @@ export async function runGuidedServerSetup(
         bearerCredential,
       },
     };
-    await host.filesystem.writeTextFile(profilePath, `${JSON.stringify(profile, null, 2)}\n`, { mode: 0o600 });
+    await host.filesystem.writeTextFile(profilePath, `${JSON.stringify(profile, null, 2)}\n`, {
+      mode: 0o600,
+    });
     await host.filesystem.writeTextFile(
       join(host.directories.configuration, 'default-profile'),
       `${answers.profileName}\n`,
@@ -660,15 +753,19 @@ export async function runGuidedServerSetup(
       host.terminal.writeOutput(`Connect Codex unavailable: ${discovery.reason}.\n`);
     } else {
       const plan = discovery.plan;
-      host.terminal.writeOutput(
-        '[optional] Connect Codex\n' +
-          `  Skill: install Datagram-owned files at ${plan.skillDestination}\n` +
-          `  MCP: codex mcp add ${plan.mcpServerName} -- ${plan.command} --profile ${JSON.stringify(plan.profileName)}\n` +
-          `  Credential reference: ${plan.credentialReference}\n` +
-          '  Authority: selected person; Store-derived values remain outside agent output\n' +
-          'Connect Codex now? [y/N]: ',
-      );
-      const connect = trim(await read()).toLowerCase();
+
+      const connect = trim(
+        await read({
+          message:
+            '[optional] Connect Codex\n' +
+            `  Skill: install Datagram-owned files at ${plan.skillDestination}\n` +
+            `  MCP: codex mcp add ${plan.mcpServerName} -- ${plan.command} --profile ${JSON.stringify(plan.profileName)}\n` +
+            `  Credential reference: ${plan.credentialReference}\n` +
+            '  Authority: selected person; Store-derived values remain outside agent output\n' +
+            'Connect Codex now?',
+          confirm: true,
+        }),
+      ).toLowerCase();
       if (connect !== 'y' && connect !== 'yes') {
         journal = { ...journal, codex: { status: 'skipped', reason: 'operator skipped' } };
         codexSummary = 'skipped (operator skipped)';
@@ -682,9 +779,7 @@ export async function runGuidedServerSetup(
                 ...journal,
                 codex: {
                   status:
-                    integrationResult.progress.skill === 'verified'
-                      ? 'skill-installed'
-                      : 'pending',
+                    integrationResult.progress.skill === 'verified' ? 'skill-installed' : 'pending',
                 },
                 failure: { stage: 'codex', code: 'setup.codex-partial' },
               };

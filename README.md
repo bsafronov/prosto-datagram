@@ -14,6 +14,11 @@ Start guided setup. No source checkout or manual configuration file is required:
 bunx prosto-datagram init
 ```
 
+Use ↑/↓ and Enter to select options. Choose **Back** in menus, or type `Back` in
+text fields that offer it, to revisit a step. Press Esc or Ctrl+C to cancel the
+current prompt. PostgreSQL connection strings are masked while you enter them.
+Completed setup stages remain available to resume after cancellation.
+
 Choose **Use on this machine** for a Local Service backed by SQLite in your operating-system user
 data directory. Choose **Run for a team** for a Server Service backed by either an externally owned
 PostgreSQL database or persistent Docker-managed PostgreSQL. Setup shows a redacted plan and writes

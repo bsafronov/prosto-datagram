@@ -21,8 +21,10 @@ import {
 import { createNativeCredentialProvider } from './credentials';
 import type { CredentialProvider } from './credentials';
 import { createDockerPostgresPort, type DockerPostgresPort } from './docker-postgres';
+import { createTerminalPrompts, type ReadAnswer } from './prompts';
 
 export interface CliTerminal {
+  readonly prompt?: ReadAnswer;
   readonly input: AsyncIterable<string | Uint8Array>;
   readonly inputIsInteractive: boolean;
   readonly outputIsInteractive: boolean;
@@ -142,6 +144,7 @@ export function createProcessCliHost(): CliHost {
   const credentialProvider = createNativeCredentialProvider(platform(), runExternalCommand);
   const host: CliHost = {
     terminal: {
+      prompt: createTerminalPrompts(process.stdin, process.stdout),
       input: process.stdin,
       inputIsInteractive: process.stdin.isTTY,
       outputIsInteractive: process.stdout.isTTY,
